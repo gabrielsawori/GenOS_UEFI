@@ -1,0 +1,67 @@
+🗺️ Kerangka Kerja Pengembangan GenOS v3 (64-Bit)
+Kita akan membaginya menjadi beberapa fase (Milestone) agar tidak kewalahan.
+
+📍 Fase 1: Visibilitas & Debugging (Mata & Telinga OS)
+Sebelum membuat fitur rumit, kita harus bisa melihat apa yang sedang terjadi di dalam kernel, terutama saat ada error.
+
+Font & Teks (Terminal): Menerjemahkan font (biasanya format PSF) untuk mengubah piksel menjadi huruf. Ini penting agar kernel bisa mencetak pesan teks (seperti printf).
+
+Serial Port Debugging (COM1): Mengirim log error dari OS langsung ke terminal host-mu. Jika layar QEMU crash atau blank, log serial ini adalah satu-satunya penyelamat kita untuk melihat letak error.
+
+📍 Fase 2: Fondasi Arsitektur CPU (Sistem Saraf)
+64-bit memiliki aturan ketat. Jika CPU menerima sinyal dari perangkat keras dan OS tidak tahu cara menanganinya, sistem akan langsung reboot.
+
+GDT (Global Descriptor Table): Mengatur segmen memori dasar dan hak akses (Ring 0 untuk Kernel, Ring 3 untuk User/Aplikasi).
+
+IDT (Interrupt Descriptor Table): Mendaftarkan penanganan error (seperti Divide by Zero atau Page Fault).
+
+ISR & IRQ: Menangkap sinyal interupsi perangkat keras (misalnya saat tombol keyboard ditekan, CPU akan diinterupsi agar OS merespons).
+
+📍 Fase 3: Manajemen Memori (Gudang & Tata Ruang)
+Ini adalah jantung dari OS 64-bit modern dan biasanya bagian yang paling menantang.
+
+PMM (Physical Memory Manager): Mengelola RAM fisik menggunakan sistem Bitmap atau Buddy Allocator. Fungsinya untuk tahu blok RAM mana yang kosong dan mana yang terpakai.
+
+VMM (Virtual Memory Manager / Paging): Memetakan alamat memori virtual ke fisik. Ini fitur krusial agar setiap aplikasi nanti merasa memiliki seluruh RAM, dan mencegah satu aplikasi merusak memori aplikasi lain.
+
+Heap Allocation (malloc & free): Membuat fungsi standar untuk memesan ruang memori secara dinamis saat OS berjalan.
+
+📍 Fase 4: Driver Dasar (Jantung & Tangan)
+Mulai berinteraksi dengan dunia luar.
+
+PIT (Programmable Interval Timer): Detak jantung OS. Sangat penting untuk melacak waktu (Uptime) dan nantinya digunakan untuk mengatur pergantian tugas (multitasking).
+
+Keyboard Driver (PS/2 atau USB Legacy): Membaca scancode dari keyboard dan mengubahnya menjadi karakter ASCII yang bisa diketik di layar.
+
+📍 Fase 5: Multitasking & User Space (Jiwa OS)
+Membuat OS tidak hanya menjalankan satu tugas (seperti saat ini), tetapi banyak tugas secara bersamaan.
+
+Proses & Thread: Membuat struktur data untuk mewakili program yang sedang berjalan.
+
+Context Switching: Menyimpan status CPU dari Program A, lalu memuat status Program B secara bergantian dalam kecepatan sangat tinggi.
+
+Ring 3 (User Mode): Menurunkan hak akses program biasa agar mereka tidak bisa sembarangan mematikan CPU atau merusak kernel.
+
+📍 Fase 6: API & Syscalls (Bahasa Aplikasi)
+Program biasa (Ring 3) tidak bisa langsung menyentuh hardware. Mereka harus "meminta izin" kepada kernel.
+
+Instruksi syscall / sysret: Ini adalah metode ultra-cepat 64-bit untuk aplikasi memanggil fungsi kernel.
+
+Memperkaya API: Membuat daftar layanan standar, seperti:
+
+sys_read(): Membaca input dari keyboard/file.
+
+sys_write(): Mencetak teks ke layar.
+
+sys_exit(): Menutup program dengan aman.
+
+📍 Fase 7: Storage & File System (Ingatan Jangka Panjang)
+PCI Enumeration: Membuat kernel mampu mendeteksi perangkat keras apa saja yang tercolok di motherboard.
+
+SATA/AHCI Driver: Membaca/menulis data mentah ke hardisk atau flashdisk.
+
+VFS (Virtual File System) & FAT32/ext2: Mengatur data mentah tersebut menjadi konsep file dan folder.
+
+Dengan roadmap ini, arah GenOS v3 sangat jelas dan terstruktur, tidak ada lagi langkah tebak-tebakan. Kita baru saja menyelesaikan pra-syarat (Booting & Framebuffer).
+
+Sesuai kerangka di atas, langkah paling logis berikutnya adalah Fase 1. Apakah kamu mau kita mulai membuat sistem pembacaan Font agar GenOS bisa mencetak kalimat di layar, atau membuat Serial Logging dulu untuk keamanan debugging?
