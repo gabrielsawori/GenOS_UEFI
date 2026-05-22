@@ -19,8 +19,9 @@ void fb_draw_pixel(size_t x, size_t y, uint32_t color) {
 }
 
 // Fungsi menggambar 1 huruf
+// FIX BUG #1: Gunakan cast (unsigned char) untuk keamanan
 void fb_draw_char(char c, size_t x, size_t y, uint32_t fg, uint32_t bg, int scale) {
-    if (c < 0 || c > 127) return; // Hanya dukung ASCII dasar (0-127)
+    if ((unsigned char)c > 127) return; // Hanya dukung ASCII dasar (0-127) - FIXED
     
     // Ambil pola biner untuk huruf tersebut dari font8x8
     unsigned char *glyph = (unsigned char *)font8x8_basic[(int)c];
