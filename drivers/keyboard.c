@@ -9,12 +9,19 @@ static volatile int buffer_head = 0; // Penunjuk tempat huruf masuk
 static volatile int buffer_tail = 0; // Penunjuk tempat huruf diambil
 
 // Fungsi rahasia memasukkan huruf ke ember
+// FIX BUG #3: Tambahkan atomic operation untuk mencegah race condition
 static void buffer_push(char c) {
+    // Disable interrupt untuk operasi atomic
+    asm volatile ("cli");
+    
     int next_head = (buffer_head + 1) % BUFFER_SIZE;
     if (next_head != buffer_tail) { // Jika ember tidak penuh
         key_buffer[buffer_head] = c;
         buffer_head = next_head;
     }
+    
+    // Enable interrupt kembali
+    asm volatile ("sti");
 }
 
 // Fungsi yang akan dipanggil oleh Terminal untuk mengambil huruf
