@@ -18,9 +18,19 @@ int is_transmit_empty(void) {
     return inb(COM1_PORT + 5) & 0x20;
 }
 
+// ===== FIX BUG #2: Tambahkan timeout untuk mencegah infinite loop =====
 void serial_write_char(char c) {
-    while (is_transmit_empty() == 0); // Tunggu sampai jalur kosong
-    outb(COM1_PORT, c);               // Kirim karakter
+    uint32_t timeout = 10000;
+    
+    // Tunggu sampai jalur kosong atau timeout
+    while ((is_transmit_empty() == 0) && (timeout-- > 0)) {
+        asm volatile ("nop"); // Hindari compiler optimization
+    }
+    
+    // Jika masih ada waktu, kirim karakter
+    if (timeout > 0) {
+        outb(COM1_PORT, c);
+    }
 }
 
 void serial_write_string(const char* str) {
