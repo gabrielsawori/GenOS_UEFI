@@ -33,8 +33,8 @@ void create_task(void (*entry_point)(void)) {
     // Gunakan kmalloc() agar mendapat alamat Virtual yang sah di mata CPU!
     new_task->stack_base = (uint64_t)kmalloc(4096); 
     
-    // Pastikan ujung tumpukan memori (Stack Top) sejajar 16-byte sesuai aturan mesin 64-bit
-    uint64_t stack_top = (new_task->stack_base + 4096) & ~0xF;
+    // FIX BUG #7: Perbaiki stack alignment dengan kurangi 8 byte untuk red zone
+    uint64_t stack_top = ((new_task->stack_base + 4096) & ~0xF) - 8;
 
     // Bersihkan KTP register
     for(int i = 0; i < sizeof(struct registers); i++) {
@@ -51,6 +51,19 @@ void create_task(void (*entry_point)(void)) {
     new_task->next = NULL;
     task_list_tail->next = new_task;
     task_list_tail = new_task;
+}
+
+// FIX BUG #4: Tambahkan fungsi delete_task untuk mencegah memory leak
+void delete_task(struct task* task) {
+    if (!task) return;
+    
+    // Bebaskan stack memory
+    if (task->stack_base != 0) {
+        kfree((void*)task->stack_base);
+    }
+    
+    // Bebaskan task structure sendiri
+    kfree(task);
 }
 
 void schedule(struct registers* current_regs) {
