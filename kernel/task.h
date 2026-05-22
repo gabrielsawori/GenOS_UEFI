@@ -19,4 +19,5 @@ struct task {
 
 void task_init(void);
 void create_task(void (*entry_point)(void));
+void delete_task(struct task* task);  // FIX BUG #4: Tambahkan deklarasi delete_task
 void schedule(struct registers* current_regs);
