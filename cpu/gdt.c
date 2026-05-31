@@ -1,44 +1,76 @@
 #include "gdt.h"
 #include "../drivers/serial.h"
+#include <stddef.h>
 
-// Kita membuat 5 entri GDT dasar untuk GenOS
-uint64_t gdt_entries[5];
+// Struktur TSS (Task State Segment) x86_64
+struct tss {
+    uint32_t reserved0;
+    uint64_t rsp0; // INI YANG PALING PENTING! (Pointer Stack Darurat Kernel)
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist1, ist2, ist3, ist4, ist5, ist6, ist7;
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iopb_offset;
+} __attribute__((packed));
 
-// Pointer untuk memberi tahu CPU di mana lokasi GDT kita
-struct gdt_ptr {
+static struct tss tss_entry;
+
+// Array GDT kita sekarang butuh 7 slot
+static uint64_t gdt[7];
+
+struct gdtr {
     uint16_t limit;
     uint64_t base;
 } __attribute__((packed));
 
-struct gdt_ptr gdtr;
+static struct gdtr gdtr;
 
-// Fungsi Assembly yang akan kita buat nanti untuk memuat GDT ke CPU
 extern void gdt_load(uint64_t ptr);
 
 void gdt_init(void) {
-    serial_write_string("[INFO] Mengonfigurasi Global Descriptor Table (GDT)...\n");
+    serial_write_string("[INFO] Mengonfigurasi GDT v2 (Menambahkan Ring 3 & TSS)...\n");
 
-    // 0: Null Descriptor (Wajib kosong menurut aturan CPU intel/AMD)
-    gdt_entries[0] = 0;
+    // 1. Segmen Dasar
+    gdt[0] = 0x0000000000000000; // Null Descriptor
+    gdt[1] = 0x00AF9A000000FFFF; // Kernel Code (Ring 0)
+    gdt[2] = 0x00CF92000000FFFF; // Kernel Data (Ring 0)
     
-    // 1: Kernel Code Segment (Ring 0, Executable, 64-bit)
-    gdt_entries[1] = 0x00209A0000000000;
-    
-    // 2: Kernel Data Segment (Ring 0, Read/Write)
-    gdt_entries[2] = 0x0000920000000000;
-    
-    // 3: User Data Segment (Ring 3, Read/Write) -> Untuk aplikasi masa depan
-    gdt_entries[3] = 0x0000F20000000000;
-    
-    // 4: User Code Segment (Ring 3, Executable, 64-bit)
-    gdt_entries[4] = 0x0020FA0000000000;
+    // 2. Segmen Kota Biasa (Ring 3) -> DPL = 3
+    gdt[3] = 0x00CFF2000000FFFF; // User Data (Ring 3)
+    gdt[4] = 0x00AFFA000000FFFF; // User Code (Ring 3)
 
-    // Atur panjang tabel dan alamat awalnya
-    gdtr.limit = sizeof(gdt_entries) - 1;
-    gdtr.base = (uint64_t)&gdt_entries;
+    // 3. Bersihkan struktur TSS (Perbaikan Warning size_t)
+    for(size_t i = 0; i < sizeof(struct tss); i++) {
+        ((uint8_t*)&tss_entry)[i] = 0;
+    }
+    tss_entry.iopb_offset = sizeof(struct tss);
 
-    // Berikan tabel ini ke CPU melalui fungsi Assembly!
+    // 4. Hitung alamat untuk memasukkan TSS ke GDT
+    uint64_t tss_base = (uint64_t)&tss_entry;
+    uint32_t tss_limit = sizeof(struct tss) - 1;
+
+    uint32_t base_low = tss_base & 0xFFFFFFFF;
+    uint32_t base_high = tss_base >> 32;
+
+    // TSS di 64-bit memakan 2 slot (Perbaikan Warning Shift Overflow dengan (uint64_t))
+    gdt[5] = (tss_limit & 0xFFFF) | ((base_low & 0xFFFFFF) << 16) | 
+             (0x89ULL << 40) | (((uint64_t)((tss_limit >> 16) & 0xF)) << 48) | 
+             (((uint64_t)(base_low >> 24)) << 56);
+    gdt[6] = base_high;
+
+    // 5. Muat GDT ke CPU
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base = (uint64_t)&gdt[0];
     gdt_load((uint64_t)&gdtr);
-    
-    serial_write_string("[OK] GDT Berhasil Dimuat!\n");
+
+    // 6. BERI TAHU CPU letak TSS
+    asm volatile ("ltr %w0" : : "r" (0x28));
+
+    serial_write_string("[OK] GDT v2 & TSS Berhasil Dimuat!\n");
+}
+
+void set_kernel_stack(uint64_t stack) {
+    tss_entry.rsp0 = stack;
 }
