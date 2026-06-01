@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "utils.h"
 #include <stdbool.h>
 
@@ -38,4 +39,20 @@ int strcmp(const char *s1, const char *s2) {
         s2++;
     }
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+void* memcpy(void* dest, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dest;
+    const uint8_t* s = (const uint8_t*)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
+void* memset(void* s, int c, size_t n) {
+    uint8_t* p = (uint8_t*)s;
+    while (n--) {
+        *p++ = (uint8_t)c;
+    }
+    return s;
 }

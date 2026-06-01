@@ -1,3 +1,9 @@
 limine/
 *.iso
-*.img
+*.img*.o
+*.elf
+*.tar
+iso_root/
+GenOS.iso
+pesan.txt
+limine/
