@@ -2,6 +2,9 @@ GenOS v3 (64-Bit)
 
 Welcome to the official repository for GenOS, a custom-built, low-level 64-bit operating system developed from scratch for educational purposes and OS development exploration. This project utilizes the modern Limine bootloader (UEFI/BIOS compatible) and focuses on modularity, code readability, and the implementation of low-level hardware architecture.
 
+📚 Dokumentasi
+GenOS sekarang memiliki folder `documentation/` untuk panduan pengembang, roadmap, arsitektur kernel, fitur, kontribusi, dan material pelatihan AI. Baca dokumen-dokumen tersebut sebelum menambahkan fitur atau memperbaiki bug.
+
 🌟 Current Features
 
 GenOS v3 already includes the foundational implementations necessary to run a basic operating system. Here are the features currently implemented:
