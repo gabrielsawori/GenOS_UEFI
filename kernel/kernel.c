@@ -176,11 +176,38 @@ void _start(void) {
     task_init();
 
     if (module_request.response != NULL && module_request.response->module_count > 0) {
+        serial_write_string("[INFO] Loading ramdisk module for TAR filesystem...\n");
         tar_init(module_request.response->modules[0]->address);
+    } else {
+        serial_write_string("[WARN] No ramdisk module available; TAR filesystem disabled.\n");
+    }
+
+    /*
+     * BUG FIX #3: syscall_init() HARUS dipanggil SEBELUM create_user_task()!
+     * Sebelumnya syscall_init() dipanggil setelah create_user_task(), yang berarti
+     * ketika timer IRQ pertama memicu context-switch ke aplikasi Ring-3 dan aplikasi
+     * langsung memanggil syscall, gate syscall belum terdaftar di MSR LSTAR.
+     * Akibatnya CPU memicu #UD (Invalid Opcode) atau #GP → Kernel Panic.
+     *
+     * Urutan yang benar:
+     *   1. syscall_init()       <- Buka gerbang syscall DULU
+     *   2. create_user_task()   <- Baru luncurkan aplikasi Ring-3
+     *   3. create_task(shell)   <- Luncurkan shell kernel
+     *   4. sti                  <- Aktifkan interrupt terakhir
+     */
+    syscall_init();
+
+    /* Jika ada app.elf di dalam ramdisk, jalankan otomatis untuk verifikasi */
+    if (module_request.response != NULL && module_request.response->module_count > 0) {
+        size_t app_size = 0;
+        char* app_ptr = tar_read_file("app.elf", &app_size);
+        if (app_ptr != NULL) {
+            serial_write_string("[INFO] Auto-launching app.elf from ramdisk for test...\n");
+            create_user_task((uint8_t*)app_ptr);
+        }
     }
 
     create_task(shell_task);
-    syscall_init();
 
     asm volatile ("sti");
     while(1) { asm volatile ("hlt"); }

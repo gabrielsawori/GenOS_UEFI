@@ -19,15 +19,28 @@ static struct heap_block* heap_head = NULL;
 void heap_init(void) {
     serial_write_string("[INFO] Menginisialisasi Kernel Heap Allocator...\n");
 
-    // 1. Minta 16 petak tanah fisik, lalu petakan (teleportasi) ke alamat Virtual Heap
+    /*
+     * BUG FIX #4: Tambahkan null-check pada pmm_alloc_page().
+     * Sebelumnya, jika PMM kehabisan frame (alloc returns NULL = alamat fisik 0),
+     * kita tetap memetakan NULL ke alamat virtual heap. Akibatnya:
+     *   - vmm_map_page memetakan virtual 0x100000000000 ke fisik 0x0
+     *   - Heap header ditulis ke alamat 0x0 → menimpa NULL page / BIOS data
+     *   - Kernel panic pada akses heap pertama
+     * Sekarang: jika alokasi gagal, hentikan boot dengan pesan error ke serial.
+     */
     for (uint64_t i = 0; i < HEAP_INITIAL_SIZE; i += 4096) {
         void* phys_page = pmm_alloc_page();
-        
-        // 0b11 (3) = Present + Writable (Ada dan bisa ditulisi)
+        if (!phys_page) {
+            serial_write_string("[FATAL] heap_init: PMM kehabisan frame! Heap tidak dapat dibuat.\n");
+            /* Hentikan sistem dengan aman */
+            asm volatile ("cli");
+            for (;;) { asm volatile ("hlt"); }
+        }
+        /* 0x03 = Present + Writable (tanpa User bit = hanya kernel yang bisa akses) */
         vmm_map_page(HEAP_START_VIRTUAL + i, (uint64_t)phys_page, 3);
     }
 
-    // 2. Pada awalnya, Heap adalah satu blok raksasa utuh sebesar 64KB yang Kosong
+    /* Pada awalnya, Heap adalah satu blok raksasa utuh sebesar 64KB yang Kosong */
     heap_head = (struct heap_block*)HEAP_START_VIRTUAL;
     heap_head->size = HEAP_INITIAL_SIZE - sizeof(struct heap_block);
     heap_head->free = 1;

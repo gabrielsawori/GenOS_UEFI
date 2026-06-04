@@ -60,6 +60,20 @@ Gunakan format berikut untuk setiap bug:
 - Periksa scancode keyboard dan translasi.
 - Uji timer dengan interrupt periodik.
 
+### 5. Debugging User Mode & Syscall
+
+- Pastikan `syscall_init()` **selalu dipanggil SEBELUM** `create_user_task()`.
+  Jika tidak, aplikasi Ring-3 yang langsung memanggil syscall akan memicu #GP.
+- Cek register STAR di MSR 0xC0000081:
+  - `STAR[47:32]` = Kernel CS (harus 0x08)
+  - `STAR[63:48]` = nilai yang akan di-OR 3 oleh CPU untuk user CS (harus 0x23)
+- Cek instruksi `mov %rsp, label` vs `mov %rsp, label(%rip)` — dalam kode 64-bit
+  PIC/PIE atau dengan model kernel, selalu gunakan RIP-relative addressing!
+- Untuk memverifikasi user stack: RSP harus 16-byte aligned sebelum CALL pertama
+  di user mode. Gunakan `(stack_top - 16) & ~0xF`.
+- Jika scheduler hang setelah aplikasi selesai: pastikan loop `do-while` punya
+  batas iterasi agar tidak infinite loop ketika semua task TASK_DEAD.
+
 ## Perbaikan dan Validasi
 
 - Gunakan `make clean && make` setelah perubahan besar.

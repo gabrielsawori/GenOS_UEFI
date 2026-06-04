@@ -49,56 +49,120 @@ void create_task(void (*entry_point)(void)) {
     task_list_tail = new_task;
 }
 
-// Fungsi Peluncur Aplikasi ELF (Ring 3)
+/*
+ * create_user_task() - Meluncurkan aplikasi ELF dalam Ring 3 (User Mode)
+ *
+ * @param binary_data: Pointer ke data biner ELF yang sudah dibaca dari ramdisk.
+ *
+ * Fungsi ini:
+ *   1. Memuat segmen ELF ke memori user melalui elf_load()
+ *   2. Mengalokasikan dan memetakan stack user mode (1 page = 4096 byte)
+ *   3. Mendaftarkan task baru ke scheduler dengan selectors Ring-3
+ *
+ * BUG FIX #6: Stack RSP diset ke (app_stack_virt + 4096 - 16) agar:
+ *   - RSP berada DI DALAM page yang di-map (bukan tepat di batasnya)
+ *   - RSP 16-byte aligned sesuai System V AMD64 ABI
+ *   - Menghindari page fault segera saat fungsi pertama push ke stack
+ */
 void create_user_task(uint8_t* binary_data) {
-    // 1. Muat ELF ke memori User Mode
+    /* 1. Muat ELF ke memori User Mode */
     uint64_t entry_point = elf_load(binary_data);
-    if (entry_point == 0) return;
+    if (entry_point == 0) {
+        serial_write_string("[ERROR] ELF load gagal: magic number tidak valid!\n");
+        return;
+    }
 
-    // 2. Siapkan Stack User Mode
+    /* 2. Siapkan Stack User Mode (1 page = 4096 byte) */
     uint64_t app_stack_virt = 0x80000000;
     uint64_t phys_stack = (uint64_t)pmm_alloc_page();
-    vmm_map_page(app_stack_virt, phys_stack, 7); 
+    if (!phys_stack) {
+        serial_write_string("[ERROR] Failed to allocate user stack!\n");
+        return;
+    }
+    vmm_map_page(app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
 
-    // 3. Daftarkan KTP ke Scheduler
+    /* 3. Daftarkan task ke Scheduler */
     struct task* new_task = (struct task*)kmalloc(sizeof(struct task));
-    new_task->pid = next_pid++;
+    if (!new_task) {
+        serial_write_string("[ERROR] Failed to allocate task struct for user task!\n");
+        return;
+    }
+    new_task->pid   = next_pid++;
     new_task->state = TASK_READY;
+    new_task->stack_base = app_stack_virt;
 
     for(size_t i = 0; i < sizeof(struct registers); i++) {
         ((uint8_t*)&new_task->regs)[i] = 0;
     }
 
-    new_task->regs.rip = entry_point; 
-    new_task->regs.cs = 0x23; // Segmen Kode User
+    new_task->regs.rip    = entry_point;
+    new_task->regs.cs     = 0x23; /* User Code Selector (Ring 3, RPL=3) */
     new_task->regs.rflags = 0x202;
-    new_task->regs.rsp = app_stack_virt + 4096;
-    new_task->regs.ss = 0x1B; // Segmen Data User
-
+    /*
+     * BUG FIX #6: RSP diset ke (base + 4096 - 16) agar:
+     * - Berada di DALAM page yang di-map (bukan di tepi atas yang sudah out-of-range)
+     * - 16-byte aligned sesuai AMD64 ABI sehingga tidak terjadi #GP saat CALL
+     */
+    new_task->regs.rsp = (app_stack_virt + 4096 - 16) & ~0xFULL;
+    /*
+     * BUG FIX: SS = 0x2B menunjuk ke GDT[5] = TSS descriptor → #GP saat iretq!
+     * User Data ada di GDT[3] = selector 0x18, dengan RPL=3 menjadi 0x1B.
+     */
+    new_task->regs.ss  = 0x1B; /* User Data Selector (GDT[3], Ring 3, RPL=3) */
     new_task->next = NULL;
+
+    /* Tambahkan task ke antrean scheduler */
     task_list_tail->next = new_task;
     task_list_tail = new_task;
 }
 
-// Pengatur Antrean (Scheduler)
+/*
+ * schedule() - Pemilih Task Berikutnya (Round-Robin Scheduler)
+ *
+ * @param current_regs: Pointer ke register CPU saat interrupt timer terjadi.
+ *
+ * Scheduler menyimpan state program saat ini lalu memilih task berikutnya
+ * yang berstatus TASK_READY. Jika semua task DEAD, scheduler berhenti berputar
+ * dan mengembalikan ke task saat ini (idle) untuk mencegah infinite loop.
+ *
+ * BUG FIX #2: Versi lama bisa infinite loop jika SEMUA task berstatus TASK_DEAD
+ * karena loop do-while tidak punya kondisi break. Sekarang kita hitung maksimum
+ * iterasi = jumlah total task dalam linked list agar aman.
+ */
 void schedule(struct registers* current_regs) {
-    if (!current_task || (current_task->next == NULL && task_list_head == task_list_tail)) return;
+    if (!current_task) return;
 
-    // Simpan status program saat ini (HANYA JIKA IA MASIH HIDUP)
+    /* Hitung jumlah total task dalam antrean untuk batas iterasi */
+    uint32_t task_count = 0;
+    struct task* t = task_list_head;
+    while (t != NULL) { task_count++; t = t->next; }
+
+    /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
+    if (task_count <= 1) return;
+
+    /* Simpan state task saat ini (hanya jika masih hidup) */
     if (current_task->state != TASK_DEAD) {
         current_task->regs = *current_regs;
         if (current_task->state == TASK_RUNNING) current_task->state = TASK_READY;
     }
 
-    // Geser ke program selanjutnya di antrean
+    /* Cari task berikutnya yang READY (maks iterasi = jumlah task agar tidak loop selamanya) */
+    uint32_t attempts = 0;
     do {
         current_task = current_task->next;
-        if (current_task == NULL) current_task = task_list_head; 
-    } while (current_task->state == TASK_DEAD); // TERUS LOMPATI JIKA PROGRAM SUDAH MATI!
+        if (current_task == NULL) current_task = task_list_head;
+        attempts++;
+        /* BUG FIX #2: Hentikan pencarian jika sudah keliling semua task tanpa menemukan READY */
+        if (attempts > task_count) {
+            /* Semua task DEAD — kembali ke task kepala (biasanya init/idle task) */
+            current_task = task_list_head;
+            break;
+        }
+    } while (current_task->state == TASK_DEAD);
 
-    // Muat register program baru ke dalam CPU
+    /* Muat register task baru ke CPU */
     current_task->state = TASK_RUNNING;
-    *current_regs = current_task->regs; 
+    *current_regs = current_task->regs;
 }
 
 // Fungsi Pengeksekusi Mati
@@ -106,6 +170,6 @@ void exit_current_task(void) {
     if (current_task != NULL) {
         current_task->state = TASK_DEAD;
     }
-    // Tunggu "Malaikat Maut" (Timer Interrupt) datang untuk membuangnya dari CPU
+    // Tunggu scheduler untuk membersihkan
     while(1) { asm volatile ("sti; hlt"); }
 }

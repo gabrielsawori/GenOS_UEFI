@@ -3,6 +3,10 @@
 #include "../mm/pmm.h"
 #include "../kernel/utils.h"
 
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+
 uint64_t elf_load(uint8_t* binary_data) {
     elf_header_t* header = (elf_header_t*)binary_data;
 
@@ -23,7 +27,8 @@ uint64_t elf_load(uint8_t* binary_data) {
             // Allocate memory and map it
             for (uint64_t j = 0; j < memsz; j += PAGE_SIZE) {
                 void* phys_page = pmm_alloc_page();
-                vmm_map_page((uint64_t)phys_page, vaddr + j, 0x07); // User, RW, Present
+                // PERBAIKAN: urutan parameter (virtual, physical, flags)
+                vmm_map_page(vaddr + j, (uint64_t)phys_page, 0x07); // User, RW, Present
             }
 
             // Copy data to mapped memory

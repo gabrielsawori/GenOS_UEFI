@@ -1,4 +1,5 @@
 #include "tar.h"
+#include "../drivers/serial.h"
 #include "../kernel/utils.h"
 
 // Basic TAR header structure
@@ -17,6 +18,7 @@ static uint8_t *tar_archive = NULL;
 
 void tar_init(void *address) {
     tar_archive = (uint8_t *)address;
+    serial_write_string("[OK] TAR archive initialized from RAM disk module.\n");
 }
 
 // Convert octal string to integer
@@ -52,4 +54,20 @@ char *tar_read_file(const char *filename, size_t *size) {
     }
 
     return NULL;
+}
+
+void tar_list_files(void (*callback)(const char *filename, size_t size)) {
+    if (!tar_archive) return;
+    
+    uint8_t *ptr = tar_archive;
+    while (1) {
+        struct tar_header *header = (struct tar_header *)ptr;
+        if (header->filename[0] == '\0') break;
+        
+        size_t file_size = octal_to_int(header->size, 11);
+        
+        if (callback) callback(header->filename, file_size);
+        
+        ptr += 512 + ((file_size + 511) / 512) * 512;
+    }
 }
