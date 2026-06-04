@@ -74,6 +74,26 @@ Gunakan format berikut untuk setiap bug:
 - Jika scheduler hang setelah aplikasi selesai: pastikan loop `do-while` punya
   batas iterasi agar tidak infinite loop ketika semua task TASK_DEAD.
 
+### 6. Debugging Syscall Assembly (`syscall_asm.S`)
+
+- **Return value hilang?** Periksa apakah `pop %rax` menimpa return value dari
+  `call syscall_handler`. RAX harus disimpan ke register lain (misal RDI) SEBELUM
+  pop sequence, lalu dikembalikan ke RAX SETELAH user RSP di-restore.
+- **Nomor syscall salah?** Jangan gunakan RAX untuk menyimpan data sementara antara
+  entry dan argument shuffle! RAX = nomor syscall. Gunakan R10 untuk temp data.
+- **Scheduler mengganggu return path?** Pastikan `in_syscall` flag di-set sebelum
+  dan di-clear setelah syscall handler. Scheduler harus skip context-switch saat flag aktif.
+- **Keyboard/IRQ tidak menyala selama syscall?** `FMASK=0x200` mematikan IF saat
+  masuk syscall. Handler harus `sti` di awal dan `cli` sebelum return.
+
+### 7. Debugging VMM & TLB
+
+- **Page Fault saat re-mapping halaman?** Jika `vmm_map_page` menulis PTE baru untuk
+  alamat yang sudah pernah di-map, CPU mungkin masih menggunakan mapping LAMA dari
+  TLB cache. Selalu gunakan `invlpg` setelah menulis PTE.
+- **Dua user task saling menimpa stack?** Pastikan setiap task punya alamat stack
+  virtual UNIK. Gunakan static counter dengan gap (misal 64KB) antar stack.
+
 ## Perbaikan dan Validasi
 
 - Gunakan `make clean && make` setelah perubahan besar.

@@ -138,8 +138,16 @@ void _start(void) {
             }
         }
         else {
-            /* Tidak ada input — tidur 10ms agar hemat CPU */
-            user_sleep(10);
+            /*
+             * Tidak ada input — langsung loop kembali ke read_key().
+             *
+             * CATATAN: Kita TIDAK menggunakan user_sleep() di sini karena
+             * sleep syscall melakukan sti;hlt di dalam kernel, yang konflik
+             * dengan scheduler saat context-switch. Sebagai gantinya, shell
+             * melakukan polling cepat. Keyboard IRQ tetap menyala di jendela
+             * singkat antara sysretq dan syscall berikutnya (saat shell di
+             * Ring 3 dengan IF=1).
+             */
         }
     }
 }

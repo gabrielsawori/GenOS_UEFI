@@ -67,6 +67,19 @@ Setelah pembaruan fitur user mode & syscall, kernel mengalami panic. Berikut daf
 | 7 | `kernel/task.c` | User task `SS = 0x2B` = GDT[5] = **TSS descriptor**, bukan User Data! | **#GP Kernel Panic** saat `iretq` context switch ke user task | Ganti ke **0x1B** = GDT[3] = User Data |
 | 8 | `cpu/syscall_asm.S` | Argument shuffle kanan-ke-kiri (`rdx→rcx, rsi→rdx, rdi→rsi, rax→rdi`) diperlukan karena konvensi syscall ≠ konvensi C | Argumen handler C diterima salah → pointer string invalid | Kembalikan shuffle 4-baris yang benar |
 
+### [2026-06-05] Bugfix & Fitur: Shell Ring 3 Migration + Critical Assembly Bugs
+
+**Fitur baru:** Shell dipindahkan dari kernel (Ring 0) ke user-space (Ring 3) sebagai ELF terpisah (`shell.elf`). 5 syscall baru ditambahkan (screen_clear, print_at, draw_char, read_file, exec). Total syscall: 9.
+
+| # | File | Bug | Dampak | Perbaikan |
+|---|------|-----|--------|-----------|
+| 9 | `cpu/syscall_asm.S` | `mov user_rsp_tmp(%rip), %rax` menimpa RAX yang masih berisi **nomor syscall** | Semua syscall terdeteksi "tidak dikenal" (nomor = alamat user RSP) | Ganti ke `%r10` yang aman |
+| 10 | `mm/vmm.c` | `vmm_map_page` tidak flush TLB setelah mengubah page table entry | Run app.elf kedua kali → `memcpy` menulis ke physical page LAMA → data korup → Page Fault | Tambah `invlpg` instruction setelah setiap PTE write |
+| 11 | `kernel/task.c` | Semua user task pakai stack virtual `0x80000000` tetap | Task kedua menimpa mapping stack task pertama | Static counter `next_user_stack` dengan 64KB gap antar stack |
+| 12 | `cpu/syscall_asm.S` | `pop %rax` di return path **menimpa return value** syscall handler dengan saved user RSP | `read_key()` selalu return alamat RSP (0x80000FF0), bukan 0. Shell banjir karakter sampah 0xF0, keyboard asli tak bisa masuk | Simpan return value ke `%rdi` sebelum pop, kembalikan ke `%rax` setelah RSP di-restore |
+| 13 | `cpu/syscall.c` + `kernel/task.c` | Scheduler bisa context-switch **di dalam syscall handler** yang pakai stack terpisah (`kernel_stack_top`) | Return path `sysretq` rusak karena scheduler mengganggu kernel stack | Flag `in_syscall`: scheduler skip switch saat flag aktif |
+| 14 | `cpu/syscall.c` | `FMASK=0x200` mematikan interrupt (IF=0) saat masuk syscall, keyboard IRQ tak bisa menyala | `read_key()` selalu return 0 karena buffer tak pernah terisi selama handler berjalan | `sti` di awal handler, `cli` sebelum return |
+
 ## Fitur Yang Direncanakan
 
 ### Stabilitas dan Debug

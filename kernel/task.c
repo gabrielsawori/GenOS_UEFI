@@ -137,8 +137,22 @@ void create_user_task(uint8_t* binary_data) {
  * karena loop do-while tidak punya kondisi break. Sekarang kita hitung maksimum
  * iterasi = jumlah total task dalam linked list agar aman.
  */
+/*
+ * Flag dari syscall.c: mencegah scheduler context-switch saat
+ * CPU sedang menangani syscall (menggunakan stack terpisah).
+ */
+extern volatile int in_syscall;
+
 void schedule(struct registers* current_regs) {
     if (!current_task) return;
+
+    /*
+     * JANGAN context-switch jika CPU sedang di dalam syscall handler!
+     * Syscall menggunakan kernel_stack_top terpisah. Jika scheduler
+     * melakukan iretq dari konteks syscall, return path (sysretq)
+     * menjadi korup.
+     */
+    if (in_syscall) return;
 
     /* Bangunkan task yang sedang tidur jika waktunya sudah tiba */
     uint64_t now = timer_get_ticks();

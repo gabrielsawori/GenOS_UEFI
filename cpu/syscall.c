@@ -19,6 +19,14 @@ extern struct limine_framebuffer *fb;
 
 uint64_t kernel_stack_top = 0;
 
+/*
+ * Flag global: menandai bahwa CPU sedang di dalam syscall handler.
+ * Scheduler HARUS skip context-switch saat flag ini aktif, karena
+ * syscall menggunakan stack terpisah (kernel_stack_top) yang tidak
+ * kompatibel dengan mekanisme iretq scheduler.
+ */
+volatile int in_syscall = 0;
+
 void syscall_init(void) {
     serial_write_string("[INFO] Membangun Pintu Gerbang System Call...\n");
 
@@ -65,7 +73,11 @@ void syscall_init(void) {
  * └────┴─────────────┴──────────────────────┴──────────────────┴──────────────┴──────────────┘
  */
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+    in_syscall = 1;
+    /* Aktifkan interrupt agar keyboard & timer IRQ bisa menyala */
+    asm volatile ("sti");
 
+    uint64_t result = 0;
     switch (syscall_num) {
 
     /* ================================================================
@@ -81,7 +93,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         serial_write_string("\n");
         fb_print("[APP RING-3] -> ", 50, y_pos, 0xFFFF00, 0x002244, 2);
         fb_print(pesan, 250, y_pos, 0xFFFFFF, 0x002244, 2);
-        return 0;
+        result = 0;
+        break;
     }
 
     /* ================================================================
@@ -89,8 +102,9 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Akhiri task yang sedang berjalan. Tidak pernah kembali.
      * ================================================================ */
     case 2:
+        in_syscall = 0;
         exit_current_task();
-        return 0;
+        result = 0; break; /* tak pernah tercapai */
 
     /* ================================================================
      * SYSCALL 3: read_key(void) -> char
@@ -99,7 +113,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 3: {
         char c = keyboard_get_char();
-        return (uint64_t)c;
+        result = (uint64_t)c;
+        break;
     }
 
     /* ================================================================
@@ -109,9 +124,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     case 4: {
         uint64_t target = timer_get_ticks() + arg1;
         while (timer_get_ticks() < target) {
-            asm volatile ("sti; hlt");
+            asm volatile ("pause");
         }
-        return 0;
+        result = 0;
+        break;
     }
 
     /* ================================================================
@@ -124,7 +140,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
                 fb_draw_pixel(x, y, 0x002244);
             }
         }
-        return 0;
+        result = 0;
+        break;
     }
 
     /* ================================================================
@@ -138,7 +155,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
         uint32_t color = (uint32_t)arg3;
         fb_print(text, x, y, color, 0x002244, 2);
-        return 0;
+        result = 0;
+        break;
     }
 
     /* ================================================================
@@ -151,7 +169,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
         uint32_t color = (uint32_t)arg3;
         fb_draw_char(c, x, y, color, 0x002244, 2);
-        return 0;
+        result = 0;
+        break;
     }
 
     /* ================================================================
@@ -173,7 +192,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         for (uint64_t i = 0; i < copy_size; i++) {
             user_buf[i] = file_data[i];
         }
-        return copy_size;
+        result = copy_size;
+        break;
     }
 
     /* ================================================================
@@ -188,11 +208,18 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         if (elf_data == NULL) return (uint64_t)-1;
 
         create_user_task((uint8_t*)elf_data);
-        return 0;
+        result = 0;
+        break;
     }
 
     default:
         serial_write_string("[WARN] Syscall tidak dikenal\n");
-        return (uint64_t)-1;
+        result = (uint64_t)-1;
+        break;
     }
+
+    /* Matikan interrupt sebelum kembali ke syscall_entry (sysretq membutuhkan CLI) */
+    asm volatile ("cli");
+    in_syscall = 0;
+    return result;
 }

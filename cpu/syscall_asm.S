@@ -83,7 +83,16 @@ syscall_entry:
     /* 4. PANGGIL HANDLER SYSCALL (Fungsi C) */
     call syscall_handler
 
-    /* 5. KEMBALIKAN SEMUANYA SEPERTI SEMULA */
+    /*
+     * 5. KEMBALIKAN SEMUANYA SEPERTI SEMULA
+     *
+     * RAX sekarang berisi RETURN VALUE dari syscall_handler.
+     * Kita HARUS menyimpannya sebelum pop sequence, karena nanti
+     * kita perlu pop user RSP dari stack. Gunakan RDI sebagai
+     * tempat sementara (RDI tidak ada di push/pop list).
+     */
+    mov %rax, %rdi          /* Simpan return value ke RDI (aman) */
+
     pop %r15
     pop %r14
     pop %r13
@@ -92,11 +101,14 @@ syscall_entry:
     pop %rbx
 
     /* Pulihkan RSP user, R11 (RFLAGS), dan RCX (RIP user) */
-    pop %rax                /* Dapatkan kembali RSP user yang kita simpan tadi */
+    pop %rax                /* RAX = user RSP (dari stack) */
     pop %r11                /* Pulihkan RFLAGS user */
     pop %rcx                /* Pulihkan RIP user (sysretq butuh ini di RCX) */
     mov %rax, %rsp          /* Ganti RSP ke Stack User kembali */
 
+    mov %rdi, %rax          /* Kembalikan RETURN VALUE ke RAX! */
+
     /* Kembali ke User Mode (Ring 3).
-     * sysretq akan: RIP=RCX, RFLAGS=R11, CS=selector user, SS=selector user+8 */
+     * sysretq akan: RIP=RCX, RFLAGS=R11, CS=selector user, SS=selector user+8
+     * RAX = return value yang diterima user-space */
     sysretq
