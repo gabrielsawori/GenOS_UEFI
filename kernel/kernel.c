@@ -197,16 +197,6 @@ void _start(void) {
      */
     syscall_init();
 
-    /* Jika ada app.elf di dalam ramdisk, jalankan otomatis untuk verifikasi */
-    if (module_request.response != NULL && module_request.response->module_count > 0) {
-        size_t app_size = 0;
-        char* app_ptr = tar_read_file("app.elf", &app_size);
-        if (app_ptr != NULL) {
-            serial_write_string("[INFO] Auto-launching app.elf from ramdisk for test...\n");
-            create_user_task((uint8_t*)app_ptr);
-        }
-    }
-
     create_task(shell_task);
 
     asm volatile ("sti");

@@ -4,6 +4,7 @@
 #include "../mm/vmm.h"
 #include "../fs/elf.h"
 #include "../drivers/serial.h"
+#include "../drivers/timer.h"
 #include <stddef.h>
 
 static struct task* current_task = NULL;
@@ -132,16 +133,26 @@ void create_user_task(uint8_t* binary_data) {
 void schedule(struct registers* current_regs) {
     if (!current_task) return;
 
+    /* Bangunkan task yang sedang tidur jika waktunya sudah tiba */
+    uint64_t now = timer_get_ticks();
+    struct task* t = task_list_head;
+    while (t != NULL) {
+        if (t->state == TASK_SLEEPING && now >= t->sleep_until) {
+            t->state = TASK_READY;
+        }
+        t = t->next;
+    }
+
     /* Hitung jumlah total task dalam antrean untuk batas iterasi */
     uint32_t task_count = 0;
-    struct task* t = task_list_head;
+    t = task_list_head;
     while (t != NULL) { task_count++; t = t->next; }
 
     /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
     if (task_count <= 1) return;
 
-    /* Simpan state task saat ini (hanya jika masih hidup) */
-    if (current_task->state != TASK_DEAD) {
+    /* Simpan state task saat ini (hanya jika masih hidup dan tidak tidur) */
+    if (current_task->state != TASK_DEAD && current_task->state != TASK_SLEEPING) {
         current_task->regs = *current_regs;
         if (current_task->state == TASK_RUNNING) current_task->state = TASK_READY;
     }
@@ -152,13 +163,13 @@ void schedule(struct registers* current_regs) {
         current_task = current_task->next;
         if (current_task == NULL) current_task = task_list_head;
         attempts++;
-        /* BUG FIX #2: Hentikan pencarian jika sudah keliling semua task tanpa menemukan READY */
+        /* Hentikan pencarian jika sudah keliling semua task tanpa menemukan READY */
         if (attempts > task_count) {
-            /* Semua task DEAD — kembali ke task kepala (biasanya init/idle task) */
+            /* Semua task DEAD/SLEEPING — kembali ke task kepala (init/idle task) */
             current_task = task_list_head;
             break;
         }
-    } while (current_task->state == TASK_DEAD);
+    } while (current_task->state == TASK_DEAD || current_task->state == TASK_SLEEPING);
 
     /* Muat register task baru ke CPU */
     current_task->state = TASK_RUNNING;
@@ -172,4 +183,20 @@ void exit_current_task(void) {
     }
     // Tunggu scheduler untuk membersihkan
     while(1) { asm volatile ("sti; hlt"); }
+}
+
+/*
+ * sleep_current_task() - Menidurkan task saat ini sampai tick tertentu.
+ *
+ * @param wake_tick: nilai timer tick di mana task harus dibangunkan.
+ *
+ * Fungsi ini TIDAK memblokir — hanya menandai task sebagai SLEEPING.
+ * Scheduler akan skip task ini sampai timer_get_ticks() >= wake_tick,
+ * lalu otomatis membangunkan (ubah state ke TASK_READY).
+ */
+void sleep_current_task(uint64_t wake_tick) {
+    if (current_task != NULL) {
+        current_task->sleep_until = wake_tick;
+        current_task->state = TASK_SLEEPING;
+    }
 }

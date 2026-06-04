@@ -126,21 +126,21 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     /*
      * SYSCALL 4: sleep(uint32_t milliseconds)
      *
-     * Menahan eksekusi task selama N milidetik.
-     * Menggunakan timer PIT yang berdetak 1000x/detik (1 tick = 1 ms).
+     * Menidurkan task selama N milidetik secara NON-BLOCKING.
      *
-     * CATATAN: Selama sleep, CPU melakukan HLT di loop — interrupt (termasuk
-     * timer) masih aktif sehingga scheduler tetap bisa context-switch ke task
-     * lain. Namun task yang memanggil sleep akan tetap di dalam loop sampai
-     * waktu habis. Ini adalah implementasi "busy-wait with HLT" yang sederhana.
+     * Versi sebelumnya menggunakan busy-wait (loop sti;hlt) di dalam kernel,
+     * yang menyebabkan BUG KRITIS: saat timer interrupt masuk di tengah loop,
+     * scheduler menyimpan register state dari konteks syscall handler — bukan
+     * register state asli user task. Akibatnya, saat scheduler memulihkan
+     * state yang corrupt ini, program crash dengan page fault.
+     *
+     * Sekarang kita hanya set state = TASK_SLEEPING dan langsung return.
+     * Scheduler akan otomatis skip task ini dan membangunkan saat waktunya tiba.
      *
      * arg1 = jumlah milidetik untuk tidur
      */
     case 4: {
-        uint64_t target = timer_get_ticks() + arg1;
-        while (timer_get_ticks() < target) {
-            asm volatile ("sti; hlt");
-        }
+        sleep_current_task(timer_get_ticks() + arg1);
         return 0;
     }
 
