@@ -7,6 +7,7 @@
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
 #include "../kernel/task.h"
+#include "../fs/tar.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -14,6 +15,7 @@
 #define MSR_FMASK 0xC0000084
 
 extern void syscall_entry(void);
+extern struct limine_framebuffer *fb;
 
 uint64_t kernel_stack_top = 0;
 
@@ -25,67 +27,51 @@ void syscall_init(void) {
     set_kernel_stack(kernel_stack_top);
 
     uint64_t efer = rdmsr(MSR_EFER);
-    wrmsr(MSR_EFER, efer | 1); // Enable syscall/sysret
+    wrmsr(MSR_EFER, efer | 1);
 
     /*
      * STAR MSR Layout:
-     *   STAR[47:32] = Kernel CS selector (untuk SYSCALL masuk kernel)
-     *     → CPU otomatis: Kernel CS = STAR[47:32],  Kernel SS = STAR[47:32] + 8
-     *   STAR[63:48] = Base selector (untuk SYSRETQ kembali ke user)
-     *     → CPU otomatis: User CS = (STAR[63:48] + 16) | 3
-     *                     User SS = (STAR[63:48] + 8)  | 3
-     *
-     * GDT kita:
-     *   [0]=Null  [1]=KCode(0x08)  [2]=KData(0x10)
-     *   [3]=UData(0x18/0x1B)  [4]=UCode(0x20/0x23)  [5-6]=TSS(0x28)
-     *
-     * Maka STAR[63:48] = 0x10 agar:
-     *   User CS = (0x10 + 16) | 3 = 0x20 | 3 = 0x23 ✓ (GDT[4] User Code)
-     *   User SS = (0x10 + 8)  | 3 = 0x18 | 3 = 0x1B ✓ (GDT[3] User Data)
+     *   STAR[47:32] = Kernel CS (0x08)
+     *   STAR[63:48] = Base untuk SYSRETQ (0x10)
+     *     → User CS = (0x10 + 16) | 3 = 0x23 ✓
+     *     → User SS = (0x10 + 8)  | 3 = 0x1B ✓
      */
     uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
     wrmsr(MSR_STAR, star);
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
-    wrmsr(MSR_FMASK, 0x200); // Clear IF (interrupt flag) saat syscall
+    wrmsr(MSR_FMASK, 0x200);
 
     serial_write_string("[OK] Pintu Gerbang Syscall Berhasil Dibuka!\n");
-    serial_write_string("     Syscall tersedia: 1=print, 2=exit, 3=read_key, 4=sleep\n");
+    serial_write_string("     Syscall: 1=print 2=exit 3=read_key 4=sleep\n");
+    serial_write_string("             5=clear 6=print_at 7=draw_char 8=read_file 9=exec\n");
 }
 
 /*
  * syscall_handler() - Dispatcher utama System Call dari Ring 3.
  *
- * Dipanggil oleh syscall_entry (assembly) setelah argumen diterjemahkan
- * dari konvensi syscall ke konvensi C (System V AMD64 ABI).
- *
  * Tabel Syscall GenOS:
- * ┌──────┬────────────┬─────────────────────┬───────────┬──────────────┐
- * │  No  │  Nama      │  arg1 (RSI→RDI)     │ arg2      │ Return (RAX) │
- * ├──────┼────────────┼─────────────────────┼───────────┼──────────────┤
- * │  1   │  print     │  char* teks         │ uint y_pos│ 0            │
- * │  2   │  exit      │  int status         │ -         │ (tidak kembali)│
- * │  3   │  read_key  │  -                  │ -         │ char (0=kosong)│
- * │  4   │  sleep     │  uint32 milidetik   │ -         │ 0            │
- * └──────┴────────────┴─────────────────────┴───────────┴──────────────┘
- *
- * @param syscall_num: nomor syscall (dari RAX user)
- * @param arg1: argumen pertama (dari RDI user)
- * @param arg2: argumen kedua (dari RSI user)
- * @param arg3: argumen ketiga (dari RDX user)
- * @return: nilai kembalian yang akan masuk ke RAX user
+ * ┌────┬─────────────┬──────────────────────┬──────────────────┬──────────────┬──────────────┐
+ * │ No │ Nama        │ arg1                 │ arg2             │ arg3         │ Return (RAX) │
+ * ├────┼─────────────┼──────────────────────┼──────────────────┼──────────────┼──────────────┤
+ * │  1 │ print       │ char* teks           │ uint y_pos       │ -            │ 0            │
+ * │  2 │ exit        │ int status           │ -                │ -            │ (tak kembali)│
+ * │  3 │ read_key    │ -                    │ -                │ -            │ char / 0     │
+ * │  4 │ sleep       │ uint32 ms            │ -                │ -            │ 0            │
+ * │  5 │ screen_clear│ -                    │ -                │ -            │ 0            │
+ * │  6 │ print_at    │ char* teks           │ (x<<32)|y        │ fg_color     │ 0            │
+ * │  7 │ draw_char   │ char c               │ (x<<32)|y        │ fg_color     │ 0            │
+ * │  8 │ read_file   │ char* filename       │ char* buffer     │ max_size     │ bytes_read   │
+ * │  9 │ exec        │ char* filename       │ -                │ -            │ 0=ok / -1    │
+ * └────┴─────────────┴──────────────────────┴──────────────────┴──────────────┴──────────────┘
  */
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
-    (void)arg3;
 
     switch (syscall_num) {
 
-    /*
+    /* ================================================================
      * SYSCALL 1: print(char* text, uint64_t y_pos)
-     *
-     * Mencetak teks dari aplikasi Ring-3 ke layar framebuffer dan serial.
-     * arg1 = pointer ke string (di memori user-space)
-     * arg2 = koordinat Y pada layar (0 = default 100)
-     */
+     * Cetak teks ke framebuffer + serial (kompatibilitas lama)
+     * ================================================================ */
     case 1: {
         char* pesan = (char*)arg1;
         uint64_t y_pos = arg2;
@@ -98,55 +84,115 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         return 0;
     }
 
-    /*
+    /* ================================================================
      * SYSCALL 2: exit(int status)
-     *
-     * Mengakhiri task yang sedang berjalan dengan aman.
-     * Task ditandai TASK_DEAD dan scheduler akan melewatinya.
-     * Fungsi ini TIDAK PERNAH kembali ke caller.
-     */
+     * Akhiri task yang sedang berjalan. Tidak pernah kembali.
+     * ================================================================ */
     case 2:
         exit_current_task();
-        return 0; /* Tidak pernah tercapai */
+        return 0;
 
-    /*
+    /* ================================================================
      * SYSCALL 3: read_key(void) -> char
-     *
-     * Membaca satu karakter dari ring buffer keyboard.
-     * Non-blocking: mengembalikan 0 jika tidak ada tombol yang ditekan.
-     * Aplikasi harus memanggil berulang (polling) atau kombinasi dengan sleep.
-     *
-     * Return: karakter ASCII (misal 'a', '1', '\n') atau 0 jika buffer kosong.
-     */
+     * Baca 1 karakter dari keyboard buffer (non-blocking).
+     * Return 0 jika buffer kosong.
+     * ================================================================ */
     case 3: {
         char c = keyboard_get_char();
         return (uint64_t)c;
     }
 
-    /*
+    /* ================================================================
      * SYSCALL 4: sleep(uint32_t milliseconds)
-     *
-     * Menidurkan task selama N milidetik secara NON-BLOCKING.
-     *
-     * Versi sebelumnya menggunakan busy-wait (loop sti;hlt) di dalam kernel,
-     * yang menyebabkan BUG KRITIS: saat timer interrupt masuk di tengah loop,
-     * scheduler menyimpan register state dari konteks syscall handler — bukan
-     * register state asli user task. Akibatnya, saat scheduler memulihkan
-     * state yang corrupt ini, program crash dengan page fault.
-     *
-     * Sekarang kita hanya set state = TASK_SLEEPING dan langsung return.
-     * Scheduler akan otomatis skip task ini dan membangunkan saat waktunya tiba.
-     *
-     * arg1 = jumlah milidetik untuk tidur
-     */
+     * Tahan eksekusi selama N milidetik (busy-wait with HLT).
+     * ================================================================ */
     case 4: {
-        sleep_current_task(timer_get_ticks() + arg1);
+        uint64_t target = timer_get_ticks() + arg1;
+        while (timer_get_ticks() < target) {
+            asm volatile ("sti; hlt");
+        }
+        return 0;
+    }
+
+    /* ================================================================
+     * SYSCALL 5: screen_clear(void)
+     * Bersihkan seluruh layar framebuffer dengan warna background.
+     * ================================================================ */
+    case 5: {
+        for (size_t y = 0; y < fb->height; y++) {
+            for (size_t x = 0; x < fb->width; x++) {
+                fb_draw_pixel(x, y, 0x002244);
+            }
+        }
+        return 0;
+    }
+
+    /* ================================================================
+     * SYSCALL 6: print_at(char* text, (x << 32) | y, fg_color)
+     * Cetak teks pada posisi (x, y) dengan warna foreground tertentu.
+     * Koordinat di-pack: arg2 = (x << 32) | (y & 0xFFFFFFFF)
+     * ================================================================ */
+    case 6: {
+        char* text = (char*)arg1;
+        uint32_t x = (uint32_t)(arg2 >> 32);
+        uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
+        uint32_t color = (uint32_t)arg3;
+        fb_print(text, x, y, color, 0x002244, 2);
+        return 0;
+    }
+
+    /* ================================================================
+     * SYSCALL 7: draw_char(char c, (x << 32) | y, fg_color)
+     * Gambar 1 karakter pada posisi (x, y) dengan warna tertentu.
+     * ================================================================ */
+    case 7: {
+        char c = (char)arg1;
+        uint32_t x = (uint32_t)(arg2 >> 32);
+        uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
+        uint32_t color = (uint32_t)arg3;
+        fb_draw_char(c, x, y, color, 0x002244, 2);
+        return 0;
+    }
+
+    /* ================================================================
+     * SYSCALL 8: read_file(char* filename, char* buffer, uint64_t max)
+     * Baca file dari TAR ramdisk ke buffer user-space.
+     * Return: jumlah byte yang dibaca, atau 0 jika file tidak ditemukan.
+     * ================================================================ */
+    case 8: {
+        char* filename = (char*)arg1;
+        char* user_buf = (char*)arg2;
+        uint64_t max_size = arg3;
+
+        size_t file_size = 0;
+        char* file_data = tar_read_file(filename, &file_size);
+        if (file_data == NULL) return 0;
+
+        /* Salin ke buffer user, batasi ukuran */
+        uint64_t copy_size = file_size < max_size ? file_size : max_size;
+        for (uint64_t i = 0; i < copy_size; i++) {
+            user_buf[i] = file_data[i];
+        }
+        return copy_size;
+    }
+
+    /* ================================================================
+     * SYSCALL 9: exec(char* filename)
+     * Muat dan jalankan file ELF dari ramdisk sebagai user task baru.
+     * Return: 0 = berhasil, -1 = file tidak ditemukan / gagal.
+     * ================================================================ */
+    case 9: {
+        char* filename = (char*)arg1;
+        size_t ukuran = 0;
+        char* elf_data = tar_read_file(filename, &ukuran);
+        if (elf_data == NULL) return (uint64_t)-1;
+
+        create_user_task((uint8_t*)elf_data);
         return 0;
     }
 
     default:
-        serial_write_string("[WARN] Syscall tidak dikenal: ");
-        serial_write_string("nomor tidak valid\n");
+        serial_write_string("[WARN] Syscall tidak dikenal\n");
         return (uint64_t)-1;
     }
 }

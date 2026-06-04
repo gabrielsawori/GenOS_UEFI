@@ -65,6 +65,22 @@ void vmm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags)
         pd[pd_idx] = p | 0b111;
     }
 
-    // --- Lapis Terakhir: Tautkan dengan Fisik Asli ---
+    /* --- Lapis Terakhir: Tautkan dengan Fisik Asli --- */
     pt[pt_idx] = physical_addr | flags;
+
+    /*
+     * FLUSH TLB untuk alamat virtual ini.
+     *
+     * CPU menyimpan cache mapping virtual→fisik di TLB (Translation Lookaside
+     * Buffer). Jika kita memetakan ulang alamat yang SUDAH PERNAH di-map
+     * sebelumnya (misal: run app.elf kedua kali), CPU masih mengingat mapping
+     * LAMA di TLB. Akibatnya:
+     *   - memcpy() menulis ELF data ke physical page LAMA (bukan yang baru)
+     *   - Aplikasi membaca data korup dari page baru yang kosong
+     *   - Page fault saat akses melampaui batas page
+     *
+     * invlpg menghapus satu entry TLB untuk alamat virtual tertentu,
+     * memaksa CPU membaca ulang dari page table saat akses berikutnya.
+     */
+    asm volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
 }

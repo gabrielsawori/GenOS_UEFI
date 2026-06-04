@@ -73,8 +73,15 @@ void create_user_task(uint8_t* binary_data) {
         return;
     }
 
-    /* 2. Siapkan Stack User Mode (1 page = 4096 byte) */
-    uint64_t app_stack_virt = 0x80000000;
+    /* 2. Siapkan Stack User Mode (1 page = 4096 byte)
+     *
+     * Setiap user task mendapat alamat stack virtual UNIK agar tidak saling
+     * menimpa. Alamat dimulai dari 0x80000000 dan bertambah 0x10000 (64KB)
+     * per task, memberikan ruang guard page antar stack.
+     */
+    static uint64_t next_user_stack = 0x80000000;
+    uint64_t app_stack_virt = next_user_stack;
+    next_user_stack += 0x10000; /* 64KB gap antar stack */
     uint64_t phys_stack = (uint64_t)pmm_alloc_page();
     if (!phys_stack) {
         serial_write_string("[ERROR] Failed to allocate user stack!\n");

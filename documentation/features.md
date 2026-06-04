@@ -11,12 +11,18 @@ Dokumen ini menjelaskan fitur yang saat ini ada di GenOS, serta fitur yang diren
 - **Page Fault Handler Diagnostik:** Membaca CR2 (faulting address), mendekode error code (Present/Write/User/Reserved/InstructionFetch), menampilkan RIP dan CS ke serial + layar.
 - **GPF Handler Diagnostik:** Menampilkan error code (biasanya selector yang bermasalah), RIP, CS, RSP, SS untuk mempercepat debugging segment selector.
 - PIC remapping untuk hardware interrupt (keyboard, timer).
-- **Syscall Gateway (MSR SYSCALL/SYSRET):** Gate Ring-3 → Ring-0 via instruksi `syscall`/`sysretq`. Tabel syscall:
+- **Syscall Gateway (MSR SYSCALL/SYSRET):** Gate Ring-3 → Ring-0 via `syscall`/`sysretq`. 9 syscall tersedia:
   - `1 (print)`: cetak teks ke framebuffer + serial
   - `2 (exit)`: akhiri task dengan aman
   - `3 (read_key)`: baca karakter dari keyboard buffer (non-blocking)
   - `4 (sleep)`: tahan eksekusi selama N milidetik
+  - `5 (screen_clear)`: bersihkan seluruh layar
+  - `6 (print_at)`: cetak teks pada posisi (x,y) dengan warna
+  - `7 (draw_char)`: gambar 1 karakter pada posisi (x,y)
+  - `8 (read_file)`: baca file dari TAR ramdisk ke buffer user
+  - `9 (exec)`: jalankan program ELF dari ramdisk
 - TSS (Task State Segment) untuk stack kernel darurat saat interrupt dari Ring-3.
+- **Shell di Ring 3:** Terminal sistem berjalan sepenuhnya di user-space (`shell.elf` @ `0x50000000`), terisolasi dari kernel. Semua akses hardware melalui syscall.
 
 ### Manajemen Memori
 - Physical Memory Manager (`PMM`) berbasis bitmap untuk alokasi RAM fisik.

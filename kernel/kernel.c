@@ -4,7 +4,6 @@
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/timer.h"
-#include "../drivers/keyboard.h"
 #include "../cpu/gdt.h"
 #include "../cpu/idt.h"
 #include "../cpu/pic.h"
@@ -31,174 +30,101 @@ volatile struct limine_module_request module_request = {
 
 static void hcf(void) { asm ("cli"); for (;;) { asm ("hlt"); } }
 
-static int cursor_x = 50;
-static int cursor_y = 100;
-struct limine_framebuffer *fb; 
+/*
+ * Framebuffer global — digunakan oleh syscall handler (screen_clear, dll).
+ * Dideklarasikan di sini karena framebuffer_request response hanya tersedia
+ * di kernel.c setelah boot.
+ */
+struct limine_framebuffer *fb;
 
-void clear_screen() {
-    for (size_t y = 0; y < fb->height; y++) {
-        for (size_t x = 0; x < fb->width; x++) { fb_draw_pixel(x, y, 0x002244); }
-    }
-    cursor_x = 50;
-    cursor_y = 50;
-}
-
-void terminal_print(const char* text, uint32_t color) {
-    fb_print(text, cursor_x, cursor_y, color, 0x002244, 2);
-    cursor_y += 24;
-    cursor_x = 50;
-}
-
-void shell_task(void) {
-    clear_screen();
-    terminal_print("=============================================", 0xFFFFFF);
-    terminal_print("           GENOS SYSTEM TERMINAL V3          ", 0x00FF00);
-    terminal_print("=============================================", 0xFFFFFF);
-    terminal_print("Type 'help' to see available commands.", 0xAAAAAA);
-    cursor_y += 10;
-
-    char cmd_buffer[256];
-    int cmd_index = 0;
-
-    fb_print("Mandor@GenOS:~$ ", cursor_x, cursor_y, 0x00FFFF, 0x002244, 2);
-    cursor_x += 16 * 16; 
-    int prompt_batas_kiri = cursor_x; 
-
-    while(1) {
-        char c = keyboard_get_char();
-
-        if (c != 0) { 
-            if (c == '\n') { 
-                cmd_buffer[cmd_index] = '\0'; 
-                cursor_y += 24; 
-                cursor_x = 50;  
-                
-                if (cmd_index > 0) {
-                    if (strcmp(cmd_buffer, "help") == 0) {
-                        terminal_print("Available Commands:", 0xFFFF00);
-                        terminal_print("  help : Show this message", 0xFFFFFF);
-                        terminal_print("  clear: Clear the terminal screen", 0xFFFFFF);
-                        terminal_print("  info : OS Information", 0xFFFFFF);
-                        terminal_print("  read : Read pesan.txt from Ramdisk", 0xFFFFFF);
-                        terminal_print("  run  : Execute app.elf in Ring 3!", 0x00FF00);
-                    } 
-                    else if (strcmp(cmd_buffer, "clear") == 0) { 
-                        clear_screen(); 
-                    }
-                    else if (strcmp(cmd_buffer, "info") == 0) {
-                        terminal_print("GenOS v3 (64-bit UEFI) - Built by Mandor", 0x00FF00);
-                        terminal_print("Architecture: x86_64 | Security: User Mode Ring-3 | Format: ELF", 0x00FF00);
-                    }
-                    else if (strcmp(cmd_buffer, "read") == 0) {
-                        size_t ukuran = 0;
-                        char* isi_file = tar_read_file("pesan.txt", &ukuran);
-                        
-                        if (isi_file != NULL) {
-                            char temp[256];
-                            size_t copy_size = ukuran < 255 ? ukuran : 255;
-                            for(size_t i=0; i<copy_size; i++) temp[i] = isi_file[i];
-                            temp[copy_size] = '\0';
-                            
-                            terminal_print("Extracting pesan.txt from Ramdisk:", 0xFFFF00);
-                            terminal_print(temp, 0xFFFFFF);
-                        } else {
-                            terminal_print("[ERROR] pesan.txt not found!", 0xFF0000);
-                        }
-                    }
-                    else if (strcmp(cmd_buffer, "run") == 0) {
-                        size_t ukuran = 0;
-                        // MENCARI FILE ELF, BUKAN BIN
-                        char* app_data = tar_read_file("app.elf", &ukuran);
-                        
-                        if (app_data != NULL) {
-                            terminal_print("Loading ELF application into User Mode (Ring 3)...", 0x00FF00);
-                            // MEMANGGIL DENGAN 1 ARGUMEN SAJA
-                            create_user_task((uint8_t*)app_data); 
-                        } else {
-                            terminal_print("[ERROR] app.elf not found in Ramdisk!", 0xFF0000);
-                        }
-                    }
-                    else {
-                        fb_print("Command not found: ", cursor_x, cursor_y, 0xFF0000, 0x002244, 2);
-                        fb_print(cmd_buffer, cursor_x + 260, cursor_y, 0xFFFF00, 0x002244, 2);
-                        cursor_y += 24;
-                    }
-                }
-                
-                cmd_index = 0; 
-                fb_print("Mandor@GenOS:~$ ", cursor_x, cursor_y, 0x00FFFF, 0x002244, 2);
-                cursor_x += 16 * 16;
-                prompt_batas_kiri = cursor_x;
-            } 
-            else if (c == '\b') { 
-                if (cmd_index > 0) { 
-                    cmd_index--; 
-                    cursor_x -= 16; 
-                    fb_draw_char(' ', cursor_x, cursor_y, 0x000000, 0x002244, 2);
-                }
-            } 
-            else { 
-                if (cmd_index < 254) { 
-                    cmd_buffer[cmd_index++] = c; 
-                    fb_draw_char(c, cursor_x, cursor_y, 0xFFFFFF, 0x002244, 2);
-                    cursor_x += 16; 
-                    if (cursor_x > 750) { cursor_y += 24; cursor_x = prompt_batas_kiri; }
-                }
-            }
-        } 
-        else { 
-            asm volatile ("hlt"); 
-        }
-    }
-}
-
+/*
+ * _start() — Entry point kernel GenOS v3.
+ *
+ * Urutan inisialisasi:
+ *   1. Serial (untuk debug output)
+ *   2. GDT + TSS (segment descriptors Ring 0 & Ring 3)
+ *   3. IDT + ISR (exception & interrupt handlers)
+ *   4. PIC (hardware interrupt routing)
+ *   5. PIT Timer (scheduler heartbeat @ 1000 Hz)
+ *   6. Framebuffer (layar)
+ *   7. PMM → VMM → Heap (memory management)
+ *   8. Task Scheduler (multitasking engine)
+ *   9. TAR Ramdisk (file system)
+ *  10. Syscall Gateway (Ring 3 ↔ Ring 0 communication)
+ *  11. Launch shell.elf (user-space terminal)
+ *  12. Enable interrupts → idle loop
+ *
+ * PENTING: shell TIDAK LAGI berjalan di kernel (Ring 0).
+ * Shell sekarang adalah ELF user-space di Ring 3 yang berkomunikasi
+ * dengan kernel sepenuhnya melalui system call.
+ */
 void _start(void) {
     if (LIMINE_BASE_REVISION_SUPPORTED == 0) hcf();
 
+    /* === FASE 1: Hardware Dasar === */
     serial_init();
     serial_write_string("[INFO] Booting GenOS v3...\n");
 
     gdt_init();
-    idt_init(); 
+    idt_init();
     pic_remap();
-    timer_init(1000); 
+    timer_init(1000);
 
     if (framebuffer_request.response == NULL || memmap_request.response == NULL) hcf();
-    fb = framebuffer_request.response->framebuffers[0]; 
+    fb = framebuffer_request.response->framebuffers[0];
     fb_init(fb);
 
+    /* === FASE 2: Memory Management === */
     serial_write_string("[INFO] Initializing Memory Management...\n");
     pmm_init();
     vmm_init();
-    heap_init(); 
-    
+    heap_init();
+
+    /* === FASE 3: Task Scheduler === */
     serial_write_string("[INFO] Starting Task Scheduler...\n");
     task_init();
 
+    /* === FASE 4: Ramdisk & Filesystem === */
     if (module_request.response != NULL && module_request.response->module_count > 0) {
         serial_write_string("[INFO] Loading ramdisk module for TAR filesystem...\n");
         tar_init(module_request.response->modules[0]->address);
     } else {
-        serial_write_string("[WARN] No ramdisk module available; TAR filesystem disabled.\n");
+        serial_write_string("[WARN] No ramdisk module; TAR filesystem disabled.\n");
     }
 
-    /*
-     * BUG FIX #3: syscall_init() HARUS dipanggil SEBELUM create_user_task()!
-     * Sebelumnya syscall_init() dipanggil setelah create_user_task(), yang berarti
-     * ketika timer IRQ pertama memicu context-switch ke aplikasi Ring-3 dan aplikasi
-     * langsung memanggil syscall, gate syscall belum terdaftar di MSR LSTAR.
-     * Akibatnya CPU memicu #UD (Invalid Opcode) atau #GP → Kernel Panic.
-     *
-     * Urutan yang benar:
-     *   1. syscall_init()       <- Buka gerbang syscall DULU
-     *   2. create_user_task()   <- Baru luncurkan aplikasi Ring-3
-     *   3. create_task(shell)   <- Luncurkan shell kernel
-     *   4. sti                  <- Aktifkan interrupt terakhir
-     */
+    /* === FASE 5: Syscall Gateway === */
     syscall_init();
 
-    create_task(shell_task);
+    /* === FASE 6: Launch User-Space Shell ===
+     *
+     * Shell berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
+     * Semua akses ke hardware (layar, keyboard, filesystem) dilakukan
+     * melalui system call. Jika shell crash, kernel tetap aman.
+     *
+     * shell.elf di-link di alamat 0x50000000 (terpisah dari app.elf
+     * yang di 0x40000000) agar keduanya bisa berjalan bersamaan.
+     */
+    serial_write_string("[INFO] Launching user-space shell (Ring 3)...\n");
+    {
+        size_t ukuran = 0;
+        char* shell_data = tar_read_file("shell.elf", &ukuran);
+        if (shell_data != NULL) {
+            create_user_task((uint8_t*)shell_data);
+            serial_write_string("[OK] Shell launched in Ring 3!\n");
+        } else {
+            serial_write_string("[FATAL] shell.elf not found in ramdisk!\n");
+            /* Tampilkan pesan darurat di layar */
+            fb_print("FATAL: shell.elf not found!", 50, 100, 0xFF0000, 0x002244, 2);
+            fb_print("Ramdisk must contain shell.elf", 50, 130, 0xFFFF00, 0x002244, 2);
+            hcf();
+        }
+    }
 
+    /* === FASE 7: Aktifkan Interrupt & Idle Loop ===
+     * Kernel masuk ke idle loop. Semua pekerjaan user dilakukan oleh
+     * shell.elf dan aplikasi Ring-3 lainnya melalui scheduler.
+     */
     asm volatile ("sti");
-    while(1) { asm volatile ("hlt"); }
+    serial_write_string("[INFO] Kernel idle. All user work runs in Ring 3.\n");
+    while (1) { asm volatile ("hlt"); }
 }

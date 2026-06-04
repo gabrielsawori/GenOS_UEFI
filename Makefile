@@ -9,6 +9,10 @@ C_SRCS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)/*.c))
 ASM_SRCS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)/*.S))
 OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.S=.o)
 
+# Daftar file libc yang digunakan oleh semua aplikasi user-space
+LIBC_SRCS = libc/stdio.c libc/stdlib.c libc/string.c
+LIBC_OBJS = $(LIBC_SRCS:.c=.o)
+
 .PHONY: all clean run iso ramdisk
 
 all: GenOS.iso
@@ -22,18 +26,23 @@ all: GenOS.iso
 kernel.elf: $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
 
-# --- KOMPILASI APLIKASI USER SEBAGAI ELF ---
-app.elf:
-	mkdir -p app libc
-	$(CC) $(CFLAGS) -c libc/stdio.c -o libc/stdio.o
-	$(CC) $(CFLAGS) -c libc/stdlib.c -o libc/stdlib.o
-	$(CC) $(CFLAGS) -c app/app.c -o app/app.o
-	$(LD) -nostdlib -Ttext 0x40000000 app/app.o libc/stdio.o libc/stdlib.o -o app.elf
+# --- KOMPILASI SHELL SEBAGAI ELF USER-SPACE (Ring 3) ---
+# Di-link di 0x50000000 agar tidak konflik dengan app.elf (0x40000000)
+shell.elf: $(LIBC_OBJS)
+	mkdir -p shell
+	$(CC) $(CFLAGS) -c shell/shell.c -o shell/shell.o
+	$(LD) -nostdlib -Ttext 0x50000000 shell/shell.o $(LIBC_OBJS) -o shell.elf
 
-# --- BUNGKUS APLIKASI KE RAMDISK ---
-ramdisk.tar: app.elf
+# --- KOMPILASI APLIKASI USER SEBAGAI ELF ---
+app.elf: $(LIBC_OBJS)
+	mkdir -p app
+	$(CC) $(CFLAGS) -c app/app.c -o app/app.o
+	$(LD) -nostdlib -Ttext 0x40000000 app/app.o $(LIBC_OBJS) -o app.elf
+
+# --- BUNGKUS SEMUA KE RAMDISK ---
+ramdisk.tar: shell.elf app.elf
 	@echo "HELLO MANDOR! This is a secret from the outside world." > pesan.txt
-	@tar -cvf ramdisk.tar pesan.txt app.elf
+	@tar -cvf ramdisk.tar pesan.txt shell.elf app.elf
 
 GenOS.iso: kernel.elf ramdisk.tar
 	mkdir -p iso_root
@@ -50,5 +59,6 @@ run: GenOS.iso
 	qemu-system-x86_64 -m 2G -cdrom GenOS.iso -serial stdio
 
 clean:
-	rm -f $(OBJS) kernel.elf GenOS.iso ramdisk.tar pesan.txt app.bin app.elf app/app.o libc/stdio.o
+	rm -f $(OBJS) $(LIBC_OBJS) kernel.elf GenOS.iso ramdisk.tar pesan.txt
+	rm -f app.elf app/app.o shell.elf shell/shell.o
 	rm -rf iso_root
