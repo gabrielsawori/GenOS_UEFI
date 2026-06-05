@@ -51,7 +51,7 @@ void syscall_init(void) {
 
     serial_write_string("[OK] Pintu Gerbang Syscall Berhasil Dibuka!\n");
     serial_write_string("     Syscall: 1=print 2=exit 3=read_key 4=sleep\n");
-    serial_write_string("             5=clear 6=print_at 7=draw_char 8=read_file 9=exec\n");
+    serial_write_string("             5=clear 6=print_at 7=draw_char 8=read_file 9=exec 10=fill_rect 11=wait_pid\n");
 }
 
 /*
@@ -69,7 +69,9 @@ void syscall_init(void) {
  * │  6 │ print_at    │ char* teks           │ (x<<32)|y        │ fg_color     │ 0            │
  * │  7 │ draw_char   │ char c               │ (x<<32)|y        │ fg_color     │ 0            │
  * │  8 │ read_file   │ char* filename       │ char* buffer     │ max_size     │ bytes_read   │
- * │  9 │ exec        │ char* filename       │ -                │ -            │ 0=ok / -1    │
+ * │  9 │ exec        │ char* filename       │ -                │ -            │ pid / -1     │
+ * │ 10 │ fill_rect   │ (x<<32)|y            │ (w<<32)|h        │ color        │ 0            │
+ * │ 11 │ wait_pid    │ uint32 pid           │ -                │ -            │ 0=alive 1=dead│
  * └────┴─────────────┴──────────────────────┴──────────────────┴──────────────┴──────────────┘
  */
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
@@ -199,16 +201,64 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     /* ================================================================
      * SYSCALL 9: exec(char* filename)
      * Muat dan jalankan file ELF dari ramdisk sebagai user task baru.
-     * Return: 0 = berhasil, -1 = file tidak ditemukan / gagal.
+     *
+     * BUG FIX #17: Mengembalikan PID child (>0) agar shell bisa menunggu
+     * child selesai dengan syscall `wait_pid` (#11). Versi blocking
+     * langsung di kernel TIDAK aman karena `kernel_stack_top` di-share
+     * antar syscall — child yang melakukan syscall akan menimpa frame
+     * kernel shell yang sedang block. Karena itu polling dilakukan di
+     * Ring 3 dengan user_sleep, sehingga kernel stack hanya terpakai
+     * sebentar saat tiap iterasi syscall.
+     *
+     * Return: PID child (>0) bila berhasil, atau (uint64_t)-1 bila gagal.
      * ================================================================ */
     case 9: {
         char* filename = (char*)arg1;
         size_t ukuran = 0;
         char* elf_data = tar_read_file(filename, &ukuran);
-        if (elf_data == NULL) return (uint64_t)-1;
+        if (elf_data == NULL) { result = (uint64_t)-1; break; }
 
-        create_user_task((uint8_t*)elf_data);
+        struct task* child = create_user_task((uint8_t*)elf_data);
+        if (child == NULL) { result = (uint64_t)-1; break; }
+
+        result = (uint64_t)child->pid;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 10: fill_rect((x<<32)|y, (w<<32)|h, color)
+     * Isi area persegi pada framebuffer dengan satu warna.
+     *
+     * Digunakan oleh shell/aplikasi Ring-3 untuk membersihkan baris
+     * sebelum menulis ulang teks (mencegah tumpang tindih karakter).
+     * Koordinat & ukuran di-pack ke 2 argumen 64-bit:
+     *   arg1 = ((uint64_t)x << 32) | (y & 0xFFFFFFFF)
+     *   arg2 = ((uint64_t)w << 32) | (h & 0xFFFFFFFF)
+     * ================================================================ */
+    case 10: {
+        uint32_t x = (uint32_t)(arg1 >> 32);
+        uint32_t y = (uint32_t)(arg1 & 0xFFFFFFFF);
+        uint32_t w = (uint32_t)(arg2 >> 32);
+        uint32_t h = (uint32_t)(arg2 & 0xFFFFFFFF);
+        uint32_t color = (uint32_t)arg3;
+        fb_fill_rect(x, y, w, h, color);
         result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 11: wait_pid(uint32_t pid)
+     * Periksa apakah task dengan PID tertentu masih hidup.
+     * Bersifat NON-BLOCKING: hanya cek status sekali lalu return.
+     * Shell di Ring 3 melakukan polling dengan user_sleep() di antara
+     * pemanggilan agar tidak menyita CPU.
+     *
+     * Return: 0 = task masih hidup (atau tidak diketahui),
+     *         1 = task sudah TASK_DEAD / tidak ditemukan.
+     * ================================================================ */
+    case 11: {
+        uint32_t want_pid = (uint32_t)arg1;
+        result = task_is_dead(want_pid) ? 1 : 0;
         break;
     }
 

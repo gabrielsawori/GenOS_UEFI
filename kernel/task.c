@@ -64,13 +64,19 @@ void create_task(void (*entry_point)(void)) {
  *   - RSP berada DI DALAM page yang di-map (bukan tepat di batasnya)
  *   - RSP 16-byte aligned sesuai System V AMD64 ABI
  *   - Menghindari page fault segera saat fungsi pertama push ke stack
+ *
+ * BUG FIX #17: create_user_task() sekarang mengembalikan pointer ke task
+ *              yang baru dibuat (atau NULL bila gagal). Pointer ini dipakai
+ *              syscall `exec` untuk memblokir shell sampai child task
+ *              berstatus TASK_DEAD, mencegah balap output yang membuat
+ *              prompt baru tertimpa oleh tulisan child.
  */
-void create_user_task(uint8_t* binary_data) {
+struct task* create_user_task(uint8_t* binary_data) {
     /* 1. Muat ELF ke memori User Mode */
     uint64_t entry_point = elf_load(binary_data);
     if (entry_point == 0) {
         serial_write_string("[ERROR] ELF load gagal: magic number tidak valid!\n");
-        return;
+        return NULL;
     }
 
     /* 2. Siapkan Stack User Mode (1 page = 4096 byte)
@@ -85,7 +91,7 @@ void create_user_task(uint8_t* binary_data) {
     uint64_t phys_stack = (uint64_t)pmm_alloc_page();
     if (!phys_stack) {
         serial_write_string("[ERROR] Failed to allocate user stack!\n");
-        return;
+        return NULL;
     }
     vmm_map_page(app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
 
@@ -93,7 +99,7 @@ void create_user_task(uint8_t* binary_data) {
     struct task* new_task = (struct task*)kmalloc(sizeof(struct task));
     if (!new_task) {
         serial_write_string("[ERROR] Failed to allocate task struct for user task!\n");
-        return;
+        return NULL;
     }
     new_task->pid   = next_pid++;
     new_task->state = TASK_READY;
@@ -122,6 +128,7 @@ void create_user_task(uint8_t* binary_data) {
     /* Tambahkan task ke antrean scheduler */
     task_list_tail->next = new_task;
     task_list_tail = new_task;
+    return new_task;
 }
 
 /*
@@ -220,4 +227,25 @@ void sleep_current_task(uint64_t wake_tick) {
         current_task->sleep_until = wake_tick;
         current_task->state = TASK_SLEEPING;
     }
+}
+
+/*
+ * task_is_dead() - cek status task berdasarkan PID.
+ *
+ * Linked list task disusuri untuk menemukan PID yang diminta.
+ * Dipakai syscall `wait_pid` agar shell di Ring 3 bisa polling
+ * status child task tanpa harus blocking di kernel — yang berbahaya
+ * karena `kernel_stack_top` di-share antar syscall.
+ *
+ * Return: 1 jika task TASK_DEAD atau PID tidak ditemukan, 0 bila masih hidup.
+ */
+int task_is_dead(uint32_t pid) {
+    struct task* t = task_list_head;
+    while (t != NULL) {
+        if (t->pid == pid) {
+            return (t->state == TASK_DEAD) ? 1 : 0;
+        }
+        t = t->next;
+    }
+    return 1; /* PID tidak ditemukan → anggap selesai */
 }

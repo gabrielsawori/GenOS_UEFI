@@ -11,7 +11,7 @@ Dokumen ini menjelaskan fitur yang saat ini ada di GenOS, serta fitur yang diren
 - **Page Fault Handler Diagnostik:** Membaca CR2 (faulting address), mendekode error code (Present/Write/User/Reserved/InstructionFetch), menampilkan RIP dan CS ke serial + layar.
 - **GPF Handler Diagnostik:** Menampilkan error code (biasanya selector yang bermasalah), RIP, CS, RSP, SS untuk mempercepat debugging segment selector.
 - PIC remapping untuk hardware interrupt (keyboard, timer).
-- **Syscall Gateway (MSR SYSCALL/SYSRET):** Gate Ring-3 → Ring-0 via `syscall`/`sysretq`. 9 syscall tersedia:
+- **Syscall Gateway (MSR SYSCALL/SYSRET):** Gate Ring-3 → Ring-0 via `syscall`/`sysretq`. 11 syscall tersedia:
   - `1 (print)`: cetak teks ke framebuffer + serial
   - `2 (exit)`: akhiri task dengan aman
   - `3 (read_key)`: baca karakter dari keyboard buffer (non-blocking)
@@ -20,7 +20,9 @@ Dokumen ini menjelaskan fitur yang saat ini ada di GenOS, serta fitur yang diren
   - `6 (print_at)`: cetak teks pada posisi (x,y) dengan warna
   - `7 (draw_char)`: gambar 1 karakter pada posisi (x,y)
   - `8 (read_file)`: baca file dari TAR ramdisk ke buffer user
-  - `9 (exec)`: jalankan program ELF dari ramdisk
+  - `9 (exec)`: jalankan program ELF dari ramdisk; return PID child (>0) atau -1
+  - `10 (fill_rect)`: isi blok persegi (x,y,w,h) dengan satu warna — dipakai shell untuk membersihkan baris sebelum menulis ulang teks (mencegah tumpang tindih karakter)
+  - `11 (wait_pid)`: cek apakah task dengan PID tertentu sudah selesai (non-blocking; 0=alive, 1=dead). Dipakai shell untuk polling sampai child task selesai sebelum menampilkan prompt baru
 - TSS (Task State Segment) untuk stack kernel darurat saat interrupt dari Ring-3.
 - **Shell di Ring 3:** Terminal sistem berjalan sepenuhnya di user-space (`shell.elf` @ `0x50000000`), terisolasi dari kernel. Semua akses hardware melalui syscall.
 
@@ -79,6 +81,14 @@ Setelah pembaruan fitur user mode & syscall, kernel mengalami panic. Berikut daf
 | 12 | `cpu/syscall_asm.S` | `pop %rax` di return path **menimpa return value** syscall handler dengan saved user RSP | `read_key()` selalu return alamat RSP (0x80000FF0), bukan 0. Shell banjir karakter sampah 0xF0, keyboard asli tak bisa masuk | Simpan return value ke `%rdi` sebelum pop, kembalikan ke `%rax` setelah RSP di-restore |
 | 13 | `cpu/syscall.c` + `kernel/task.c` | Scheduler bisa context-switch **di dalam syscall handler** yang pakai stack terpisah (`kernel_stack_top`) | Return path `sysretq` rusak karena scheduler mengganggu kernel stack | Flag `in_syscall`: scheduler skip switch saat flag aktif |
 | 14 | `cpu/syscall.c` | `FMASK=0x200` mematikan interrupt (IF=0) saat masuk syscall, keyboard IRQ tak bisa menyala | `read_key()` selalu return 0 karena buffer tak pernah terisi selama handler berjalan | `sti` di awal handler, `cli` sebelum return |
+
+### [2026-06-05] Bugfix: Ramdisk Tidak Termuat & Teks Terminal Tumpang Tindih
+
+| # | File | Bug | Dampak | Perbaikan |
+|---|------|-----|--------|-----------|
+| 15 | `limine.cfg` | Tidak ada entry `MODULE_PATH=` untuk `ramdisk.tar` | `module_request.response->module_count` = 0 → `tar_init()` tak dipanggil → `tar_read_file("shell.elf", ...)` selalu NULL → kernel halt dengan pesan `[FATAL] shell.elf not found in ramdisk!` | Tambahkan baris `MODULE_PATH=boot:///ramdisk.tar` di entry boot |
+| 16 | `shell/shell.c`, `drivers/framebuffer.c`, `cpu/syscall.c`, `libc/stdio.c` | `terminal_print()` menggambar teks baru langsung di atas teks lama. Font 8x8 (scale 2 = cell 16x16) tidak mengisi seluruh tinggi baris terminal (24 px) → 8 px gap antar baris tidak pernah ditimpa, dan glyph sempit menyisakan piksel karakter sebelumnya | Saat perintah seperti `info` lalu `help` dijalankan, sisa karakter lama terlihat di sela-sela karakter baru (efek tumpang tindih / "ghosting") | Tambah primitif `fb_fill_rect()` di driver, syscall baru `10 = fill_rect`, libc `fill_rect()`. Shell sekarang selalu memanggil `terminal_clear_line()` sebelum mencetak baris, dan membersihkan cell tujuan sebelum `draw_char()` saat mengetik / backspace |
+| 17 | `shell/shell.c`, `cpu/syscall.c`, `kernel/task.{c,h}`, `libc/stdlib.{c,h}` | Setelah `run` (exec), shell langsung mencetak prompt baru tanpa menunggu `app.elf` selesai. App menulis di koordinat absolut (Y=300..504) sementara shell mencetak prompt di Y rendah → ketika user mengetik, baris terminal turun & menumpuk di atas output app, dan respons app tetap "stuck" di layar | Prompt baru tidak muncul di bawah output app; karakter yang diketik menimpa tulisan app | `create_user_task()` sekarang mengembalikan `struct task*`. Syscall `9 (exec)` mengembalikan PID child. Tambahkan syscall `11 (wait_pid)` non-blocking. Shell di Ring 3 polling `wait_pid()` + `user_sleep(50)` sampai child DEAD, lalu `clear_screen()` & reset cursor sebelum menampilkan prompt baru. Polling dilakukan di Ring 3 (bukan blocking di kernel) karena `kernel_stack_top` di-share antar syscall — child yang melakukan syscall akan menimpa frame kernel shell yang sedang block |
 
 ## Fitur Yang Direncanakan
 

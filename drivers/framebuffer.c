@@ -68,3 +68,18 @@ void fb_print(const char *str, size_t x, size_t y, uint32_t fg, uint32_t bg, int
         }
     }
 }
+
+/*
+ * fb_fill_rect() - Isi blok persegi (x,y,w,h) dengan satu warna.
+ *
+ * Dipakai shell untuk membersihkan baris sebelum mencetak teks baru,
+ * sehingga karakter lama tidak tumpang tindih dengan karakter baru.
+ * fb_draw_pixel() sudah meng-handle clipping di luar batas layar.
+ */
+void fb_fill_rect(size_t x, size_t y, size_t w, size_t h, uint32_t color) {
+    for (size_t dy = 0; dy < h; dy++) {
+        for (size_t dx = 0; dx < w; dx++) {
+            fb_draw_pixel(x + dx, y + dy, color);
+        }
+    }
+}

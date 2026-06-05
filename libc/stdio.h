@@ -20,3 +20,10 @@ void print_at(const char* text, int x, int y, uint32_t color);
 
 /* Gambar 1 karakter pada posisi (x, y) dengan warna foreground (syscall 7) */
 void draw_char(char c, int x, int y, uint32_t color);
+
+/*
+ * Isi area persegi (x,y,w,h) dengan satu warna (syscall 10).
+ * Berguna untuk membersihkan baris terminal sebelum menulis ulang
+ * agar teks lama tidak tumpang tindih dengan teks baru.
+ */
+void fill_rect(int x, int y, int w, int h, uint32_t color);
