@@ -33,3 +33,18 @@ void draw_char(char c, int x, int y, uint32_t color) {
     uint64_t packed_xy = ((uint64_t)(uint32_t)x << 32) | (uint32_t)y;
     syscall(7, (uint64_t)c, packed_xy, (uint64_t)color);
 }
+
+/*
+ * fill_rect() - Isi blok persegi (x,y,w,h) dengan satu warna.
+ *
+ * Pack koordinat & ukuran ke 2 argumen 64-bit karena syscall hanya
+ * mendukung 3 argumen user:
+ *   arg1 = (x << 32) | y
+ *   arg2 = (w << 32) | h
+ *   arg3 = color
+ */
+void fill_rect(int x, int y, int w, int h, uint32_t color) {
+    uint64_t packed_xy = ((uint64_t)(uint32_t)x << 32) | (uint32_t)y;
+    uint64_t packed_wh = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
+    syscall(10, packed_xy, packed_wh, (uint64_t)color);
+}

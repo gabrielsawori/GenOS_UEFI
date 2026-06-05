@@ -22,10 +22,23 @@ struct task {
 void task_init(void);
 void create_task(void (*entry_point)(void));
 void schedule(struct registers* current_regs);
-void create_user_task(uint8_t* binary_data);
+/*
+ * create_user_task() - Muat ELF & jadwalkan eksekusi di Ring 3.
+ * Mengembalikan pointer ke struct task yang baru dibuat, atau NULL bila
+ * gagal. Pointer ini dapat dipakai pemanggil (mis. syscall `exec`) untuk
+ * menunggu child task selesai dengan memantau `task->state == TASK_DEAD`.
+ */
+struct task* create_user_task(uint8_t* binary_data);
 
 // Fungsi untuk membunuh program yang sedang berjalan
 void exit_current_task(void);
 
 // Fungsi untuk menidurkan task saat ini sampai tick tertentu
 void sleep_current_task(uint64_t wake_tick);
+
+/*
+ * task_is_dead() - cek status task berdasarkan PID.
+ * Return: 1 jika task TASK_DEAD atau PID tidak ditemukan, 0 bila masih hidup.
+ * Dipakai oleh syscall `wait_pid` untuk polling non-blocking dari Ring 3.
+ */
+int task_is_dead(uint32_t pid);

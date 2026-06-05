@@ -23,10 +23,24 @@ int read_file(const char* filename, char* buffer, int max_size) {
 /*
  * exec() - Jalankan program ELF dari ramdisk.
  *
- * Kernel akan memuat ELF dan membuat user task baru.
- * Program baru berjalan bersamaan (concurrent) dengan pemanggil.
- * Return: 0 = berhasil, -1 = file tidak ditemukan.
+ * Kernel memuat ELF & membuat user task baru. Program baru berjalan
+ * bersamaan (concurrent) dengan pemanggil. Untuk menunggu child selesai,
+ * pakai wait_pid() di loop polling.
+ *
+ * Return: PID child (>0) jika berhasil, -1 jika file tidak ditemukan.
  */
 int exec(const char* filename) {
     return (int)syscall(9, (uint64_t)filename, 0, 0);
+}
+
+/*
+ * wait_pid() - Cek apakah task dengan PID tertentu sudah selesai.
+ *
+ * Non-blocking: hanya cek state lalu return. Pemanggil bertanggung jawab
+ * memanggil user_sleep() di antara polling agar tidak menyita CPU.
+ *
+ * Return: 0 = masih hidup, 1 = TASK_DEAD / tidak ditemukan.
+ */
+int wait_pid(int pid) {
+    return (int)syscall(11, (uint64_t)pid, 0, 0);
 }

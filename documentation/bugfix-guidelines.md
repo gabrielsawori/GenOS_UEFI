@@ -94,6 +94,51 @@ Gunakan format berikut untuk setiap bug:
 - **Dua user task saling menimpa stack?** Pastikan setiap task punya alamat stack
   virtual UNIK. Gunakan static counter dengan gap (misal 64KB) antar stack.
 
+### 8. Debugging Bootloader & Ramdisk
+
+- **`shell.elf not found in ramdisk` padahal sudah masuk tar?** Periksa `limine.cfg`:
+  setiap modul yang dibutuhkan kernel harus didaftarkan dengan baris
+  `MODULE_PATH=boot:///<file>`. Tanpa itu, `module_request.response->module_count`
+  bernilai 0 dan `tar_init()` tidak pernah dipanggil → semua `tar_read_file()`
+  mengembalikan NULL.
+- Verifikasi isi tar dengan `tar -tvf ramdisk.tar` sebelum mencurigai kode kernel.
+
+### 9. Debugging Rendering Terminal (Tumpang Tindih Teks)
+
+- **Teks baru tumpang tindih dengan teks lama?** Font 8x8 dengan `scale=2`
+  menghasilkan cell 16x16 piksel, tetapi shell memakai tinggi baris 24 px →
+  ada **8 px gap** vertikal yang TIDAK pernah ditimpa oleh `fb_draw_char`.
+  Selain itu, glyph yang sempit (mis. `i`, `l`) hanya menyala beberapa kolom
+  sehingga residu karakter sebelumnya tetap terlihat di kolom yang gelap.
+- **Perbaikan baku:** Sebelum menulis baris baru, isi area baris penuh
+  (`x,y,w=line_width,h=line_height`) dengan warna background lewat
+  `fill_rect()` (syscall 10) atau `fb_fill_rect()` di kernel. Lakukan hal
+  yang sama untuk satu cell saat backspace atau saat menulis ulang karakter
+  di kolom yang sama.
+- **Jangan mengandalkan `bg_color` `fb_draw_char` saja** — bg hanya menutupi
+  area 8x8 (atau 16x16 bila scale=2) per glyph, bukan jarak antar baris/cell.
+
+### 10. Debugging exec / wait Antar Task User
+
+- **Shell tidak menampilkan prompt baru setelah child task selesai?** Pada
+  desain awal, syscall `exec` membuat task baru lalu langsung return.
+  Karena child task menulis di koordinat absolut sementara shell mencetak
+  prompt di posisi cursornya, output saling menimpa & input user menumpuk
+  di atas tulisan child.
+- **Jangan blocking di kernel** untuk menunggu child! `kernel_stack_top`
+  di-share oleh semua syscall. Jika shell menunggu di kernel handler
+  (mis. `while(child->state != TASK_DEAD) hlt`), saat child melakukan
+  syscall ia akan **mereset** RSP ke top kernel_stack dan menimpa frame
+  kernel shell yang masih hidup → korupsi state.
+- **Pola yang aman:** `exec` mengembalikan PID; tambahkan syscall
+  non-blocking `wait_pid` yang hanya cek state task. Shell polling di
+  Ring 3 dengan `user_sleep(50)` di antara cek. Saat shell tidur,
+  ia berada di stack-nya sendiri di Ring 3 — kernel_stack hanya dipakai
+  sebentar per syscall, jadi child bebas memakainya juga.
+- **Setelah child selesai**, shell tidak tahu seberapa luas child menggambar.
+  Cara paling rapi: panggil `clear_screen()` & reset cursor sebelum
+  menampilkan prompt baru.
+
 ## Perbaikan dan Validasi
 
 - Gunakan `make clean && make` setelah perubahan besar.
