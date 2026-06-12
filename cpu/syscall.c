@@ -10,6 +10,8 @@
 #include "../kernel/utils.h"
 #include "../fs/tar.h"
 #include "../fs/vfs.h"
+#include "../fs/cache.h"
+#include "../mm/shm.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -55,9 +57,15 @@ void syscall_init(void) {
     serial_write_string("     Syscall: 1=print 2=exit 3=read_key 4=sleep\n");
     serial_write_string("             5=clear 6=print_at 7=draw_char 8=read_file 9=exec 10=fill_rect 11=wait_pid\n");
     serial_write_string("            12=open 13=read 14=close 15=seek 16=readdir\n");
+    serial_write_string("            17=shm_create 18=shm_attach 19=shm_detach 20=shm_destroy\n");
+    serial_write_string("            21=cache_stats 22=fork\n");
+    serial_write_string("            23=write 24=create 25=unlink\n");
 
     /* Initialize VFS layer */
     vfs_init();
+
+    /* Initialize Shared Memory layer */
+    shm_init();
 }
 
 /*
@@ -317,13 +325,14 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * SYSCALL 12: open(char* filename, uint32_t flags)
      * Buka file atau direktori melalui VFS layer.
      * filename = "/" membuka listing direktori (semua entry TAR).
-     * flags diabaikan untuk sekarang (TAR read-only).
+     * flags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREATE=4
      * Return: FD number (>=0) atau -1 bila gagal.
      * ================================================================ */
     case 12: {
         char* filename = (char*)arg1;
+        int flags = (int)(int64_t)arg2;
         uint32_t pid = get_current_pid();
-        int fd = vfs_open(pid, filename);
+        int fd = vfs_open(pid, filename, flags);
         result = (uint64_t)(int64_t)fd;
         break;
     }
@@ -384,6 +393,131 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         uint32_t pid = get_current_pid();
         int ret = vfs_readdir(pid, fd, name_buf, size_buf);
         result = (uint64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 17: shm_create(uint32_t size)
+     * Buat shared memory segment baru.
+     * Return: shmid (>=0) atau -1 bila gagal.
+     * ================================================================ */
+    case 17: {
+        uint32_t size = (uint32_t)arg1;
+        uint32_t pid = get_current_pid();
+        int shmid = shm_create(pid, size);
+        result = (uint64_t)(int64_t)shmid;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 18: shm_attach(int shmid)
+     * Pasang (map) shared memory segment ke address space proses ini.
+     * Return: virtual address (>0) atau 0 bila gagal.
+     * ================================================================ */
+    case 18: {
+        int shmid = (int)(int64_t)arg1;
+        uint32_t pid = get_current_pid();
+        uint64_t* pml4 = task_get_current_pml4();
+        uint64_t vaddr = shm_attach(shmid, pid, pml4);
+        result = vaddr;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 19: shm_detach(uint64_t addr)
+     * Lepas (unmap) shared memory dari address space proses ini.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 19: {
+        uint64_t addr = arg1;
+        uint32_t pid = get_current_pid();
+        uint64_t* pml4 = task_get_current_pml4();
+        int ret = shm_detach(addr, pid, pml4);
+        result = (uint64_t)(int64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 20: shm_destroy(int shmid)
+     * Hancurkan shared memory segment (hanya jika tidak ada yang attach).
+     * Return: 0 = sukses, -1 = error / masih ada yang attach.
+     * ================================================================ */
+    case 20: {
+        int shmid = (int)(int64_t)arg1;
+        int ret = shm_destroy(shmid);
+        result = (uint64_t)(int64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 21: cache_stats(cache_stats_t* out)
+     * Ambil statistik performa buffer cache.
+     * arg1 = pointer ke struct cache_stats_t di user-space.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 21: {
+        cache_stats_t* out = (cache_stats_t*)arg1;
+        if (!out) { result = (uint64_t)-1; break; }
+        cache_stats_t s = cache_get_stats();
+        out->hits        = s.hits;
+        out->misses      = s.misses;
+        out->evictions   = s.evictions;
+        out->used_blocks = s.used_blocks;
+        out->total_blocks = s.total_blocks;
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 22: fork(void)
+     * Kloning proses saat ini. Child mendapat salinan penuh address space,
+     * register state, dan FD table parent.
+     * Return: PID child (>0) ke parent, 0 ke child, -1 bila gagal.
+     * ================================================================ */
+    case 22: {
+        int32_t child_pid = task_fork();
+        result = (uint64_t)(int64_t)child_pid;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 23: write(int fd, void* buf, size_t count)
+     * Write data to a file descriptor (must be writable/tmpfs).
+     * Return: bytes written or -1 on error.
+     * ================================================================ */
+    case 23: {
+        int fd = (int)(int64_t)arg1;
+        void* buf = (void*)arg2;
+        size_t count = (size_t)arg3;
+        uint32_t pid = get_current_pid();
+        int bytes = vfs_write(pid, fd, buf, count);
+        result = (uint64_t)(int64_t)bytes;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 24: create(char* filename)
+     * Create a new empty file in tmpfs.
+     * Return: 0 on success, -1 on error.
+     * ================================================================ */
+    case 24: {
+        char* filename = (char*)arg1;
+        uint32_t pid = get_current_pid();
+        int ret = vfs_create(pid, filename);
+        result = (uint64_t)(int64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 25: unlink(char* filename)
+     * Delete a file from tmpfs.
+     * Return: 0 on success, -1 on error.
+     * ================================================================ */
+    case 25: {
+        char* filename = (char*)arg1;
+        uint32_t pid = get_current_pid();
+        int ret = vfs_unlink(pid, filename);
+        result = (uint64_t)(int64_t)ret;
         break;
     }
 
