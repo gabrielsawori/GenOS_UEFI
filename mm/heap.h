@@ -9,3 +9,6 @@ void* kmalloc(size_t size);
 
 // Mengembalikan potongan memori yang sudah selesai dipakai
 void kfree(void* ptr);
+
+// Mengubah ukuran potongan memori (resize) — bisa membesar atau mengecil
+void* krealloc(void* ptr, size_t new_size);

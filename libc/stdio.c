@@ -48,3 +48,58 @@ void fill_rect(int x, int y, int w, int h, uint32_t color) {
     uint64_t packed_wh = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
     syscall(10, packed_xy, packed_wh, (uint64_t)color);
 }
+
+/* === VFS File Operations (syscalls 12-16) === */
+
+/*
+ * read_file() - Legacy: baca file langsung dari ramdisk (syscall 8).
+ * Tetap ada untuk kompatibilitas. Gunakan open/read/close untuk API baru.
+ */
+int read_file(const char* filename, char* buffer, int max_size) {
+    return (int)syscall(8, (uint64_t)filename, (uint64_t)buffer, (uint64_t)max_size);
+}
+
+/*
+ * open() - Buka file atau direktori melalui VFS (syscall 12).
+ * filename = "/" membuka listing direktori.
+ * Return: FD number (>=0) atau -1 bila gagal.
+ */
+int open(const char* filename, int flags) {
+    return (int)syscall(12, (uint64_t)filename, (uint64_t)flags, 0);
+}
+
+/*
+ * read() - Baca dari file descriptor (syscall 13).
+ * Return: jumlah byte yang dibaca, 0 = EOF, -1 = error.
+ */
+int read(int fd, void* buf, int count) {
+    return (int)syscall(13, (uint64_t)(int64_t)fd, (uint64_t)buf, (uint64_t)count);
+}
+
+/*
+ * close() - Tutup file descriptor (syscall 14).
+ * Return: 0 = sukses, -1 = error.
+ */
+int close(int fd) {
+    return (int)syscall(14, (uint64_t)(int64_t)fd, 0, 0);
+}
+
+/*
+ * seek() - Ubah posisi baca file (syscall 15).
+ * whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END.
+ * Return: posisi baru atau -1 bila error.
+ */
+int seek(int fd, int offset, int whence) {
+    return (int)syscall(15, (uint64_t)(int64_t)fd, (uint64_t)(int64_t)offset, (uint64_t)whence);
+}
+
+/*
+ * readdir() - Baca entry direktori berikutnya (syscall 16).
+ * FD harus dibuka dengan open("/", 0).
+ * name_buf diisi nama file, *size_buf diisi ukuran.
+ * Return: 1 = entry ditemukan, 0 = tidak ada entry lagi.
+ */
+int readdir(int fd, char* name_buf, int* size_buf) {
+    /* size_buf is int* but kernel expects size_t* — cast through uint64_t */
+    return (int)syscall(16, (uint64_t)(int64_t)fd, (uint64_t)name_buf, (uint64_t)size_buf);
+}
