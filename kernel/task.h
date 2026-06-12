@@ -2,7 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>     
 #include "../cpu/isr.h"
-#include "../fs/vfs.h" 
+#include "../fs/vfs.h"
+#include "../mm/shm.h" 
 
 typedef enum {
     TASK_RUNNING,
@@ -23,6 +24,7 @@ struct task {
     uint64_t user_pages[64];  // Daftar page fisik milik proses ini
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table
+    shm_attach_record_t shm_attached[SHM_MAX_ATTACH]; // SHM attachments
     struct task* next;        
 };
 
@@ -76,3 +78,23 @@ uint32_t get_current_pid(void);
  * Return: pointer ke fds[], atau NULL jika tidak ada task aktif.
  */
 vfs_fd_t* task_get_current_fds(void);
+
+/*
+ * task_find_by_pid() - Look up a task by PID in the linked list.
+ * Return: pointer to task, or NULL if not found.
+ */
+struct task* task_find_by_pid(uint32_t pid);
+
+/*
+ * task_get_current_pml4() - Get the current task's PML4 pointer.
+ * Return: PML4 pointer, or NULL for the kernel task.
+ */
+uint64_t* task_get_current_pml4(void);
+
+/*
+ * task_fork() - Clone the current process.
+ * Creates a child with copied address space, registers, and FD table.
+ * Returns child PID (>0) to parent, 0 is set for child (via regs.rax),
+ * or -1 on failure.
+ */
+int32_t task_fork(void);

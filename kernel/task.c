@@ -2,10 +2,16 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../mm/shm.h"
 #include "../fs/elf.h"
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
+#include "../limine.h"
+#include "utils.h"
 #include <stddef.h>
+
+/* Borrow from pmm.c for HHDM physical page access during fork copy */
+extern volatile struct limine_hhdm_request hhdm_request;
 
 static struct task* current_task = NULL;
 static struct task* task_list_head = NULL;
@@ -24,7 +30,14 @@ void task_init(void) {
 
     /* Initialize FD table: all slots free */
     for (int i = 0; i < VFS_MAX_FDS; i++) {
-        init_task->fds[i].type = VFS_TYPE_NONE;
+        init_task->fds[i].type      = VFS_TYPE_NONE;
+        init_task->fds[i].writable  = 0;
+        init_task->fds[i].tmpfs_idx = -1;
+    }
+
+    /* Initialize SHM attachments: all slots free */
+    for (int i = 0; i < SHM_MAX_ATTACH; i++) {
+        init_task->shm_attached[i].shmid = -1;
     }
 
     current_task = init_task;
@@ -51,6 +64,18 @@ void create_task(void (*entry_point)(void)) {
     new_task->regs.rflags = 0x202;  
     new_task->regs.rsp = stack_top; 
     new_task->regs.ss = 0x10;       
+
+    /* Initialize FD table: all slots free */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        new_task->fds[i].type      = VFS_TYPE_NONE;
+        new_task->fds[i].writable  = 0;
+        new_task->fds[i].tmpfs_idx = -1;
+    }
+
+    /* Initialize SHM attachments: all slots free */
+    for (int i = 0; i < SHM_MAX_ATTACH; i++) {
+        new_task->shm_attached[i].shmid = -1;
+    }
 
     new_task->next = NULL;
     task_list_tail->next = new_task;
@@ -101,7 +126,14 @@ struct task* create_user_task(uint8_t* binary_data) {
 
     /* Initialize FD table: all slots free */
     for (int i = 0; i < VFS_MAX_FDS; i++) {
-        new_task->fds[i].type = VFS_TYPE_NONE;
+        new_task->fds[i].type      = VFS_TYPE_NONE;
+        new_task->fds[i].writable  = 0;
+        new_task->fds[i].tmpfs_idx = -1;
+    }
+
+    /* Initialize SHM attachments: all slots free */
+    for (int i = 0; i < SHM_MAX_ATTACH; i++) {
+        new_task->shm_attached[i].shmid = -1;
     }
 
     /* 3. Muat ELF ke address space proses baru */
@@ -235,6 +267,8 @@ void schedule(struct registers* current_regs) {
                     pmm_free_page((void*)t->user_pages[pg]);
                 }
             }
+            /* Cleanup shared memory attachments BEFORE destroying PML4 */
+            shm_cleanup_process(t);
             /* Bebaskan page table levels (lower half) + PML4 */
             if (t->pml4) {
                 vmm_destroy_address_space(t->pml4);
@@ -404,4 +438,180 @@ uint32_t get_current_pid(void) {
  */
 vfs_fd_t* task_get_current_fds(void) {
     return current_task ? current_task->fds : NULL;
+}
+
+/*
+ * task_find_by_pid() - Look up a task by PID in the linked list.
+ */
+struct task* task_find_by_pid(uint32_t pid) {
+    struct task* t = task_list_head;
+    while (t != NULL) {
+        if (t->pid == pid) return t;
+        t = t->next;
+    }
+    return NULL;
+}
+
+/*
+ * task_get_current_pml4() - Return the current task's PML4 pointer.
+ */
+uint64_t* task_get_current_pml4(void) {
+    return current_task ? current_task->pml4 : NULL;
+}
+
+/*
+ * task_fork() - Clone the current process (full address space copy).
+ *
+ * Creates a child process with:
+ *   - Its own PML4 (new address space)
+ *   - Physical copy of all parent's user pages (code, data, stack)
+ *   - Copied register state (child RAX=0 so fork returns 0 to child)
+ *   - Copied FD table (open file descriptors inherited)
+ *   - Clean SHM attachments (child starts fresh)
+ *
+ * Returns child PID (>0) to parent, or -1 on failure.
+ * Child will return 0 when it starts executing.
+ */
+int32_t task_fork(void) {
+    if (!current_task) return -1;
+    if (!current_task->pml4) {
+        serial_write_string("[FORK] Cannot fork kernel task!\n");
+        return -1;
+    }
+
+    uint64_t hhdm_offset = hhdm_request.response->offset;
+    uint64_t* parent_pml4 = current_task->pml4;
+
+    /* 1. Create child's address space (PML4 with shared upper half) */
+    uint64_t* child_pml4 = vmm_create_address_space();
+    if (!child_pml4) {
+        serial_write_string("[FORK] Failed to create child address space!\n");
+        return -1;
+    }
+
+    /* 2. Walk parent's PML4 lower half, copy all mapped pages to child */
+    uint64_t child_pages[64];
+    uint32_t child_page_count = 0;
+
+    for (int i = 0; i < 256; i++) {
+        if (!(parent_pml4[i] & 1)) continue;
+        uint64_t* pdpt = (uint64_t*)((parent_pml4[i] & ~0xFFF) + hhdm_offset);
+
+        for (int j = 0; j < 512; j++) {
+            if (!(pdpt[j] & 1)) continue;
+            uint64_t* pd = (uint64_t*)((pdpt[j] & ~0xFFF) + hhdm_offset);
+
+            for (int k = 0; k < 512; k++) {
+                if (!(pd[k] & 1)) continue;
+                uint64_t* pt = (uint64_t*)((pd[k] & ~0xFFF) + hhdm_offset);
+
+                for (int l = 0; l < 512; l++) {
+                    if (!(pt[l] & 1)) continue;
+
+                    /* Found a mapped page - reconstruct VA */
+                    uint64_t va = ((uint64_t)i << 39) |
+                                  ((uint64_t)j << 30) |
+                                  ((uint64_t)k << 21) |
+                                  ((uint64_t)l << 12);
+                    /* Sign-extend if bit 47 is set (canonical upper half) */
+                    if (va & (1ULL << 47)) {
+                        va |= 0xFFFF000000000000ULL;
+                    }
+
+                    /* Only copy user (lower half) pages */
+                    if (va >= 0x800000000000ULL && !(va & (1ULL << 47))) continue;
+                    if ((va >> 48) != 0 && (va >> 48) != 0xFFFF) continue;
+
+                    uint64_t parent_phys = pt[l] & ~0xFFF;
+                    uint64_t flags = pt[l] & 0xFFF;
+
+                    /* Allocate new physical page for child */
+                    void* child_phys = pmm_alloc_page();
+                    if (!child_phys) {
+                        serial_write_string("[FORK] Out of memory during page copy!\n");
+                        goto fail_cleanup;
+                    }
+
+                    /* Copy page content via HHDM */
+                    uint8_t* src = (uint8_t*)(parent_phys + hhdm_offset);
+                    uint8_t* dst = (uint8_t*)((uint64_t)child_phys + hhdm_offset);
+                    for (int b = 0; b < 4096; b++) {
+                        dst[b] = src[b];
+                    }
+
+                    /* Map in child's PML4 at same VA with same flags */
+                    vmm_map_page_in(child_pml4, va, (uint64_t)child_phys, flags);
+
+                    /* Track for cleanup */
+                    if (child_page_count < 64) {
+                        child_pages[child_page_count++] = (uint64_t)child_phys;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 3. Allocate child task struct */
+    struct task* child = (struct task*)kmalloc(sizeof(struct task));
+    if (!child) {
+        serial_write_string("[FORK] Failed to allocate child task struct!\n");
+        goto fail_cleanup;
+    }
+
+    /* 4. Copy parent's registers, override RAX=0 for child's fork() return */
+    child->regs = current_task->regs;
+    child->regs.rax = 0;  /* fork() returns 0 to child */
+
+    /* 5. Set up child task fields */
+    child->pid = next_pid++;
+    child->state = TASK_READY;
+    child->pml4 = child_pml4;
+    child->stack_base = current_task->stack_base;
+    child->sleep_until = 0;
+    child->wait_target_pid = 0;
+
+    /* Copy page tracking */
+    child->user_page_count = child_page_count;
+    for (uint32_t pg = 0; pg < child_page_count; pg++) {
+        child->user_pages[pg] = child_pages[pg];
+    }
+    for (uint32_t pg = child_page_count; pg < 64; pg++) {
+        child->user_pages[pg] = 0;
+    }
+
+    /* 6. Copy FD table from parent */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        child->fds[i] = current_task->fds[i];
+    }
+
+    /* 7. Clear SHM attachments (child starts fresh) */
+    for (int i = 0; i < SHM_MAX_ATTACH; i++) {
+        child->shm_attached[i].shmid = -1;
+        child->shm_attached[i].vaddr = 0;
+        child->shm_attached[i].page_count = 0;
+    }
+
+    /* 8. Append child to task list */
+    child->next = NULL;
+    task_list_tail->next = child;
+    task_list_tail = child;
+
+    serial_write_string("[FORK] Child process created with PID ");
+    char pid_buf[16];
+    itoa(child->pid, pid_buf, 10);
+    serial_write_string(pid_buf);
+    serial_write_string("\n");
+
+    return (int32_t)child->pid;
+
+fail_cleanup:
+    /* Free any allocated child pages */
+    for (uint32_t pg = 0; pg < child_page_count; pg++) {
+        if (child_pages[pg]) {
+            pmm_free_page((void*)child_pages[pg]);
+        }
+    }
+    /* Destroy child's PML4 */
+    vmm_destroy_address_space(child_pml4);
+    return -1;
 }
