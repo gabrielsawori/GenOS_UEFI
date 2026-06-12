@@ -71,3 +71,38 @@ void tar_list_files(void (*callback)(const char *filename, size_t size)) {
         ptr += 512 + ((file_size + 511) / 512) * 512;
     }
 }
+
+/*
+ * tar_get_entry() - Iterate TAR entries by index for VFS readdir.
+ *
+ * Walks the archive from the start, skipping `index` entries.
+ * Returns 1 if the entry exists (fills name_buf and *size_buf),
+ * or 0 if past end of archive.
+ */
+int tar_get_entry(int index, char *name_buf, size_t *size_buf) {
+    if (!tar_archive) return 0;
+
+    uint8_t *ptr = tar_archive;
+    int current = 0;
+
+    while (1) {
+        struct tar_header *header = (struct tar_header *)ptr;
+        if (header->filename[0] == '\0') return 0; /* End of archive */
+
+        size_t file_size = octal_to_int(header->size, 11);
+
+        if (current == index) {
+            /* Copy filename */
+            int i;
+            for (i = 0; i < 99 && header->filename[i] != '\0'; i++) {
+                name_buf[i] = header->filename[i];
+            }
+            name_buf[i] = '\0';
+            if (size_buf) *size_buf = file_size;
+            return 1;
+        }
+
+        current++;
+        ptr += 512 + ((file_size + 511) / 512) * 512;
+    }
+}

@@ -95,6 +95,7 @@ void _start(void) {
                         terminal_print("  help  : Show this message", 0xFFFFFF);
                         terminal_print("  clear : Clear the terminal screen", 0xFFFFFF);
                         terminal_print("  info  : OS Information", 0xFFFFFF);
+                        terminal_print("  ls    : List files in ramdisk", 0xFFFFFF);
                         terminal_print("  read  : Read pesan.txt from Ramdisk", 0xFFFFFF);
                         terminal_print("  run   : Execute app.elf in Ring 3!", 0x00FF00);
                     }
@@ -124,13 +125,10 @@ void _start(void) {
                     }
                     /* --- RUN ---
                      *
-                     * BUG FIX #17: Tunggu child app selesai dengan polling
-                     * `wait_pid` di Ring 3 (bukan blocking di kernel — yang
-                     * tidak aman karena kernel_stack_top di-share antar
-                     * syscall). Setelah child mati, layar masih berisi
-                     * tulisan app pada koordinat absolut, jadi kita
-                     * bersihkan layar dan reset cursor agar prompt baru
-                     * muncul rapi tanpa tertimpa output app.
+                     * wait_pid sekarang BLOCKING: shell tidur (TASK_WAITING)
+                     * sampai child mati, memberi CPU penuh ke app tanpa
+                     * polling busy-wait. Setelah child mati, reaper
+                     * membangunkan shell dan kita bersihkan layar.
                      */
                     else if (strcmp(cmd_buffer, "run") == 0) {
                         terminal_print("Loading app.elf into Ring 3...", 0x00FF00);
@@ -138,12 +136,8 @@ void _start(void) {
                         if (pid <= 0) {
                             terminal_print("[ERROR] app.elf not found!", 0xFF0000);
                         } else {
-                            /* Polling sampai child task DEAD. user_sleep
-                             * memberi CPU ke scheduler agar child mendapat
-                             * giliran berjalan. */
-                            while (!wait_pid(pid)) {
-                                user_sleep(50);
-                            }
+                            /* Blokir sampai child task DEAD */
+                            wait_pid(pid);
                             /* App selesai — bersihkan layar & reset terminal */
                             clear_screen();
                             cursor_x = TERM_LEFT;

@@ -7,7 +7,9 @@
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
 #include "../kernel/task.h"
+#include "../kernel/utils.h"
 #include "../fs/tar.h"
+#include "../fs/vfs.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -52,6 +54,10 @@ void syscall_init(void) {
     serial_write_string("[OK] Pintu Gerbang Syscall Berhasil Dibuka!\n");
     serial_write_string("     Syscall: 1=print 2=exit 3=read_key 4=sleep\n");
     serial_write_string("             5=clear 6=print_at 7=draw_char 8=read_file 9=exec 10=fill_rect 11=wait_pid\n");
+    serial_write_string("            12=open 13=read 14=close 15=seek 16=readdir\n");
+
+    /* Initialize VFS layer */
+    vfs_init();
 }
 
 /*
@@ -76,6 +82,20 @@ void syscall_init(void) {
  */
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
     in_syscall = 1;
+    /*
+     * BUG FIX: Paksa task ke TASK_RUNNING sebelum memproses syscall.
+     *
+     * Jika task sebelumnya memanggil sleep (yang men-set TASK_SLEEPING),
+     * lalu task kembali dan membuat syscall berikutnya (mis. wait_pid),
+     * state task masih TASK_SLEEPING. Jika timer IRQ menyala saat task
+     * di dalam syscall ini, scheduler akan melewati task (karena SLEEPING)
+     * dan TIDAK menyimpan register ke task->regs. Akibatnya, state task
+     * bisa korup saat dibangunkan nanti.
+     *
+     * Dengan men-set TASK_RUNNING di sini, scheduler selalu memperlakukan
+     * task ini sebagai task aktif jika timer menyala di tengah syscall.
+     */
+    task_mark_running();
     /* Aktifkan interrupt agar keyboard & timer IRQ bisa menyala */
     asm volatile ("sti");
 
@@ -104,6 +124,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Akhiri task yang sedang berjalan. Tidak pernah kembali.
      * ================================================================ */
     case 2:
+        serial_write_string("[EXIT] Task called exit()\n");
         in_syscall = 0;
         exit_current_task();
         result = 0; break; /* tak pernah tercapai */
@@ -121,12 +142,24 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
 
     /* ================================================================
      * SYSCALL 4: sleep(uint32_t milliseconds)
-     * Tahan eksekusi selama N milidetik (busy-wait with HLT).
+     *
+     * BUG FIX: Versi lama menggunakan busy-wait (pause loop) dengan
+     * in_syscall = 1 selama N milidetik. Ini MEMBLOKIR scheduler dari
+     * context-switch karena scheduler selalu skip saat in_syscall aktif.
+     *
+     * Akibatnya: saat shell memanggil user_sleep(50) dalam polling loop
+     * `while (!wait_pid(pid)) user_sleep(50)`, app task TIDAK PERNAH
+     * mendapat giliran CPU — shell memonopoli CPU selama 50ms per iterasi,
+     * lalu hanya memberi jendela ~50ns sebelum syscall berikutnya.
+     *
+     * PERBAIKAN: Gunakan sleep_current_task() untuk menandai task sebagai
+     * TASK_SLEEPING. Setelah sysretq, timer IRQ berikutnya akan memanggil
+     * schedule(), yang melihat task SLEEPING dan langsung switch ke task
+     * lain (mis. app). Task dibangunkan otomatis saat timer tick >= target.
      * ================================================================ */
     case 4: {
-        uint64_t target = timer_get_ticks() + arg1;
-        while (timer_get_ticks() < target) {
-            asm volatile ("pause");
+        if (arg1 > 0) {
+            sleep_current_task(timer_get_ticks() + arg1);
         }
         result = 0;
         break;
@@ -216,11 +249,22 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         char* filename = (char*)arg1;
         size_t ukuran = 0;
         char* elf_data = tar_read_file(filename, &ukuran);
-        if (elf_data == NULL) { result = (uint64_t)-1; break; }
+        if (elf_data == NULL) {
+            serial_write_string("[EXEC] File not found: ");
+            serial_write_string(filename);
+            serial_write_string("\n");
+            result = (uint64_t)-1;
+            break;
+        }
 
         struct task* child = create_user_task((uint8_t*)elf_data);
         if (child == NULL) { result = (uint64_t)-1; break; }
 
+        serial_write_string("[EXEC] Launched PID ");
+        char pid_buf[16];
+        itoa(child->pid, pid_buf, 10);
+        serial_write_string(pid_buf);
+        serial_write_string("\n");
         result = (uint64_t)child->pid;
         break;
     }
@@ -248,17 +292,98 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
 
     /* ================================================================
      * SYSCALL 11: wait_pid(uint32_t pid)
-     * Periksa apakah task dengan PID tertentu masih hidup.
-     * Bersifat NON-BLOCKING: hanya cek status sekali lalu return.
-     * Shell di Ring 3 melakukan polling dengan user_sleep() di antara
-     * pemanggilan agar tidak menyita CPU.
+     * BLOKIR task saat ini sampai task target selesai (TASK_DEAD).
      *
-     * Return: 0 = task masih hidup (atau tidak diketahui),
-     *         1 = task sudah TASK_DEAD / tidak ditemukan.
+     * Setelah wait_for_pid() men-set TASK_WAITING, scheduler akan
+     * skip task ini dan memberi CPU penuh ke child. Saat child
+     * memanggil exit, reaper membangunkan parent ke TASK_READY.
+     * Tidak ada lagi polling busy-wait dari Ring 3.
+     *
+     * Return: 1 = task sudah selesai (atau tidak ditemukan).
      * ================================================================ */
     case 11: {
         uint32_t want_pid = (uint32_t)arg1;
-        result = task_is_dead(want_pid) ? 1 : 0;
+        char buf[32];
+        serial_write_string("[WAIT] PID ");
+        itoa(want_pid, buf, 10);
+        serial_write_string(buf);
+        serial_write_string(" -> blocking...\n");
+        wait_for_pid(want_pid);
+        result = 1; /* Selalu 1 karena saat return, target sudah mati */
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 12: open(char* filename, uint32_t flags)
+     * Buka file atau direktori melalui VFS layer.
+     * filename = "/" membuka listing direktori (semua entry TAR).
+     * flags diabaikan untuk sekarang (TAR read-only).
+     * Return: FD number (>=0) atau -1 bila gagal.
+     * ================================================================ */
+    case 12: {
+        char* filename = (char*)arg1;
+        uint32_t pid = get_current_pid();
+        int fd = vfs_open(pid, filename);
+        result = (uint64_t)(int64_t)fd;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 13: read(int fd, char* buf, size_t count)
+     * Baca hingga count byte dari file descriptor ke buffer user.
+     * Return: jumlah byte yang dibaca, 0 = EOF, -1 = error.
+     * ================================================================ */
+    case 13: {
+        int fd = (int)(int64_t)arg1;
+        char* buf = (char*)arg2;
+        size_t count = (size_t)arg3;
+        uint32_t pid = get_current_pid();
+        int bytes = vfs_read(pid, fd, buf, count);
+        result = (uint64_t)(int64_t)bytes;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 14: close(int fd)
+     * Tutup file descriptor dan bebaskan slot FD.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 14: {
+        int fd = (int)(int64_t)arg1;
+        uint32_t pid = get_current_pid();
+        int ret = vfs_close(pid, fd);
+        result = (uint64_t)(int64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 15: seek(int fd, int64_t offset, int whence)
+     * Ubah posisi baca file: 0=SET, 1=CUR, 2=END.
+     * Return: posisi baru (>=0) atau -1 bila error.
+     * ================================================================ */
+    case 15: {
+        int fd = (int)(int64_t)arg1;
+        int64_t offset = (int64_t)arg2;
+        int whence = (int)arg3;
+        uint32_t pid = get_current_pid();
+        int ret = vfs_seek(pid, fd, offset, whence);
+        result = (uint64_t)(int64_t)ret;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 16: readdir(int fd, char* name_buf, size_t* size_buf)
+     * Baca entry direktori berikutnya dari FD yang dibuka dengan "/".
+     * name_buf diisi nama file, *size_buf diisi ukuran file.
+     * Return: 1 = entry ditemukan, 0 = selesai (tidak ada entry lagi).
+     * ================================================================ */
+    case 16: {
+        int fd = (int)(int64_t)arg1;
+        char* name_buf = (char*)arg2;
+        size_t* size_buf = (size_t*)arg3;
+        uint32_t pid = get_current_pid();
+        int ret = vfs_readdir(pid, fd, name_buf, size_buf);
+        result = (uint64_t)ret;
         break;
     }
 

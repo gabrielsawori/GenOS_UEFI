@@ -19,6 +19,13 @@ void task_init(void) {
     init_task->pid = 0;
     init_task->state = TASK_RUNNING;
     init_task->next = NULL;
+    init_task->pml4 = NULL;          /* Kernel task: pakai kernel_pml4 */
+    init_task->user_page_count = 0;
+
+    /* Initialize FD table: all slots free */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        init_task->fds[i].type = VFS_TYPE_NONE;
+    }
 
     current_task = init_task;
     task_list_head = init_task;
@@ -72,14 +79,42 @@ void create_task(void (*entry_point)(void)) {
  *              prompt baru tertimpa oleh tulisan child.
  */
 struct task* create_user_task(uint8_t* binary_data) {
-    /* 1. Muat ELF ke memori User Mode */
-    uint64_t entry_point = elf_load(binary_data);
-    if (entry_point == 0) {
-        serial_write_string("[ERROR] ELF load gagal: magic number tidak valid!\n");
+    /* 1. Buat address space baru untuk proses ini */
+    uint64_t* new_pml4 = vmm_create_address_space();
+    if (!new_pml4) {
+        serial_write_string("[ERROR] Failed to create address space!\n");
         return NULL;
     }
 
-    /* 2. Siapkan Stack User Mode (1 page = 4096 byte)
+    /* 2. Daftarkan task ke Scheduler (lebih awal agar pml4 tersedia) */
+    struct task* new_task = (struct task*)kmalloc(sizeof(struct task));
+    if (!new_task) {
+        serial_write_string("[ERROR] Failed to allocate task struct for user task!\n");
+        vmm_destroy_address_space(new_pml4);
+        return NULL;
+    }
+
+    /* Inisialisasi field address space */
+    new_task->pml4 = new_pml4;
+    new_task->user_page_count = 0;
+    for (int i = 0; i < 64; i++) new_task->user_pages[i] = 0;
+
+    /* Initialize FD table: all slots free */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        new_task->fds[i].type = VFS_TYPE_NONE;
+    }
+
+    /* 3. Muat ELF ke address space proses baru */
+    uint64_t entry_point = elf_load(binary_data, new_pml4,
+                                    new_task->user_pages, &new_task->user_page_count);
+    if (entry_point == 0) {
+        serial_write_string("[ERROR] ELF load gagal: magic number tidak valid!\n");
+        vmm_destroy_address_space(new_pml4);
+        kfree(new_task);
+        return NULL;
+    }
+
+    /* 4. Siapkan Stack User Mode (1 page = 4096 byte)
      *
      * Setiap user task mendapat alamat stack virtual UNIK agar tidak saling
      * menimpa. Alamat dimulai dari 0x80000000 dan bertambah 0x10000 (64KB)
@@ -91,16 +126,20 @@ struct task* create_user_task(uint8_t* binary_data) {
     uint64_t phys_stack = (uint64_t)pmm_alloc_page();
     if (!phys_stack) {
         serial_write_string("[ERROR] Failed to allocate user stack!\n");
+        vmm_destroy_address_space(new_pml4);
+        kfree(new_task);
         return NULL;
     }
-    vmm_map_page(app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
 
-    /* 3. Daftarkan task ke Scheduler */
-    struct task* new_task = (struct task*)kmalloc(sizeof(struct task));
-    if (!new_task) {
-        serial_write_string("[ERROR] Failed to allocate task struct for user task!\n");
-        return NULL;
+    /* Catat stack page untuk cleanup */
+    if (new_task->user_page_count < 64) {
+        new_task->user_pages[new_task->user_page_count++] = phys_stack;
     }
+
+    /* Petakan stack ke address space proses baru (bukan kernel_pml4!) */
+    vmm_map_page_in(new_pml4, app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
+
+    /* 5. Setup register dan state task */
     new_task->pid   = next_pid++;
     new_task->state = TASK_READY;
     new_task->stack_base = app_stack_virt;
@@ -112,16 +151,7 @@ struct task* create_user_task(uint8_t* binary_data) {
     new_task->regs.rip    = entry_point;
     new_task->regs.cs     = 0x23; /* User Code Selector (Ring 3, RPL=3) */
     new_task->regs.rflags = 0x202;
-    /*
-     * BUG FIX #6: RSP diset ke (base + 4096 - 16) agar:
-     * - Berada di DALAM page yang di-map (bukan di tepi atas yang sudah out-of-range)
-     * - 16-byte aligned sesuai AMD64 ABI sehingga tidak terjadi #GP saat CALL
-     */
     new_task->regs.rsp = (app_stack_virt + 4096 - 16) & ~0xFULL;
-    /*
-     * BUG FIX: SS = 0x2B menunjuk ke GDT[5] = TSS descriptor → #GP saat iretq!
-     * User Data ada di GDT[3] = selector 0x18, dengan RPL=3 menjadi 0x1B.
-     */
     new_task->regs.ss  = 0x1B; /* User Data Selector (GDT[3], Ring 3, RPL=3) */
     new_task->next = NULL;
 
@@ -171,6 +201,52 @@ void schedule(struct registers* current_regs) {
         t = t->next;
     }
 
+    /*
+     * === DEAD TASK REAPER ===
+     * Bebaskan resource (stack + task struct) dari task yang sudah mati.
+     * Dilakukan SETIAP tick agar memori tidak bocor saat proses exit.
+     * Hanya reap task yang BUKAN current_task (kita masih pakai stack-nya!).
+     */
+    struct task* prev = NULL;
+    t = task_list_head;
+    while (t != NULL) {
+        struct task* next = t->next;
+        if (t->state == TASK_DEAD && t != current_task) {
+            /* Unlink dari linked list */
+            if (prev != NULL) {
+                prev->next = next;
+            } else {
+                task_list_head = next;
+            }
+            if (t == task_list_tail) {
+                task_list_tail = prev;
+            }
+            /* Bangunkan task yang menunggu PID ini (blocking wait_pid) */
+            struct task* w = task_list_head;
+            while (w != NULL) {
+                if (w->state == TASK_WAITING && w->wait_target_pid == t->pid) {
+                    w->state = TASK_READY;
+                }
+                w = w->next;
+            }
+            /* Bebaskan semua page fisik milik proses ini */
+            for (uint32_t pg = 0; pg < t->user_page_count; pg++) {
+                if (t->user_pages[pg]) {
+                    pmm_free_page((void*)t->user_pages[pg]);
+                }
+            }
+            /* Bebaskan page table levels (lower half) + PML4 */
+            if (t->pml4) {
+                vmm_destroy_address_space(t->pml4);
+            }
+            /* Bebaskan task struct */
+            kfree(t);
+        } else {
+            prev = t;
+        }
+        t = next;
+    }
+
     /* Hitung jumlah total task dalam antrean untuk batas iterasi */
     uint32_t task_count = 0;
     t = task_list_head;
@@ -179,8 +255,10 @@ void schedule(struct registers* current_regs) {
     /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
     if (task_count <= 1) return;
 
-    /* Simpan state task saat ini (hanya jika masih hidup dan tidak tidur) */
-    if (current_task->state != TASK_DEAD && current_task->state != TASK_SLEEPING) {
+    /* Simpan state task saat ini (hanya jika masih hidup dan tidak tidur/menunggu) */
+    if (current_task->state != TASK_DEAD &&
+        current_task->state != TASK_SLEEPING &&
+        current_task->state != TASK_WAITING) {
         current_task->regs = *current_regs;
         if (current_task->state == TASK_RUNNING) current_task->state = TASK_READY;
     }
@@ -193,11 +271,19 @@ void schedule(struct registers* current_regs) {
         attempts++;
         /* Hentikan pencarian jika sudah keliling semua task tanpa menemukan READY */
         if (attempts > task_count) {
-            /* Semua task DEAD/SLEEPING — kembali ke task kepala (init/idle task) */
+            /* Semua task DEAD/SLEEPING/WAITING — kembali ke task kepala (init/idle task) */
             current_task = task_list_head;
             break;
         }
-    } while (current_task->state == TASK_DEAD || current_task->state == TASK_SLEEPING);
+    } while (current_task->state == TASK_DEAD ||
+             current_task->state == TASK_SLEEPING ||
+             current_task->state == TASK_WAITING);
+
+    /* Ganti address space (CR3) sesuai task yang dipilih */
+    if (current_task->pml4 != NULL) {
+        vmm_switch_pml4(current_task->pml4);
+    }
+    /* Jika pml4 == NULL (kernel task), CR3 sudah benar dari boot */
 
     /* Muat register task baru ke CPU */
     current_task->state = TASK_RUNNING;
@@ -208,6 +294,17 @@ void schedule(struct registers* current_regs) {
 void exit_current_task(void) {
     if (current_task != NULL) {
         current_task->state = TASK_DEAD;
+
+        /* Bangunkan task yang menunggu PID ini (blocking wait_pid).
+         * Meskipun reaper juga melakukan ini, kita bangunkan SEKARANG
+         * agar parent tidak perlu menunggu tick berikutnya. */
+        struct task* w = task_list_head;
+        while (w != NULL) {
+            if (w->state == TASK_WAITING && w->wait_target_pid == current_task->pid) {
+                w->state = TASK_READY;
+            }
+            w = w->next;
+        }
     }
     // Tunggu scheduler untuk membersihkan
     while(1) { asm volatile ("sti; hlt"); }
@@ -248,4 +345,63 @@ int task_is_dead(uint32_t pid) {
         t = t->next;
     }
     return 1; /* PID tidak ditemukan → anggap selesai */
+}
+
+/*
+ * task_mark_running() - Tandai task saat ini sebagai TASK_RUNNING.
+ *
+ * Dipanggil di awal syscall_handler agar task yang sebelumnya tidur
+ * (TASK_SLEEPING) tidak dilewati scheduler jika timer interrupt
+ * menyala saat task sedang di dalam syscall berikutnya.
+ * Tanpa ini, register task bisa disimpan paksa oleh scheduler ke
+ * task->regs saat state masih SLEEPING → korupsi state.
+ */
+void task_mark_running(void) {
+    if (current_task != NULL) {
+        current_task->state = TASK_RUNNING;
+    }
+}
+
+/*
+ * wait_for_pid() - Blokir task saat ini sampai task target selesai.
+ *
+ * @param target_pid: PID task yang ditunggu.
+ *
+ * Jika target sudah TASK_DEAD atau tidak ditemukan, langsung return
+ * tanpa memblokir. Jika target masih hidup, set state ke TASK_WAITING
+ * dan scheduler akan skip task ini sampai target mati (dibangunkan
+ * oleh exit_current_task atau reaper di schedule).
+ */
+void wait_for_pid(uint32_t target_pid) {
+    if (!current_task) return;
+
+    /* Cek apakah target sudah mati atau tidak ada */
+    struct task* t = task_list_head;
+    int found = 0;
+    while (t != NULL) {
+        if (t->pid == target_pid) {
+            found = 1;
+            if (t->state == TASK_DEAD) return; /* Sudah mati, tidak perlu tunggu */
+            break;
+        }
+        t = t->next;
+    }
+
+    if (!found) return; /* PID tidak ditemukan, anggap selesai */
+
+    /* Blokir task ini sampai target mati */
+    current_task->state = TASK_WAITING;
+    current_task->wait_target_pid = target_pid;
+}
+
+uint32_t get_current_pid(void) {
+    return current_task ? current_task->pid : 0;
+}
+
+/*
+ * task_get_current_fds() - Return the current task's FD array.
+ * Used by VFS layer to access per-process file descriptors.
+ */
+vfs_fd_t* task_get_current_fds(void) {
+    return current_task ? current_task->fds : NULL;
 }

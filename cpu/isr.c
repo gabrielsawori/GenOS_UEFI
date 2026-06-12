@@ -85,6 +85,7 @@ static void handle_page_fault(struct registers *regs) {
     asm volatile ("mov %%cr2, %0" : "=r"(cr2));
 
     uint64_t err = regs->err_code;
+    int user_mode = (regs->cs & 3) == 3; /* Ring 3 = user mode */
 
     /* ==================== OUTPUT KE SERIAL ==================== */
     serial_write_string("\n========== PAGE FAULT DIAGNOSTIC ==========\n");
@@ -97,33 +98,56 @@ static void handle_page_fault(struct registers *regs) {
     serial_write_string("\n  Operasi:  ");
     serial_write_string((err & 0x02) ? "WRITE (Tulis)" : "READ (Baca)");
     serial_write_string("\n  Konteks:  ");
-    serial_write_string((err & 0x04) ? "User Mode (Ring 3)" : "Kernel Mode (Ring 0)");
+    serial_write_string(user_mode ? "User Mode (Ring 3)" : "Kernel Mode (Ring 0)");
     if (err & 0x08) serial_write_string("\n  [!] Reserved bit set dalam page table!");
     if (err & 0x10) serial_write_string("\n  [!] Instruction Fetch (NX violation)");
-    serial_write_string("\n=============================================\n");
 
-    /* ==================== OUTPUT KE LAYAR ==================== */
-    size_t y = 300;
-    fb_print("============= PAGE FAULT =============", 50, y, 0xFF4444, 0x002244, 2);
-    y += 28;
-    print_hex_fb("Alamat Fault (CR2): ", cr2, 50, y, 0xFF8800);
-    y += 24;
-    print_hex_fb("Instruksi (RIP):    ", regs->rip, 50, y, 0xFF8800);
-    y += 24;
-    print_hex_fb("Code Segment (CS):  ", regs->cs, 50, y, 0xFF8800);
-    y += 24;
-    print_hex_fb("Error Code:         ", err, 50, y, 0xFF8800);
-    y += 28;
+    if (user_mode) {
+        /* ==================== USER MODE FAULT: KILL PROCESS ==================== */
+        serial_write_string("\n  [ACTION] Membunuh proses user (PID ");
+        char pid_buf[16];
+        itoa(get_current_pid(), pid_buf, 10);
+        serial_write_string(pid_buf);
+        serial_write_string(")\n=============================================\n");
 
-    /* Tampilkan penjelasan penyebab yang mudah dibaca manusia */
-    fb_print((err & 0x01) ? "Penyebab: Protection Violation"
-                          : "Penyebab: Page Not Present", 50, y, 0xFFFF00, 0x002244, 2);
-    y += 22;
-    fb_print((err & 0x02) ? "Operasi:  WRITE (Tulis)"
-                          : "Operasi:  READ (Baca)", 50, y, 0xFFFF00, 0x002244, 2);
-    y += 22;
-    fb_print((err & 0x04) ? "Konteks:  User Mode (Ring 3)"
-                          : "Konteks:  Kernel Mode (Ring 0)", 50, y, 0xFFFF00, 0x002244, 2);
+        /* ==================== OUTPUT KE LAYAR ==================== */
+        size_t y = 300;
+        fb_print("============= PAGE FAULT =============", 50, y, 0xFF4444, 0x002244, 2);
+        y += 28;
+        print_hex_fb("Alamat Fault (CR2): ", cr2, 50, y, 0xFF8800);
+        y += 24;
+        print_hex_fb("Instruksi (RIP):    ", regs->rip, 50, y, 0xFF8800);
+        y += 24;
+        fb_print("Proses user dibunuh (PID ", 50, y, 0xFFFF00, 0x002244, 2);
+        fb_print(pid_buf, 50 + 25 * 16, y, 0xFFFF00, 0x002244, 2);
+
+        /* Tandai task sebagai mati — reaper akan bersihkan di tick berikutnya */
+        exit_current_task(); /* Tidak akan kembali: masuk loop hlt */
+    } else {
+        /* ==================== KERNEL MODE FAULT: PANIC ==================== */
+        serial_write_string("\n  [FATAL] Page fault di kernel! Sistem dihentikan.\n");
+        serial_write_string("=============================================\n");
+
+        /* ==================== OUTPUT KE LAYAR ==================== */
+        size_t y = 300;
+        fb_print("============= PAGE FAULT =============", 50, y, 0xFF4444, 0x002244, 2);
+        y += 28;
+        print_hex_fb("Alamat Fault (CR2): ", cr2, 50, y, 0xFF8800);
+        y += 24;
+        print_hex_fb("Instruksi (RIP):    ", regs->rip, 50, y, 0xFF8800);
+        y += 24;
+        print_hex_fb("Code Segment (CS):  ", regs->cs, 50, y, 0xFF8800);
+        y += 24;
+        print_hex_fb("Error Code:         ", err, 50, y, 0xFF8800);
+        y += 28;
+        fb_print((err & 0x01) ? "Penyebab: Protection Violation"
+                              : "Penyebab: Page Not Present", 50, y, 0xFFFF00, 0x002244, 2);
+        y += 22;
+        fb_print((err & 0x02) ? "Operasi:  WRITE (Tulis)"
+                              : "Operasi:  READ (Baca)", 50, y, 0xFFFF00, 0x002244, 2);
+        y += 22;
+        fb_print("Konteks:  Kernel Mode (Ring 0) — FATAL!", 50, y, 0xFF0000, 0x002244, 2);
+    }
 }
 
 /*

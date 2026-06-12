@@ -34,6 +34,7 @@ typedef struct {
     uint64_t align;
 } elf_phdr_t;
 
-uint64_t elf_load(uint8_t* binary_data);
+uint64_t elf_load(uint8_t* binary_data, uint64_t* target_pml4,
+                  uint64_t* phys_pages, uint32_t* page_count);
 
 #endif
