@@ -67,7 +67,7 @@ uint64_t elf_load(uint8_t* binary_data, uint64_t* target_pml4,
                 if (!phys_page) return 0;
 
                 /* Catat page fisik untuk cleanup nanti */
-                if (phys_pages && page_count && *page_count < 64) {
+                if (phys_pages && page_count && *page_count < 256) {
                     phys_pages[*page_count] = (uint64_t)phys_page;
                     (*page_count)++;
                 }

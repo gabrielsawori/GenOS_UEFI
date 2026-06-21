@@ -76,31 +76,110 @@ void log_bad_cs(uint64_t bad_cs) {
     serial_write_string(" — FORCED TO 0x08 (kernel)\n");
 }
 
+#include "../mm/pmm.h"
+#include "../mm/vmm.h"
+
 /*
- * handle_page_fault() - Handler khusus untuk Page Fault (INT 14).
+ * cow_resolve() - Handle Copy-on-Write page fault.
  *
- * Page Fault adalah exception paling umum dalam pengembangan OS.
- * Handler ini menampilkan informasi diagnostik lengkap:
+ * When fork() marks pages as read-only + CoW (bit 9), any write triggers
+ * a page fault. This function:
+ *   1. Checks if the faulting PTE has CoW bit set
+ *   2. If refcount == 1, just make it writable again (last owner)
+ *   3. If refcount > 1, allocate new page, copy, remap writable
  *
- *   1. CR2 (Faulting Address) — alamat virtual yang menyebabkan fault
- *   2. Error Code bits:
- *      - Bit 0 (P):    0 = halaman tidak ada, 1 = pelanggaran proteksi
- *      - Bit 1 (W/R):  0 = akses baca, 1 = akses tulis
- *      - Bit 2 (U/S):  0 = mode kernel (Ring 0), 1 = mode user (Ring 3)
- *      - Bit 3 (RSVD): 1 = reserved bit di page table entry terset
- *      - Bit 4 (I/D):  1 = fault saat instruction fetch (eksekusi kode)
- *   3. RIP — alamat instruksi yang menyebabkan fault
- *   4. CS  — code segment selector (0x08 = kernel, 0x23 = user)
- *
- * Semua informasi dicetak ke serial port DAN ke framebuffer agar bisa
- * dilihat baik di QEMU serial console maupun di layar langsung.
+ * Returns 1 if CoW was handled (resume execution), 0 if not a CoW fault.
  */
+static int cow_resolve(uint64_t fault_addr, uint64_t err_code) {
+    /* CoW only applies to WRITE faults on PRESENT pages from USER mode */
+    if (!(err_code & 0x01)) return 0; /* Page not present → not CoW */
+    if (!(err_code & 0x02)) return 0; /* Read fault → not CoW */
+    if (!(err_code & 0x04)) return 0; /* Kernel mode → not CoW */
+
+    /* Get current task's PML4 */
+    uint64_t* pml4 = task_get_current_pml4();
+    if (!pml4) return 0;
+
+    extern volatile struct limine_hhdm_request hhdm_request;
+    uint64_t offset = hhdm_request.response->offset;
+
+    /* Walk page tables to find the PTE */
+    uint64_t pml4_idx = (fault_addr >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (fault_addr >> 30) & 0x1FF;
+    uint64_t pd_idx   = (fault_addr >> 21) & 0x1FF;
+    uint64_t pt_idx   = (fault_addr >> 12) & 0x1FF;
+
+    if (!(pml4[pml4_idx] & 1)) return 0;
+    uint64_t* pdpt = (uint64_t*)((pml4[pml4_idx] & ~0xFFF) + offset);
+
+    if (!(pdpt[pdpt_idx] & 1)) return 0;
+    uint64_t* pd = (uint64_t*)((pdpt[pdpt_idx] & ~0xFFF) + offset);
+
+    if (!(pd[pd_idx] & 1)) return 0;
+    uint64_t* pt = (uint64_t*)((pd[pd_idx] & ~0xFFF) + offset);
+
+    uint64_t pte = pt[pt_idx];
+    if (!(pte & 1)) return 0;      /* Not present */
+    if (!(pte & 0x200)) return 0;  /* No CoW bit (bit 9) → not our fault */
+
+    uint64_t old_phys = pte & ~0xFFF;
+    uint64_t flags = pte & 0xFFF;
+
+    /* Remove CoW bit, add WRITABLE */
+    flags = (flags & ~0x200) | 0x002;
+
+    uint8_t refcount = pmm_get_refcount((void*)old_phys);
+
+    if (refcount <= 1) {
+        /* Last owner: just make writable, no copy needed */
+        pt[pt_idx] = old_phys | flags;
+    } else {
+        /* Shared: allocate new page and copy */
+        void* new_phys = pmm_alloc_page();
+        if (!new_phys) {
+            serial_write_string("[CoW] Out of memory!\n");
+            return 0; /* Let it crash — no memory */
+        }
+
+        /* Copy 4KB content */
+        uint8_t* src = (uint8_t*)(old_phys + offset);
+        uint8_t* dst = (uint8_t*)((uint64_t)new_phys + offset);
+        for (int i = 0; i < 4096; i++) dst[i] = src[i];
+
+        /* Remap to new page (writable, no CoW) */
+        pt[pt_idx] = (uint64_t)new_phys | flags;
+
+        /* Decrement refcount of old shared page */
+        pmm_free_page((void*)old_phys);
+
+        /* Track new page in current task */
+        struct task* t = task_find_by_pid(get_current_pid());
+        if (t && t->user_page_count < 256) {
+            t->user_pages[t->user_page_count++] = (uint64_t)new_phys;
+        }
+    }
+
+    /* Flush TLB for this address */
+    asm volatile("invlpg (%0)" : : "r"(fault_addr) : "memory");
+    return 1; /* CoW handled, resume execution */
+}
+
 static void handle_page_fault(struct registers *regs) {
     /* Baca CR2 — register khusus CPU yang menyimpan alamat fault */
     uint64_t cr2;
     asm volatile ("mov %%cr2, %0" : "=r"(cr2));
 
     uint64_t err = regs->err_code;
+
+    /*
+     * === COPY-ON-WRITE RESOLUTION ===
+     * Try CoW first. If the fault is a write to a CoW page,
+     * resolve it transparently and return to the faulting instruction.
+     */
+    if (cow_resolve(cr2, err)) {
+        return; /* CoW handled — resume user code */
+    }
+
     int user_mode = (regs->cs & 3) == 3; /* Ring 3 = user mode */
 
     /* ==================== OUTPUT KE SERIAL ==================== */
@@ -273,17 +352,26 @@ static void handle_gpf(struct registers *regs) {
  */
 void isr_handler(struct registers *regs) {
     if (regs->int_no < 32) {
-        /* ===== CPU EXCEPTION: KERNEL PANIC ===== */
+        /* ===== CPU EXCEPTION ===== */
+
+        /* INT 14: Page Fault — may be recoverable (CoW or user fault) */
+        if (regs->int_no == 14) {
+            handle_page_fault(regs);
+            /* If handle_page_fault returns, it was either:
+             * - CoW resolved (resume user code)
+             * - User process killed (exit_current_task loops, won't reach here)
+             * - Kernel fault (cli+hlt inside handler, won't reach here)
+             * So if we reach here, it was a CoW success — just return. */
+            return;
+        }
+
+        /* All other exceptions are fatal */
         serial_write_string("\n[!!!] KERNEL PANIC: ");
         serial_write_string(exception_messages[regs->int_no]);
         serial_write_string(" [!!!]\n");
 
-        /* Handler khusus untuk exception yang sering terjadi */
-        if (regs->int_no == 14) {
-            /* INT 14: Page Fault — tampilkan CR2 dan decode error code */
-            handle_page_fault(regs);
-        } else if (regs->int_no == 13) {
-            /* INT 13: General Protection Fault — tampilkan selector info */
+        if (regs->int_no == 13) {
+            /* INT 13: General Protection Fault */
             handle_gpf(regs);
         } else {
             /* Exception lainnya: tampilkan info dasar */
@@ -292,7 +380,6 @@ void isr_handler(struct registers *regs) {
             fb_print("=============================================", 50, 340, 0xFF0000, 0x002244, 2);
             fb_print(exception_messages[regs->int_no], 50, 410, 0xFFFF00, 0x002244, 2);
 
-            /* Tampilkan RIP dan error code untuk semua exception */
             print_hex_fb("RIP: ", regs->rip, 50, 440, 0xFF8800);
             print_hex_fb("ERR: ", regs->err_code, 50, 464, 0xFF8800);
 

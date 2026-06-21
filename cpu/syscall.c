@@ -25,10 +25,18 @@ extern struct limine_framebuffer *fb;
 uint64_t kernel_stack_top = 0;
 
 /*
- * Flag global: menandai bahwa CPU sedang di dalam syscall handler.
- * Scheduler HARUS skip context-switch saat flag ini aktif, karena
- * syscall menggunakan stack terpisah (kernel_stack_top) yang tidak
- * kompatibel dengan mekanisme iretq scheduler.
+ * in_syscall flag: DEPRECATED for scheduling purposes.
+ *
+ * Previously this flag blocked ALL context switches during syscalls.
+ * Now that each task has its own kernel stack (per-task stack scheme),
+ * the scheduler can safely preempt during syscalls:
+ *   - Timer interrupt pushes onto the same per-task kernel stack
+ *   - Scheduler saves/restores the interrupt frame correctly
+ *   - iretq returns to inside the syscall handler on the per-task stack
+ *   - Syscall continues and sysretq returns to user mode
+ *
+ * This is exactly how Linux handles preemptible syscalls.
+ * The flag is kept only for debugging/tracing purposes.
  */
 volatile int in_syscall = 0;
 
@@ -81,6 +89,7 @@ void syscall_init(void) {
     serial_write_string("            17=shm_create 18=shm_attach 19=shm_detach 20=shm_destroy\n");
     serial_write_string("            21=cache_stats 22=fork\n");
     serial_write_string("            23=write 24=create 25=unlink\n");
+    serial_write_string("            26=nice 27=sched_info\n");
 
     /* Initialize VFS layer */
     vfs_init();
@@ -110,22 +119,14 @@ void syscall_init(void) {
  * └────┴─────────────┴──────────────────────┴──────────────────┴──────────────┴──────────────┘
  */
 uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
-    in_syscall = 1;
+    in_syscall = 1; /* Debug tracing only — no longer blocks scheduler */
     /*
-     * BUG FIX: Paksa task ke TASK_RUNNING sebelum memproses syscall.
-     *
-     * Jika task sebelumnya memanggil sleep (yang men-set TASK_SLEEPING),
-     * lalu task kembali dan membuat syscall berikutnya (mis. wait_pid),
-     * state task masih TASK_SLEEPING. Jika timer IRQ menyala saat task
-     * di dalam syscall ini, scheduler akan melewati task (karena SLEEPING)
-     * dan TIDAK menyimpan register ke task->regs. Akibatnya, state task
-     * bisa korup saat dibangunkan nanti.
-     *
-     * Dengan men-set TASK_RUNNING di sini, scheduler selalu memperlakukan
-     * task ini sebagai task aktif jika timer menyala di tengah syscall.
+     * Paksa task ke TASK_RUNNING sebelum memproses syscall.
+     * Ini memastikan scheduler memperlakukan task sebagai aktif jika
+     * timer interrupt menyala di tengah syscall (preemptible syscalls).
      */
     task_mark_running();
-    /* Aktifkan interrupt agar keyboard & timer IRQ bisa menyala */
+    /* Aktifkan interrupt agar timer dapat preempt syscall yang lama */
     asm volatile ("sti");
 
     uint64_t result = 0;
@@ -542,13 +543,48 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         break;
     }
 
+    /* ================================================================
+     * SYSCALL 26: nice(int nice_value)
+     * Adjust scheduling priority via nice value.
+     *   nice < 0 = higher priority (more CPU time)
+     *   nice > 0 = lower priority (less CPU time)
+     *   nice = 0 = default
+     * Range: -2 to +2.
+     * Return: 0 on success.
+     * ================================================================ */
+    case 26: {
+        int nice_val = (int)(int64_t)arg1;
+        result = (uint64_t)(int64_t)task_set_nice(nice_val);
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 27: sched_info(uint32_t pid, char* buf)
+     * Get scheduling info for a process.
+     * pid=0 means current process.
+     * Writes info string to buf (must be >= 128 bytes).
+     * Return: 0 on success, -1 if not found.
+     * ================================================================ */
+    case 27: {
+        uint32_t target_pid = (uint32_t)arg1;
+        char* buf = (char*)arg2;
+        result = (uint64_t)(int64_t)task_get_sched_info(target_pid, buf);
+        break;
+    }
+
     default:
         serial_write_string("[WARN] Syscall tidak dikenal\n");
         result = (uint64_t)-1;
         break;
     }
 
-    /* Matikan interrupt sebelum kembali ke syscall_entry (sysretq membutuhkan CLI) */
+    /*
+     * Matikan interrupt sebelum kembali ke syscall_entry assembly.
+     * CLI melindungi critical path: pop callee-saved regs → sysretq.
+     * Tanpa CLI, timer bisa fire saat RSP sudah di-switch ke user stack
+     * tapi CPU masih di Ring 0 → stack corruption.
+     * sysretq secara atomik me-restore RFLAGS (termasuk IF=1) dari R11.
+     */
     asm volatile ("cli");
     in_syscall = 0;
     return result;
