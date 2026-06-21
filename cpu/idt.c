@@ -51,6 +51,14 @@ void idt_init(void) {
         idt_set_descriptor(32 + i, (void*)irq_stub_table[i], 0x8E);
     }
 
+    // 3. LAPIC Timer (Vector 48) — for SMP per-CPU scheduling
+    extern void lapic_timer_stub(void);
+    idt_set_descriptor(48, (void*)lapic_timer_stub, 0x8E);
+
     idt_load((uint64_t)&idtr);
     serial_write_string("[OK] IDT Berhasil Dimuat dan ISR/IRQ Didaftarkan!\n");
+}
+
+void idt_load_on_ap(void) {
+    idt_load((uint64_t)&idtr);
 }

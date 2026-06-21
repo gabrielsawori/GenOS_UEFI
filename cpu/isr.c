@@ -408,4 +408,11 @@ void isr_handler(struct registers *regs) {
         if (regs->int_no >= 40) { outb(0xA0, 0x20); } /* Slave PIC */
         outb(0x20, 0x20); /* Master PIC */
     }
+    /* ===== LAPIC TIMER (INT 48) — SMP per-CPU scheduler tick ===== */
+    else if (regs->int_no == 48) {
+        extern void lapic_eoi(void);
+        timer_tick();     /* Increment global tick counter */
+        schedule(regs);   /* Context switch on this CPU */
+        lapic_eoi();      /* Acknowledge LAPIC interrupt */
+    }
 }

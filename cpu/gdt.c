@@ -74,3 +74,13 @@ void gdt_init(void) {
 void set_kernel_stack(uint64_t stack) {
     tss_entry.rsp0 = stack;
 }
+
+/*
+ * gdt_load_on_ap() - Load BSP's GDT on an Application Processor.
+ * Re-uses the same GDTR (shared GDT table). Does NOT load TSS
+ * since APs currently only idle (cli; hlt). TSS per-AP will be
+ * needed when per-CPU scheduling is implemented.
+ */
+void gdt_load_on_ap(void) {
+    gdt_load((uint64_t)&gdtr);
+}

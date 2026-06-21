@@ -90,6 +90,7 @@ void syscall_init(void) {
     serial_write_string("            21=cache_stats 22=fork\n");
     serial_write_string("            23=write 24=create 25=unlink\n");
     serial_write_string("            26=nice 27=sched_info\n");
+    serial_write_string("            28=clone 29=thread_count\n");
 
     /* Initialize VFS layer */
     vfs_init();
@@ -569,6 +570,29 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         uint32_t target_pid = (uint32_t)arg1;
         char* buf = (char*)arg2;
         result = (uint64_t)(int64_t)task_get_sched_info(target_pid, buf);
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 28: clone(uint64_t entry, uint64_t stack_top)
+     * Create a new thread in the current process.
+     * The thread shares the parent's address space but has its own stack.
+     * Return: thread TID (>0) to caller, -1 on error.
+     * ================================================================ */
+    case 28: {
+        uint64_t entry = arg1;
+        uint64_t stack = arg2;
+        result = (uint64_t)(int64_t)task_clone(entry, stack);
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 29: thread_count()
+     * Get the number of threads in the current process.
+     * Return: thread count (>= 1).
+     * ================================================================ */
+    case 29: {
+        result = (uint64_t)task_get_thread_count();
         break;
     }
 

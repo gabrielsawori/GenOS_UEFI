@@ -79,6 +79,13 @@ IRQ_STUB 45, 13
 IRQ_STUB 46, 14
 IRQ_STUB 47, 15
 
+/* LAPIC Timer Interrupt (INT 48) */
+.global lapic_timer_stub
+lapic_timer_stub:
+    push $0
+    push $48
+    jmp isr_common
+
 /* Menyimpan semua register */
 isr_common:
     push %rax
