@@ -13,6 +13,7 @@
 #include "../mm/heap.h"
 #include "task.h"
 #include "../cpu/syscall.h"
+#include "../cpu/smp.h"
 #include "../fs/tar.h"
 
 LIMINE_BASE_REVISION(1)
@@ -47,6 +48,16 @@ volatile struct limine_memmap_request memmap_request = { .id = LIMINE_MEMMAP_REQ
 __attribute__((used, section(".requests")))
 volatile struct limine_module_request module_request = {
     .id = LIMINE_MODULE_REQUEST, .revision = 0
+};
+
+__attribute__((used, section(".requests")))
+volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST, .revision = 0
+};
+
+__attribute__((used, section(".requests")))
+volatile struct limine_smp_request smp_request = {
+    .id = LIMINE_SMP_REQUEST, .revision = 0, .flags = 0
 };
 
 static void hcf(void) { asm ("cli"); for (;;) { asm ("hlt"); } }
@@ -132,6 +143,12 @@ void _start(void) {
     pmm_init();
     vmm_init();
     heap_init();
+
+    /* === FASE 2.5: SMP/CPU Detection via ACPI MADT === */
+    smp_init(
+        smp_request.response,
+        rsdp_request.response ? rsdp_request.response->address : (void*)0
+    );
 
     /* === FASE 3: Task Scheduler === */
     serial_write_string("[INFO] Starting Task Scheduler...\n");

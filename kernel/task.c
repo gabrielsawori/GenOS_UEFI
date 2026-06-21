@@ -7,9 +7,17 @@
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
 #include "../cpu/gdt.h"
+#include "../cpu/spinlock.h"
+#include "../cpu/lapic.h"
 #include "../limine.h"
 #include "utils.h"
 #include <stddef.h>
+
+/* SMP scheduler spinlock — protects task list and current_task */
+static spinlock_t sched_lock = SPINLOCK_INIT;
+
+/* Serial output spinlock — prevents garbled output from multiple CPUs */
+static spinlock_t serial_lock = SPINLOCK_INIT;
 
 /* Borrow from pmm.c for HHDM physical page access during fork copy */
 extern volatile struct limine_hhdm_request hhdm_request;
@@ -57,6 +65,9 @@ void task_init(void) {
 
     struct task* init_task = (struct task*)kmalloc(sizeof(struct task));
     init_task->pid = 0;
+    init_task->tgid = 0;          /* Thread group leader = self */
+    init_task->is_thread = 0;
+    init_task->thread_count = 1;
     init_task->state = TASK_RUNNING;
     init_task->next = NULL;
     init_task->pml4 = NULL;          /* Kernel task: pakai kernel_pml4 */
@@ -119,6 +130,9 @@ void task_init(void) {
 void create_task(void (*entry_point)(void)) {
     struct task* new_task = (struct task*)kmalloc(sizeof(struct task));
     new_task->pid = next_pid++;
+    new_task->tgid = new_task->pid;
+    new_task->is_thread = 0;
+    new_task->thread_count = 1;
     new_task->state = TASK_READY;
 
     new_task->stack_base = (uint64_t)kmalloc(4096); 
@@ -283,6 +297,9 @@ struct task* create_user_task(uint8_t* binary_data) {
 
     /* 5. Setup register dan state task */
     new_task->pid   = next_pid++;
+    new_task->tgid  = new_task->pid; /* Process leader = self */
+    new_task->is_thread = 0;
+    new_task->thread_count = 1;
     new_task->state = TASK_READY;
     new_task->stack_base = app_stack_virt;
 
@@ -341,6 +358,11 @@ extern uint64_t kernel_stack_top;
 
 void schedule(struct registers* current_regs) {
     if (!current_task) return;
+
+    /* SMP: Try to acquire scheduler lock. If another CPU already holds it,
+     * skip this tick (non-blocking). This prevents deadlock if timer fires
+     * while already in schedule() on same CPU. */
+    if (!spin_trylock(&sched_lock)) return;
 
     /* Bangunkan task yang sedang tidur jika waktunya sudah tiba */
     uint64_t now = timer_get_ticks();
@@ -406,17 +428,42 @@ void schedule(struct registers* current_regs) {
                 }
                 w = w->next;
             }
-            /* Bebaskan semua page fisik milik proses ini */
-            for (uint32_t pg = 0; pg < t->user_page_count; pg++) {
-                if (t->user_pages[pg]) {
-                    pmm_free_page((void*)t->user_pages[pg]);
+
+            if (t->is_thread) {
+                /*
+                 * THREAD CLEANUP: Do NOT free user_pages or PML4!
+                 * These are owned by the thread group leader.
+                 * Only free the task struct and kernel stack.
+                 */
+                struct task* leader = task_find_by_pid(t->tgid);
+                if (leader && leader->thread_count > 0) {
+                    leader->thread_count--;
                 }
-            }
-            /* Cleanup shared memory attachments BEFORE destroying PML4 */
-            shm_cleanup_process(t);
-            /* Bebaskan page table levels (lower half) + PML4 */
-            if (t->pml4) {
-                vmm_destroy_address_space(t->pml4);
+            } else {
+                /*
+                 * PROCESS CLEANUP: Free all resources.
+                 * If this is a thread group leader, kill all remaining threads.
+                 */
+                /* Kill all threads in this group */
+                struct task* th = task_list_head;
+                while (th != NULL) {
+                    if (th != t && th->tgid == t->pid && th->state != TASK_DEAD) {
+                        th->state = TASK_DEAD;
+                    }
+                    th = th->next;
+                }
+                /* Free user pages */
+                for (uint32_t pg = 0; pg < t->user_page_count; pg++) {
+                    if (t->user_pages[pg]) {
+                        pmm_free_page((void*)t->user_pages[pg]);
+                    }
+                }
+                /* Cleanup shared memory */
+                shm_cleanup_process(t);
+                /* Destroy address space */
+                if (t->pml4) {
+                    vmm_destroy_address_space(t->pml4);
+                }
             }
             /* Bebaskan task struct */
             kfree(t);
@@ -432,7 +479,10 @@ void schedule(struct registers* current_regs) {
     while (t != NULL) { task_count++; t = t->next; }
 
     /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
-    if (task_count <= 1) return;
+    if (task_count <= 1) {
+        spin_unlock(&sched_lock);
+        return;
+    }
 
     /*
      * === QUANTUM CHECK ===
@@ -444,6 +494,7 @@ void schedule(struct registers* current_regs) {
     if (current_task->state == TASK_RUNNING && current_task->quantum > 0) {
         current_task->quantum--;
         current_task->cpu_ticks++;
+        spin_unlock(&sched_lock);
         return; /* Tetap di task ini, tidak switch */
     }
 
@@ -553,6 +604,8 @@ void schedule(struct registers* current_regs) {
             serial_write_string("\n");
         }
     }
+
+    spin_unlock(&sched_lock);
 }
 
 // Fungsi Pengeksekusi Mati
@@ -958,4 +1011,125 @@ int task_get_sched_info(uint32_t pid, char* out_buf) {
 
     #undef APPEND
     return 0;
+}
+
+/*
+ * task_clone() - Create a new thread sharing the parent's address space.
+ *
+ * @param entry:     User-space function address where thread starts executing.
+ * @param stack_top: Top of the thread's user-allocated stack.
+ *
+ * Unlike fork(), clone() does NOT copy the address space. The new thread:
+ *   - SHARES parent's PML4 (same virtual memory, same code, same data)
+ *   - SHARES parent's user_pages[] (no separate page tracking)
+ *   - SHARES parent's FD table (same open files)
+ *   - Gets its OWN: PID/TID, registers, kernel stack, scheduler state
+ *
+ * Thread Group: all threads in a process share the same TGID (= leader's PID).
+ * When the leader exits, all threads in the group are killed too.
+ */
+int32_t task_clone(uint64_t entry, uint64_t stack_top) {
+    if (!current_task) return -1;
+    if (!current_task->pml4) {
+        serial_write_string("[CLONE] Cannot create thread in kernel task!\n");
+        return -1;
+    }
+
+    extern volatile struct limine_hhdm_request hhdm_request;
+    uint64_t hhdm_offset = hhdm_request.response->offset;
+
+    /* 1. Allocate thread task struct */
+    struct task* thread = (struct task*)kmalloc(sizeof(struct task));
+    if (!thread) {
+        serial_write_string("[CLONE] Failed to allocate thread struct!\n");
+        return -1;
+    }
+
+    /* 2. Set up thread registers */
+    for (size_t i = 0; i < sizeof(struct registers); i++) {
+        ((uint8_t*)&thread->regs)[i] = 0;
+    }
+    thread->regs.rip    = entry;
+    thread->regs.cs     = 0x23;  /* User Code, Ring 3 */
+    thread->regs.rflags = 0x202; /* IF=1, reserved=1 */
+    thread->regs.rsp    = stack_top & ~0xFULL; /* 16-byte aligned */
+    thread->regs.ss     = 0x1B;  /* User Data, Ring 3 */
+
+    /* 3. Thread identity */
+    thread->pid = next_pid++;
+    thread->tgid = current_task->tgid; /* Same thread group as parent */
+    thread->is_thread = 1;
+    thread->thread_count = 0; /* Only leader tracks count */
+    thread->state = TASK_READY;
+
+    /* SHARE parent's address space — THIS IS THE KEY DIFFERENCE FROM FORK */
+    thread->pml4 = current_task->pml4;
+    thread->stack_base = stack_top - 4096; /* Approximate */
+
+    /* Thread doesn't track user_pages — leader owns them */
+    thread->user_page_count = 0;
+    for (int i = 0; i < 256; i++) thread->user_pages[i] = 0;
+
+    /* 4. Allocate per-thread kernel stack */
+    uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
+    if (kstack_phys1 && kstack_phys2) {
+        thread->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    } else {
+        thread->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+    }
+
+    /* 5. Copy FD table from parent (shared semantics) */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        thread->fds[i] = current_task->fds[i];
+    }
+
+    /* 6. Clear SHM attachments */
+    for (int i = 0; i < SHM_MAX_ATTACH; i++) {
+        thread->shm_attached[i].shmid = -1;
+        thread->shm_attached[i].vaddr = 0;
+        thread->shm_attached[i].page_count = 0;
+    }
+
+    /* 7. Inherit scheduling priority */
+    thread->base_priority = current_task->base_priority;
+    thread->priority      = current_task->priority;
+    thread->nice          = current_task->nice;
+    thread->quantum_max   = current_task->quantum_max;
+    thread->quantum       = thread->quantum_max;
+    thread->cpu_ticks     = 0;
+    thread->sleep_count   = 0;
+    thread->sleep_until   = 0;
+    thread->wait_target_pid = 0;
+
+    /* 8. Increment parent's thread count */
+    struct task* leader = task_find_by_pid(current_task->tgid);
+    if (leader) {
+        leader->thread_count++;
+    }
+
+    /* 9. Append to task list */
+    thread->next = NULL;
+    task_list_tail->next = thread;
+    task_list_tail = thread;
+
+    serial_write_string("[CLONE] Thread TID ");
+    char buf[16];
+    itoa(thread->pid, buf, 10);
+    serial_write_string(buf);
+    serial_write_string(" created in TGID ");
+    itoa(thread->tgid, buf, 10);
+    serial_write_string(buf);
+    serial_write_string("\n");
+
+    return (int32_t)thread->pid;
+}
+
+/*
+ * task_get_thread_count() - Get thread count for current process.
+ */
+uint32_t task_get_thread_count(void) {
+    if (!current_task) return 0;
+    struct task* leader = task_find_by_pid(current_task->tgid);
+    return leader ? leader->thread_count : 1;
 }

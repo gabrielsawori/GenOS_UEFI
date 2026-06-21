@@ -40,6 +40,7 @@ typedef enum {
 
 struct task {
     uint32_t pid;             
+    uint32_t tgid;            // Thread Group ID (= PID of group leader)
     task_state_t state;       
     struct registers regs;    
     uint64_t stack_base;      
@@ -47,6 +48,10 @@ struct task {
     uint32_t wait_target_pid; // PID yang ditunggu (untuk TASK_WAITING)
     uint64_t* pml4;           // Address space PML4 (NULL = kernel task)
     uint64_t kernel_stack;    // Per-task kernel stack top (for TSS.RSP0)
+
+    /* === Thread Support === */
+    uint8_t  is_thread;       // 1 = thread (shares parent's PML4), 0 = process
+    uint32_t thread_count;    // Number of threads in this process (leader only)
 
     /* === Scheduler Priority Fields === */
     int8_t   priority;        // Current priority level (PRIO_IDLE..PRIO_HIGH)
@@ -151,3 +156,22 @@ int task_set_nice(int nice);
  * Return: 0 on success, -1 if not found.
  */
 int task_get_sched_info(uint32_t pid, char* out_buf);
+
+/*
+ * task_clone() - Create a new thread in the current process.
+ * @param entry: Thread entry point function address (user-space)
+ * @param stack_top: Top of the thread's stack (user-allocated)
+ *
+ * The new thread shares the parent's address space (PML4), FDs, and SHM.
+ * It gets its own: PID/TID, registers, kernel stack, scheduling state.
+ *
+ * Returns thread TID (>0) to parent, or -1 on failure.
+ * Thread starts executing at entry with RSP=stack_top.
+ */
+int32_t task_clone(uint64_t entry, uint64_t stack_top);
+
+/*
+ * task_get_thread_count() - Get number of threads in current process.
+ * Returns thread_count for the current task's thread group leader.
+ */
+uint32_t task_get_thread_count(void);
