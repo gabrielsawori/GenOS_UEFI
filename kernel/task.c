@@ -6,12 +6,17 @@
 #include "../fs/elf.h"
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
+#include "../cpu/gdt.h"
 #include "../limine.h"
 #include "utils.h"
 #include <stddef.h>
 
 /* Borrow from pmm.c for HHDM physical page access during fork copy */
 extern volatile struct limine_hhdm_request hhdm_request;
+
+/* Boot kernel stack from kernel.c — used as init task's kernel stack */
+extern uint8_t boot_kernel_stack[];
+#define BOOT_KERNEL_STACK_SIZE 8192
 
 static struct task* current_task = NULL;
 static struct task* task_list_head = NULL;
@@ -27,6 +32,38 @@ void task_init(void) {
     init_task->next = NULL;
     init_task->pml4 = NULL;          /* Kernel task: pakai kernel_pml4 */
     init_task->user_page_count = 0;
+
+    /*
+     * BUG FIX: Init task uses the boot_kernel_stack allocated in kernel.c.
+     * This is the same stack set in TSS.RSP0 before interrupts are enabled.
+     */
+    init_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+
+    /*
+     * BUG FIX (CRITICAL): Initialize SS and RSP for init task.
+     *
+     * In x86-64 long mode, iretq ALWAYS pops SS and RSP from the stack,
+     * even when returning to Ring 0 (same privilege). This is DIFFERENT
+     * from 32-bit protected mode where SS/RSP are only popped on
+     * privilege change.
+     *
+     * Without valid SS (0x10 = kernel data) and RSP, the first time
+     * scheduler switches AWAY from PID 0 and then BACK, iretq loads
+     * RSP=0 and SS=0 from task->regs, causing immediate triple fault:
+     *   push to RSP=0 => #PF at CR2=0xFFFFFFFFFFFFFFF8
+     *   #PF handler tries to use RSP=0 => double fault
+     *   double fault handler tries to use RSP=0 => triple fault => REBOOT
+     *
+     * regs.rsp will be overwritten by schedule() on first save anyway,
+     * but it must be non-zero as a safety net.
+     */
+    for(size_t i = 0; i < sizeof(struct registers); i++) {
+        ((uint8_t*)&init_task->regs)[i] = 0;
+    }
+    init_task->regs.cs     = 0x08; /* Kernel Code */
+    init_task->regs.ss     = 0x10; /* Kernel Data */
+    init_task->regs.rflags = 0x202;
+    init_task->regs.rsp    = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
 
     /* Initialize FD table: all slots free */
     for (int i = 0; i < VFS_MAX_FDS; i++) {
@@ -64,6 +101,22 @@ void create_task(void (*entry_point)(void)) {
     new_task->regs.rflags = 0x202;  
     new_task->regs.rsp = stack_top; 
     new_task->regs.ss = 0x10;       
+
+    /*
+     * BUG FIX: Allocate per-task kernel stack (2 pages = 8KB) via PMM.
+     * Each task needs its own kernel stack so TSS.RSP0 can be set
+     * per-task on context switch.
+     */
+    uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
+    uint64_t hhdm_offset = hhdm_request.response->offset;
+    if (kstack_phys1 && kstack_phys2) {
+        /* Use HHDM mapping to access the physical pages */
+        new_task->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    } else {
+        /* Fallback: use parent's stack (not ideal but prevents crash) */
+        new_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+    }
 
     /* Initialize FD table: all slots free */
     for (int i = 0; i < VFS_MAX_FDS; i++) {
@@ -170,6 +223,28 @@ struct task* create_user_task(uint8_t* binary_data) {
 
     /* Petakan stack ke address space proses baru (bukan kernel_pml4!) */
     vmm_map_page_in(new_pml4, app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
+
+    /*
+     * BUG FIX: Allocate per-task KERNEL stack (2 pages = 8KB) via PMM.
+     * When this user task takes an interrupt or syscall, CPU loads
+     * TSS.RSP0 as the Ring 0 stack. Each task MUST have its own
+     * kernel stack, otherwise concurrent interrupts on different tasks
+     * corrupt each other's kernel stack frames.
+     *
+     * On QEMU this rarely happens because emulation is single-threaded
+     * and interrupt timing is predictable. On bare metal, PIT fires
+     * at 1000Hz and can interrupt any task at any time.
+     */
+    uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
+    uint64_t hhdm_offset = hhdm_request.response->offset;
+    if (kstack_phys1 && kstack_phys2) {
+        /* Stack grows down, so top = base of second page + PAGE_SIZE */
+        new_task->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    } else {
+        serial_write_string("[WARN] Could not allocate per-task kernel stack!\n");
+        new_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+    }
 
     /* 5. Setup register dan state task */
     new_task->pid   = next_pid++;
@@ -289,10 +364,23 @@ void schedule(struct registers* current_regs) {
     /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
     if (task_count <= 1) return;
 
-    /* Simpan state task saat ini (hanya jika masih hidup dan tidak tidur/menunggu) */
-    if (current_task->state != TASK_DEAD &&
-        current_task->state != TASK_SLEEPING &&
-        current_task->state != TASK_WAITING) {
+    /* Simpan state task saat ini (skip hanya task yang sudah DEAD)
+     *
+     * CRITICAL FIX: In x86-64 long mode, iretq ALWAYS pops all 5 values
+     * (RIP, CS, RFLAGS, RSP, SS) from the stack, regardless of whether
+     * the interrupt was from Ring 0 or Ring 3. This is different from
+     * 32-bit protected mode.
+     *
+     * Therefore, when an interrupt fires in Ring 0, the CPU still pushes
+     * SS and RSP onto the stack, and they ARE valid. We can safely do
+     * a full register copy in ALL cases.
+     *
+     * The old code tried to "preserve" SS/RSP for Ring 0 interrupts,
+     * but this caused init task (PID 0) to keep SS=0/RSP=0 forever
+     * (since they were never initialized), leading to triple fault
+     * when PID 0 was restored via iretq.
+     */
+    if (current_task->state != TASK_DEAD) {
         current_task->regs = *current_regs;
         if (current_task->state == TASK_RUNNING) current_task->state = TASK_READY;
     }
@@ -319,9 +407,46 @@ void schedule(struct registers* current_regs) {
     }
     /* Jika pml4 == NULL (kernel task), CR3 sudah benar dari boot */
 
+    /*
+     * BUG FIX: Update TSS.RSP0 to the CURRENT task's kernel stack.
+     * Without this, ALL tasks share the same Ring 0 stack when taking
+     * interrupts. On bare metal with 1000Hz timer, Task A's interrupt
+     * frame gets overwritten by Task B's interrupt → stack corruption
+     * → GPF/triple fault → reboot.
+     *
+     * Each task has its own kernel_stack allocated in create_task/
+     * create_user_task. We set TSS.RSP0 here so the CPU uses the
+     * correct per-task kernel stack for the next Ring 3→0 transition.
+     */
+    if (current_task->kernel_stack) {
+        set_kernel_stack(current_task->kernel_stack);
+    }
+
     /* Muat register task baru ke CPU */
     current_task->state = TASK_RUNNING;
     *current_regs = current_task->regs;
+
+    /* === SERIAL TRACE: Log context switches (first 5 + every 1000th) === */
+    {
+        static uint32_t switch_count = 0;
+        switch_count++;
+        if (switch_count <= 5 || (switch_count % 1000) == 0) {
+            serial_write_string("[SWITCH #");
+            char buf[16];
+            itoa(switch_count, buf, 10);
+            serial_write_string(buf);
+            serial_write_string("] PID ");
+            itoa(current_task->pid, buf, 10);
+            serial_write_string(buf);
+            serial_write_string(" CS=0x");
+            itoa(current_task->regs.cs, buf, 16);
+            serial_write_string(buf);
+            serial_write_string(" SS=0x");
+            itoa(current_task->regs.ss, buf, 16);
+            serial_write_string(buf);
+            serial_write_string("\n");
+        }
+    }
 }
 
 // Fungsi Pengeksekusi Mati
@@ -558,9 +683,14 @@ int32_t task_fork(void) {
         goto fail_cleanup;
     }
 
-    /* 4. Copy parent's registers, override RAX=0 for child's fork() return */
+    /* 4. Copy parent's registers, override RAX=0 for child's fork() return
+     * Ensure child always gets valid Ring 3 selectors even if parent's
+     * saved state was captured during a Ring 0 interrupt (SS/RSP may be stale).
+     */
     child->regs = current_task->regs;
     child->regs.rax = 0;  /* fork() returns 0 to child */
+    child->regs.cs  = 0x23; /* User Code Selector  — force valid Ring 3 */
+    child->regs.ss  = 0x1B; /* User Data Selector  — force valid Ring 3 */
 
     /* 5. Set up child task fields */
     child->pid = next_pid++;
@@ -569,6 +699,15 @@ int32_t task_fork(void) {
     child->stack_base = current_task->stack_base;
     child->sleep_until = 0;
     child->wait_target_pid = 0;
+
+    /* Allocate per-task kernel stack for child */
+    uint64_t fork_kstack_phys1 = (uint64_t)pmm_alloc_page();
+    uint64_t fork_kstack_phys2 = (uint64_t)pmm_alloc_page();
+    if (fork_kstack_phys1 && fork_kstack_phys2) {
+        child->kernel_stack = fork_kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    } else {
+        child->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+    }
 
     /* Copy page tracking */
     child->user_page_count = child_page_count;

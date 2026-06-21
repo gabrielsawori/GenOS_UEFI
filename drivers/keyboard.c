@@ -10,18 +10,16 @@ static volatile int buffer_tail = 0; // Penunjuk tempat huruf diambil
 
 // Fungsi rahasia memasukkan huruf ke ember
 // FIX BUG #3: Tambahkan atomic operation untuk mencegah race condition
+// FIX: Removed cli/sti — the interrupt gate (IDT type 0x8E) already clears IF
+// on entry, so interrupts are disabled throughout the IRQ handler.
+// Re-enabling IF with sti here would allow nested interrupts (e.g. timer
+// firing during keyboard processing), causing stack corruption on bare metal.
 static void buffer_push(char c) {
-    // Disable interrupt untuk operasi atomic
-    asm volatile ("cli");
-    
     int next_head = (buffer_head + 1) % BUFFER_SIZE;
     if (next_head != buffer_tail) { // Jika ember tidak penuh
         key_buffer[buffer_head] = c;
         buffer_head = next_head;
     }
-    
-    // Enable interrupt kembali
-    asm volatile ("sti");
 }
 
 // Fungsi yang akan dipanggil oleh Terminal untuk mengambil huruf

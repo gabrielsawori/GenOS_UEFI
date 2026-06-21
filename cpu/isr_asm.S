@@ -1,4 +1,5 @@
 .extern isr_handler
+.extern log_bad_cs
 
 /* Makro untuk CPU Error (Tanpa Kode) */
 .macro ISR_NOERRCODE i
@@ -96,6 +97,15 @@ isr_common:
     push %r14
     push %r15
 
+    /*
+     * BUG FIX (Bare Metal): Clear direction flag.
+     * Some BIOS/UEFI firmwares leave DF=1. If an interrupt fires while
+     * DF=1 and the C handler uses memcpy/memset/string operations,
+     * they go backwards and corrupt memory. QEMU always starts with
+     * DF=0, masking this bug.
+     */
+    cld
+
     mov %rsp, %rdi
     call isr_handler
 
@@ -116,6 +126,67 @@ isr_common:
     pop %rax
 
     add $16, %rsp
+
+    /*
+     * DEFENSIVE CS/SS VALIDATION (Bare Metal Safety Net)
+     *
+     * Before iretq, verify CS and SS are consistent. In x86-64 long mode,
+     * iretq ALWAYS pops RIP, CS, RFLAGS, RSP, SS — and validates that
+     * SS.DPL == target CPL (from CS). If CS and SS mismatch in privilege
+     * level, iretq triggers #GP with the SS selector as error code.
+     *
+     * STACK LAYOUT after "push %rax":
+     *     [RSP+0]  = RAX (saved)
+     *     [RSP+8]  = RIP
+     *     [RSP+16] = CS
+     *     [RSP+24] = RFLAGS
+     *     [RSP+32] = RSP
+     *     [RSP+40] = SS
+     */
+    push %rax
+    mov 16(%rsp), %ax         /* Read CS from stack */
+    cmp $0x08, %ax
+    je .Lcs_kernel            /* Kernel CS — validate SS=0x10 */
+    cmp $0x23, %ax
+    je .Lcs_user              /* User CS   — validate SS=0x1B */
+
+    /* CS is GARBAGE — log and fix to kernel */
+.Lcs_bad:
+    push %rdi
+    push %rsi
+    push %rcx
+    push %rdx
+    push %r8
+    push %r9
+    mov %rax, %rdi            /* bad CS value */
+    call log_bad_cs
+    pop %r9
+    pop %r8
+    pop %rdx
+    pop %rcx
+    pop %rsi
+    pop %rdi
+
+    /* Force kernel mode: CS=0x08, SS=0x10 */
+    movw $0x08, 16(%rsp)
+    movw $0x10, 40(%rsp)
+    jmp .Lcs_done
+
+.Lcs_kernel:
+    /* CS=0x08 (kernel): SS MUST be 0x10. Force it.
+     * If SS were 0x1B (user data, DPL=3), iretq to CPL=0 would
+     * #GP(0x18) because SS.DPL(3) != target CPL(0). */
+    movw $0x10, 40(%rsp)
+    jmp .Lcs_done
+
+.Lcs_user:
+    /* CS=0x23 (user): SS MUST be 0x1B. Force it.
+     * If SS were 0x10 (kernel data, DPL=0), iretq to CPL=3 would
+     * #GP because SS.DPL(0) != target CPL(3). */
+    movw $0x1B, 40(%rsp)
+
+.Lcs_done:
+    pop %rax
     iretq
 
 /* Tabel Array Error CPU */

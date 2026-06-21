@@ -35,9 +35,6 @@ void fill_rect(int x, int y, int w, int h, uint32_t color);
 #define SEEK_CUR  1
 #define SEEK_END  2
 
-/* Baca file dari ramdisk langsung (syscall 8, legacy) */
-int read_file(const char* filename, char* buffer, int max_size);
-
 /* Buka file atau direktori melalui VFS; return FD (>=0) atau -1 */
 int open(const char* filename, int flags);
 
@@ -52,3 +49,14 @@ int seek(int fd, int offset, int whence);
 
 /* Baca entry direktori berikutnya; return 1=found, 0=done */
 int readdir(int fd, char* name_buf, int* size_buf);
+
+/* === Write Operations (syscalls 23-25) === */
+
+/* Write up to count bytes to fd; return bytes written or -1 */
+int write(int fd, const void* buf, int count);
+
+/* Create a new file in tmpfs; return 0 on success, -1 on error */
+int create(const char* filename);
+
+/* Delete a file from tmpfs; return 0 on success, -1 on error */
+int unlink(const char* filename);

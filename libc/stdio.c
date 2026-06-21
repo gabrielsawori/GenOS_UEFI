@@ -52,14 +52,6 @@ void fill_rect(int x, int y, int w, int h, uint32_t color) {
 /* === VFS File Operations (syscalls 12-16) === */
 
 /*
- * read_file() - Legacy: baca file langsung dari ramdisk (syscall 8).
- * Tetap ada untuk kompatibilitas. Gunakan open/read/close untuk API baru.
- */
-int read_file(const char* filename, char* buffer, int max_size) {
-    return (int)syscall(8, (uint64_t)filename, (uint64_t)buffer, (uint64_t)max_size);
-}
-
-/*
  * open() - Buka file atau direktori melalui VFS (syscall 12).
  * filename = "/" membuka listing direktori.
  * Return: FD number (>=0) atau -1 bila gagal.
@@ -102,4 +94,18 @@ int seek(int fd, int offset, int whence) {
 int readdir(int fd, char* name_buf, int* size_buf) {
     /* size_buf is int* but kernel expects size_t* — cast through uint64_t */
     return (int)syscall(16, (uint64_t)(int64_t)fd, (uint64_t)name_buf, (uint64_t)size_buf);
+}
+
+/* === Write Operations (syscalls 23-25) === */
+
+int write(int fd, const void* buf, int count) {
+    return (int)syscall(23, (uint64_t)(int64_t)fd, (uint64_t)buf, (uint64_t)count);
+}
+
+int create(const char* filename) {
+    return (int)syscall(24, (uint64_t)filename, 0, 0);
+}
+
+int unlink(const char* filename) {
+    return (int)syscall(25, (uint64_t)filename, 0, 0);
 }

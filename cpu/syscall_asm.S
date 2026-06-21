@@ -81,6 +81,7 @@ syscall_entry:
     mov %rax, %rdi          /* rdi = syscall_num (C param ke-1) */
 
     /* 4. PANGGIL HANDLER SYSCALL (Fungsi C) */
+    cld                         /* Clear DF — user code might have set it */
     call syscall_handler
 
     /*

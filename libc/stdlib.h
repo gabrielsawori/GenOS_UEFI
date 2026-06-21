@@ -26,3 +26,35 @@ int exec(const char* filename);
  *     while (pid > 0 && !wait_pid(pid)) user_sleep(50);
  */
 int wait_pid(int pid);
+
+/* === Shared Memory IPC (syscalls 17-20) === */
+
+/* Buat shared memory segment; return shmid (>=0) atau -1 */
+int shm_create(int size);
+
+/* Pasang segment ke address space; return virtual address atau NULL */
+void* shm_attach(int shmid);
+
+/* Lepas shared memory; return 0 sukses / -1 error */
+int shm_detach(void* addr);
+
+/* Hancurkan segment (harus sudah di-detach semua); return 0 / -1 */
+int shm_destroy(int shmid);
+
+/* === Buffer Cache Statistics (syscall 21) === */
+
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint32_t used_blocks;
+    uint32_t total_blocks;
+} cache_stats_t;
+
+/* Ambil statistik performa buffer cache; return 0 sukses / -1 error */
+int cache_get_stats(cache_stats_t* out);
+
+/* === Process Management (syscall 22) === */
+
+/* Kloning proses saat ini; return PID child ke parent, 0 ke child, -1 error */
+int fork(void);

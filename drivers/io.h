@@ -12,3 +12,12 @@ static inline uint8_t inb(uint16_t port) {
     __asm__ volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
     return ret;
 }
+
+/* I/O port delay (~1-2μs on real hardware).
+ * Reading from port 0x80 (POST diagnostic port) is a harmless
+ * way to waste time. Required by 8259A PIC during initialization
+ * on bare metal (QEMU doesn't need this, but it's harmless there).
+ */
+static inline void io_wait(void) {
+    outb(0x80, 0);
+}

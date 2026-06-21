@@ -6,6 +6,7 @@
 #include "../drivers/keyboard.h"
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
+#include "../mm/pmm.h"
 #include "../kernel/task.h"
 #include "../kernel/utils.h"
 #include "../fs/tar.h"
@@ -34,8 +35,28 @@ volatile int in_syscall = 0;
 void syscall_init(void) {
     serial_write_string("[INFO] Membangun Pintu Gerbang System Call...\n");
 
-    uint64_t stack_base = (uint64_t)kmalloc(4096);
-    kernel_stack_top = stack_base + 4096;
+    /*
+     * BUG FIX: Allocate syscall kernel stack via PMM (2 pages = 8KB)
+     * instead of kmalloc(4096). This ensures:
+     *   1. Larger stack for complex syscalls (fork, exec)
+     *   2. Physical page alignment (no heap header misalignment)
+     *   3. Consistent with per-task kernel stack scheme
+     *
+     * Note: This stack is used by syscall_entry (via kernel_stack_top)
+     * and also set as TSS.RSP0. Per-task kernel stacks in schedule()
+     * will override TSS.RSP0 during context switches.
+     */
+    extern volatile struct limine_hhdm_request hhdm_request;
+    uint64_t hhdm_off = hhdm_request.response->offset;
+    uint64_t phys1 = (uint64_t)pmm_alloc_page();
+    uint64_t phys2 = (uint64_t)pmm_alloc_page();
+    if (!phys1 || !phys2) {
+        serial_write_string("[FATAL] Cannot allocate syscall kernel stack!\n");
+        asm volatile ("cli");
+        for (;;) asm volatile ("hlt");
+    }
+    /* Stack grows down: top = end of second page (via HHDM) */
+    kernel_stack_top = phys2 + hhdm_off + 4096;
     set_kernel_stack(kernel_stack_top);
 
     uint64_t efer = rdmsr(MSR_EFER);

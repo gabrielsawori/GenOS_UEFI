@@ -17,6 +17,27 @@
 
 LIMINE_BASE_REVISION(1)
 
+/* ====================================================================
+ * LIMINE v5.x REQUEST MARKERS (WAJIB untuk bare metal!)
+ *
+ * Limine v5.x memindai ELF untuk marker start & end yang membungkus
+ * section .requests. Tanpa markers ini, bootloader mengabaikan semua
+ * request → semua response NULL → kernel hang di hcf().
+ *
+ * Marker harus ditempatkan DI LUAR section .requests (di sectionnya
+ * sendiri) agar Limine bisa menemukan batas awal/akhir blok request.
+ * ==================================================================== */
+__attribute__((used, section(".requests_start_marker")))
+volatile uint64_t limine_requests_start_marker[4] = {
+    0xf6b8f4b39de7d1ae, 0xfab91a6940fcb9cf,
+    0x785c6ed015d3e316, 0x181e920a7852b9d9
+};
+
+__attribute__((used, section(".requests_end_marker")))
+volatile uint64_t limine_requests_end_marker[2] = {
+    0xadc0e0531bb10d03, 0x9572709f31764c62
+};
+
 __attribute__((used, section(".requests")))
 volatile struct limine_framebuffer_request framebuffer_request = { .id = LIMINE_FRAMEBUFFER_REQUEST, .revision = 0 };
 
@@ -58,7 +79,23 @@ struct limine_framebuffer *fb;
  * Shell sekarang adalah ELF user-space di Ring 3 yang berkomunikasi
  * dengan kernel sepenuhnya melalui system call.
  */
+/*
+ * Temporary boot stack for TSS.RSP0 initialization.
+ * Used before heap is available. After syscall_init(), kernel_stack_top
+ * from heap replaces this. Aligned to 16 bytes per AMD64 ABI.
+ */
+uint8_t __attribute__((aligned(16))) boot_kernel_stack[8192];
+
 void _start(void) {
+    /*
+     * BUG FIX: GUARANTEE interrupts are disabled from the very start.
+     * On bare metal, the BIOS/UEFI may leave IF=1. Without this CLI,
+     * a pending PIT/keyboard IRQ could fire before IDT is set up → #GP
+     * or before PMM/VMM/Heap/Task are initialized → NULL dereference.
+     * QEMU rarely triggers this race, but real hardware does.
+     */
+    asm volatile ("cli");
+
     if (LIMINE_BASE_REVISION_SUPPORTED == 0) hcf();
 
     /* === FASE 1: Hardware Dasar === */
@@ -66,11 +103,27 @@ void _start(void) {
     serial_write_string("[INFO] Booting GenOS v3...\n");
 
     gdt_init();
+
+    /*
+     * BUG FIX: Initialize TSS.RSP0 with a temporary boot stack BEFORE
+     * IDT is loaded. If any exception fires (e.g. #PF during PMM init),
+     * the CPU needs a valid RSP0 to switch to Ring 0 stack.
+     * Without this, TSS.RSP0 = 0 → CPU writes to address 0 → immediate
+     * crash on bare metal (QEMU silently maps address 0).
+     */
+    set_kernel_stack((uint64_t)(boot_kernel_stack + sizeof(boot_kernel_stack)));
+
     idt_init();
     pic_remap();
-    timer_init(1000);
 
-    if (framebuffer_request.response == NULL || memmap_request.response == NULL) hcf();
+    /*
+     * BUG FIX: Do NOT call timer_init() here!
+     * Timer PIT fires IRQ0 → schedule() → but task_init/heap not ready yet.
+     * timer_init() is moved to AFTER all subsystems are initialized.
+     */
+
+    if (framebuffer_request.response == NULL || framebuffer_request.response->framebuffer_count < 1) hcf();
+    if (memmap_request.response == NULL) hcf();
     fb = framebuffer_request.response->framebuffers[0];
     fb_init(fb);
 
@@ -120,10 +173,16 @@ void _start(void) {
         }
     }
 
-    /* === FASE 7: Aktifkan Interrupt & Idle Loop ===
-     * Kernel masuk ke idle loop. Semua pekerjaan user dilakukan oleh
-     * shell.elf dan aplikasi Ring-3 lainnya melalui scheduler.
+    /* === FASE 7: Aktifkan Timer & Interrupt → Idle Loop ===
+     *
+     * BUG FIX: Timer PIT diinisialisasi di sini, SETELAH semua subsistem
+     * (PMM, VMM, Heap, Task, Syscall) siap. Ini mencegah IRQ0 menyala
+     * saat scheduler/heap belum aktif — penyebab utama crash bare metal.
+     *
+     * Urutan HARUS: timer_init() → sti. Timer hanya mulai generate IRQ
+     * setelah PIT diprogram, dan interrupt hanya diterima setelah sti.
      */
+    timer_init(1000);
     asm volatile ("sti");
     serial_write_string("[INFO] Kernel idle. All user work runs in Ring 3.\n");
     while (1) { asm volatile ("hlt"); }

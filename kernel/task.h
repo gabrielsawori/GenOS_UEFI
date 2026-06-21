@@ -21,6 +21,7 @@ struct task {
     uint64_t sleep_until;     // Tick target untuk bangun dari TASK_SLEEPING
     uint32_t wait_target_pid; // PID yang ditunggu (untuk TASK_WAITING)
     uint64_t* pml4;           // Address space PML4 (NULL = kernel task)
+    uint64_t kernel_stack;    // Per-task kernel stack top (for TSS.RSP0)
     uint64_t user_pages[64];  // Daftar page fisik milik proses ini
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table

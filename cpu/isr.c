@@ -61,6 +61,22 @@ static void print_hex_fb(const char* label, uint64_t value, size_t x, size_t y, 
 }
 
 /*
+ * log_bad_cs() - Called from isr_common assembly when a garbage CS value
+ * is detected on the iretq stack frame. Logs the bad value to serial
+ * so we can diagnose which task's state was corrupted.
+ */
+void log_bad_cs(uint64_t bad_cs) {
+    serial_write_string("\n[!!!] BAD CS DETECTED BEFORE IRETQ: 0x");
+    char buf[20];
+    itoa(bad_cs, buf, 16);
+    serial_write_string(buf);
+    serial_write_string(" PID=");
+    itoa(get_current_pid(), buf, 10);
+    serial_write_string(buf);
+    serial_write_string(" — FORCED TO 0x08 (kernel)\n");
+}
+
+/*
  * handle_page_fault() - Handler khusus untuk Page Fault (INT 14).
  *
  * Page Fault adalah exception paling umum dalam pengembangan OS.
@@ -167,6 +183,61 @@ static void handle_gpf(struct registers *regs) {
     print_hex_serial("CS  (Code Segment)    ", regs->cs);
     print_hex_serial("RSP (Stack Pointer)   ", regs->rsp);
     print_hex_serial("SS  (Stack Segment)   ", regs->ss);
+    print_hex_serial("RFLAGS                ", regs->rflags);
+    print_hex_serial("int_no                ", regs->int_no);
+
+    /* Dump all general-purpose registers for full context */
+    print_hex_serial("RAX", regs->rax);
+    print_hex_serial("RBX", regs->rbx);
+    print_hex_serial("RCX", regs->rcx);
+    print_hex_serial("RDX", regs->rdx);
+    print_hex_serial("RDI", regs->rdi);
+    print_hex_serial("RSI", regs->rsi);
+    print_hex_serial("RBP", regs->rbp);
+
+    /* Dump the ORIGINAL iretq frame that caused the GPF.
+     * When GPF fires at iretq, the CPU pushes a new exception frame
+     * ON TOP of the original frame. The original is at:
+     *   regs + sizeof(struct registers) = regs + 22*8 = regs + 176
+     * struct registers has 22 uint64_t fields (15 GPRs + int_no + err_code + 5 CPU state)
+     */
+    serial_write_string("\n  [Original iretq frame that faulted]:\n");
+    uint64_t* orig = (uint64_t*)((uint8_t*)regs + 176);
+    print_hex_serial("  orig RIP", orig[0]);
+    print_hex_serial("  orig CS ", orig[1]);
+    print_hex_serial("  orig RFL", orig[2]);
+    print_hex_serial("  orig RSP", orig[3]);
+    print_hex_serial("  orig SS ", orig[4]);
+
+    /* Also dump the current GPF handler's own frame for reference */
+    serial_write_string("  [GPF handler's own frame]:\n");
+    uint64_t* self = (uint64_t*)((uint8_t*)regs + 160);
+    print_hex_serial("  self RIP", self[0]);
+    print_hex_serial("  self CS ", self[1]);
+    print_hex_serial("  self RFL", self[2]);
+
+    /* Dump current task PID for context */
+    serial_write_string("  Current PID: ");
+    char pid_buf[16];
+    itoa(get_current_pid(), pid_buf, 10);
+    serial_write_string(pid_buf);
+    serial_write_string("\n");
+
+    /* Dump raw stack: show 30 entries (240 bytes) covering both frames */
+    serial_write_string("  [Raw stack dump]:\n");
+    uint64_t* stk = (uint64_t*)regs;
+    for (int i = 0; i < 30; i++) {
+        serial_write_string("    +");
+        char off[8];
+        itoa(i * 8, off, 10);
+        serial_write_string(off);
+        serial_write_string(": ");
+        char val[20];
+        itoa(stk[i], val, 16);
+        serial_write_string(val);
+        serial_write_string("\n");
+    }
+
     serial_write_string("================================================\n");
 
     size_t y = 300;
