@@ -17,7 +17,19 @@ static uint64_t bitmap_size = 0;
 static uint64_t total_pages = 0;   
 static uint64_t free_pages = 0;    
 static uint64_t highest_address = 0; 
-static uint64_t hhdm_offset = 0;   
+static uint64_t hhdm_offset = 0;
+
+/*
+ * Page reference count array.
+ * refcounts[page_index] = number of mappings referencing this physical page.
+ *   0 = free (bit clear in bitmap)
+ *   1 = exclusively owned by one process
+ *  >1 = shared (Copy-on-Write)
+ *
+ * Stored right after bitmap in the same usable memory region.
+ */
+static uint8_t* refcounts = NULL;
+static uint64_t refcounts_size = 0;
 
 static void bitmap_set(uint64_t bit) {
     bitmap[bit / 8] |= (1 << (bit % 8)); 
@@ -61,8 +73,12 @@ void pmm_init(void) {
 
     for (uint64_t i = 0; i < mmap->entry_count; i++) {
         if (mmap->entries[i]->type == LIMINE_MEMMAP_USABLE) {
-            if (mmap->entries[i]->length >= bitmap_size) {
+            /* Need space for bitmap + refcounts (1 byte per page) */
+            refcounts_size = total_pages; /* 1 byte per page */
+            uint64_t needed = bitmap_size + refcounts_size;
+            if (mmap->entries[i]->length >= needed) {
                 bitmap = (uint8_t*)(mmap->entries[i]->base + hhdm_offset);
+                refcounts = bitmap + bitmap_size;
                 break;
             }
         }
@@ -77,6 +93,10 @@ void pmm_init(void) {
     for (uint64_t i = 0; i < bitmap_size; i++) {
         bitmap[i] = 0xFF; 
     }
+    /* Initialize all refcounts to 0 (free) */
+    for (uint64_t i = 0; i < refcounts_size; i++) {
+        refcounts[i] = 0;
+    }
 
     for (uint64_t i = 0; i < mmap->entry_count; i++) {
         if (mmap->entries[i]->type == LIMINE_MEMMAP_USABLE) {
@@ -90,10 +110,13 @@ void pmm_init(void) {
         }
     }
 
-    uint64_t bitmap_start_page = ((uint64_t)bitmap - hhdm_offset) / PAGE_SIZE;
-    uint64_t bitmap_pages = bitmap_size / PAGE_SIZE + 1;
-    for (uint64_t i = 0; i < bitmap_pages; i++) {
-        bitmap_set(bitmap_start_page + i);
+    /* Mark bitmap + refcounts region as used */
+    uint64_t metadata_start_page = ((uint64_t)bitmap - hhdm_offset) / PAGE_SIZE;
+    uint64_t metadata_bytes = bitmap_size + refcounts_size;
+    uint64_t metadata_pages = metadata_bytes / PAGE_SIZE + 1;
+    for (uint64_t i = 0; i < metadata_pages; i++) {
+        bitmap_set(metadata_start_page + i);
+        refcounts[metadata_start_page + i] = 1;
         free_pages--;
     }
 
@@ -104,6 +127,7 @@ void* pmm_alloc_page(void) {
     for (uint64_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i); 
+            refcounts[i] = 1; /* New page starts with refcount=1 */
             free_pages--;
             return (void*)(i * PAGE_SIZE); 
         }
@@ -113,12 +137,44 @@ void* pmm_alloc_page(void) {
 
 void pmm_free_page(void* ptr) {
     uint64_t page = (uint64_t)ptr / PAGE_SIZE;
-    if (page < total_pages) {
-        if (bitmap_test(page)) {
-            bitmap_clear(page); 
-            free_pages++;
+    if (page >= total_pages) return;
+    if (!bitmap_test(page)) return; /* Already free */
+
+    /* Decrement refcount. Only actually free if refcount reaches 0 */
+    if (refcounts[page] > 1) {
+        refcounts[page]--;
+        return; /* Still shared by other processes */
+    }
+
+    /* Refcount is 0 or 1 — actually free the page */
+    refcounts[page] = 0;
+    bitmap_clear(page); 
+    free_pages++;
+}
+
+/*
+ * pmm_ref_page: Increment reference count for a physical page.
+ * Called by CoW fork to share a page between parent and child.
+ */
+void pmm_ref_page(void* ptr) {
+    uint64_t page = (uint64_t)ptr / PAGE_SIZE;
+    if (page < total_pages && bitmap_test(page)) {
+        if (refcounts[page] < 255) { /* Prevent overflow */
+            refcounts[page]++;
         }
     }
+}
+
+/*
+ * pmm_get_refcount: Get reference count for a physical page.
+ * Returns 0 if page is free or out of range.
+ */
+uint8_t pmm_get_refcount(void* ptr) {
+    uint64_t page = (uint64_t)ptr / PAGE_SIZE;
+    if (page < total_pages) {
+        return refcounts[page];
+    }
+    return 0;
 }
 
 uint64_t pmm_get_free_ram(void) {

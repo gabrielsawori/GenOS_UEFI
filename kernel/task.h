@@ -13,6 +13,31 @@ typedef enum {
     TASK_DEAD       // Program telah selesai/mati
 } task_state_t;
 
+/*
+ * Priority Levels — Menentukan urutan penjadwalan dan quantum.
+ * Task dengan prioritas lebih tinggi mendapat giliran CPU lebih sering
+ * dan quantum (jatah tick) yang lebih besar.
+ *
+ * PRIO_HIGH:   Untuk proses interaktif (shell, UI) — quantum 4 ticks
+ * PRIO_NORMAL: Default untuk semua proses baru    — quantum 2 ticks
+ * PRIO_LOW:    Background tasks                   — quantum 1 tick
+ * PRIO_IDLE:   Hanya jalan jika tidak ada yang lain — quantum 1 tick
+ */
+#define PRIO_IDLE    0
+#define PRIO_LOW     1
+#define PRIO_NORMAL  2
+#define PRIO_HIGH    3
+#define PRIO_COUNT   4
+
+/* Quantum (jumlah ticks per giliran) untuk setiap level prioritas */
+#define QUANTUM_IDLE    1
+#define QUANTUM_LOW     1
+#define QUANTUM_NORMAL  2
+#define QUANTUM_HIGH    4
+
+/* Starvation prevention: boost semua task setiap N ticks */
+#define STARVATION_BOOST_INTERVAL 500
+
 struct task {
     uint32_t pid;             
     task_state_t state;       
@@ -22,7 +47,17 @@ struct task {
     uint32_t wait_target_pid; // PID yang ditunggu (untuk TASK_WAITING)
     uint64_t* pml4;           // Address space PML4 (NULL = kernel task)
     uint64_t kernel_stack;    // Per-task kernel stack top (for TSS.RSP0)
-    uint64_t user_pages[64];  // Daftar page fisik milik proses ini
+
+    /* === Scheduler Priority Fields === */
+    int8_t   priority;        // Current priority level (PRIO_IDLE..PRIO_HIGH)
+    int8_t   base_priority;   // Original priority (before boost/decay)
+    int8_t   nice;            // Nice value (-2..+2, higher = lower priority)
+    uint8_t  quantum;         // Current quantum (ticks remaining in this slice)
+    uint8_t  quantum_max;     // Max quantum for this priority level
+    uint32_t cpu_ticks;       // Total CPU ticks consumed (for stats)
+    uint32_t sleep_count;     // Jumlah kali task sleep (I/O indicator)
+
+    uint64_t user_pages[256]; // Daftar page fisik milik proses ini (was 64, now 256 = 1MB max)
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table
     shm_attach_record_t shm_attached[SHM_MAX_ATTACH]; // SHM attachments
@@ -99,3 +134,20 @@ uint64_t* task_get_current_pml4(void);
  * or -1 on failure.
  */
 int32_t task_fork(void);
+
+/*
+ * task_set_nice() - Set nice value for the current task.
+ * @param nice: Nice value (-2 to +2). Negative = higher priority.
+ * Adjusts effective priority = base_priority - nice (clamped).
+ * Return: 0 on success.
+ */
+int task_set_nice(int nice);
+
+/*
+ * task_get_sched_info() - Get scheduling info for a task.
+ * @param pid: Target PID (0 = current task)
+ * @param out_buf: Output buffer (at least 128 bytes)
+ * Writes: "PID=N PRI=N NICE=N QTICK=N/M CPU=N SLP=N STATE=X"
+ * Return: 0 on success, -1 if not found.
+ */
+int task_get_sched_info(uint32_t pid, char* out_buf);

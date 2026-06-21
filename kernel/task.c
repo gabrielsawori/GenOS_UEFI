@@ -23,6 +23,35 @@ static struct task* task_list_head = NULL;
 static struct task* task_list_tail = NULL;
 static uint32_t next_pid = 1;
 
+/* Quantum lookup table indexed by priority level */
+static const uint8_t quantum_table[PRIO_COUNT] = {
+    QUANTUM_IDLE,    /* PRIO_IDLE   = 0 */
+    QUANTUM_LOW,     /* PRIO_LOW    = 1 */
+    QUANTUM_NORMAL,  /* PRIO_NORMAL = 2 */
+    QUANTUM_HIGH     /* PRIO_HIGH   = 3 */
+};
+
+/* Starvation prevention counter */
+static uint64_t last_boost_tick = 0;
+
+/* Helper: clamp priority to valid range */
+static inline int8_t clamp_priority(int p) {
+    if (p < PRIO_IDLE) return PRIO_IDLE;
+    if (p > PRIO_HIGH) return PRIO_HIGH;
+    return (int8_t)p;
+}
+
+/* Helper: initialize priority fields for a new task */
+static void task_init_priority(struct task* t, int8_t prio) {
+    t->base_priority = prio;
+    t->priority      = prio;
+    t->nice          = 0;
+    t->quantum_max   = quantum_table[prio];
+    t->quantum       = t->quantum_max;
+    t->cpu_ticks     = 0;
+    t->sleep_count   = 0;
+}
+
 void task_init(void) {
     serial_write_string("[INFO] Initializing Multitasking Engine...\n");
 
@@ -38,6 +67,9 @@ void task_init(void) {
      * This is the same stack set in TSS.RSP0 before interrupts are enabled.
      */
     init_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
+
+    /* Idle task gets lowest priority — only runs when nothing else can */
+    task_init_priority(init_task, PRIO_IDLE);
 
     /*
      * BUG FIX (CRITICAL): Initialize SS and RSP for init task.
@@ -101,6 +133,9 @@ void create_task(void (*entry_point)(void)) {
     new_task->regs.rflags = 0x202;  
     new_task->regs.rsp = stack_top; 
     new_task->regs.ss = 0x10;       
+
+    /* Kernel tasks default to NORMAL priority */
+    task_init_priority(new_task, PRIO_NORMAL);
 
     /*
      * BUG FIX: Allocate per-task kernel stack (2 pages = 8KB) via PMM.
@@ -175,7 +210,7 @@ struct task* create_user_task(uint8_t* binary_data) {
     /* Inisialisasi field address space */
     new_task->pml4 = new_pml4;
     new_task->user_page_count = 0;
-    for (int i = 0; i < 64; i++) new_task->user_pages[i] = 0;
+    for (int i = 0; i < 256; i++) new_task->user_pages[i] = 0;
 
     /* Initialize FD table: all slots free */
     for (int i = 0; i < VFS_MAX_FDS; i++) {
@@ -217,7 +252,7 @@ struct task* create_user_task(uint8_t* binary_data) {
     }
 
     /* Catat stack page untuk cleanup */
-    if (new_task->user_page_count < 64) {
+    if (new_task->user_page_count < 256) {
         new_task->user_pages[new_task->user_page_count++] = phys_stack;
     }
 
@@ -262,6 +297,14 @@ struct task* create_user_task(uint8_t* binary_data) {
     new_task->regs.ss  = 0x1B; /* User Data Selector (GDT[3], Ring 3, RPL=3) */
     new_task->next = NULL;
 
+    /* User tasks default to NORMAL priority.
+     * First user task (shell, PID 1) gets HIGH priority for responsiveness. */
+    if (new_task->pid <= 2) {
+        task_init_priority(new_task, PRIO_HIGH);
+    } else {
+        task_init_priority(new_task, PRIO_NORMAL);
+    }
+
     /* Tambahkan task ke antrean scheduler */
     task_list_tail->next = new_task;
     task_list_tail = new_task;
@@ -269,34 +312,35 @@ struct task* create_user_task(uint8_t* binary_data) {
 }
 
 /*
- * schedule() - Pemilih Task Berikutnya (Round-Robin Scheduler)
+ * schedule() - Priority-Based Round-Robin Scheduler
  *
  * @param current_regs: Pointer ke register CPU saat interrupt timer terjadi.
  *
- * Scheduler menyimpan state program saat ini lalu memilih task berikutnya
- * yang berstatus TASK_READY. Jika semua task DEAD, scheduler berhenti berputar
- * dan mengembalikan ke task saat ini (idle) untuk mencegah infinite loop.
+ * Algoritma:
+ *   1. Kurangi quantum task saat ini. Jika masih > 0, TIDAK context-switch
+ *      (task masih punya jatah CPU) — kecuali task sudah DEAD/SLEEPING/WAITING.
+ *   2. Pilih task READY dengan prioritas tertinggi (priority-based selection).
+ *      Jika ada beberapa task dengan prioritas sama, round-robin di antara mereka.
+ *   3. I/O-bound boost: task yang sering sleep mendapat +1 prioritas.
+ *   4. Starvation prevention: setiap STARVATION_BOOST_INTERVAL ticks,
+ *      semua task mendapat priority reset ke base_priority.
  *
- * BUG FIX #2: Versi lama bisa infinite loop jika SEMUA task berstatus TASK_DEAD
- * karena loop do-while tidak punya kondisi break. Sekarang kita hitung maksimum
- * iterasi = jumlah total task dalam linked list agar aman.
+ * Quantum per priority:
+ *   PRIO_HIGH   = 4 ticks (shell, interactive)
+ *   PRIO_NORMAL = 2 ticks (default user procs)
+ *   PRIO_LOW    = 1 tick  (background)
+ *   PRIO_IDLE   = 1 tick  (kernel idle)
  */
 /*
- * Flag dari syscall.c: mencegah scheduler context-switch saat
- * CPU sedang menangani syscall (menggunakan stack terpisah).
+ * kernel_stack_top: digunakan oleh syscall_entry assembly.
+ * Di-update per-task oleh scheduler agar syscall selalu menggunakan
+ * per-task kernel stack (bukan shared stack). Ini memungkinkan
+ * scheduler melakukan preemption di TENGAH syscall — persis seperti Linux.
  */
-extern volatile int in_syscall;
+extern uint64_t kernel_stack_top;
 
 void schedule(struct registers* current_regs) {
     if (!current_task) return;
-
-    /*
-     * JANGAN context-switch jika CPU sedang di dalam syscall handler!
-     * Syscall menggunakan kernel_stack_top terpisah. Jika scheduler
-     * melakukan iretq dari konteks syscall, return path (sysretq)
-     * menjadi korup.
-     */
-    if (in_syscall) return;
 
     /* Bangunkan task yang sedang tidur jika waktunya sudah tiba */
     uint64_t now = timer_get_ticks();
@@ -304,8 +348,34 @@ void schedule(struct registers* current_regs) {
     while (t != NULL) {
         if (t->state == TASK_SLEEPING && now >= t->sleep_until) {
             t->state = TASK_READY;
+            /* I/O-bound boost: task yang baru bangun dari sleep mendapat
+             * temporary priority boost agar responsif (seperti CFS) */
+            if (t->sleep_count > 5 && t->priority < PRIO_HIGH) {
+                t->priority = clamp_priority(t->base_priority + 1);
+                t->quantum_max = quantum_table[t->priority];
+            }
         }
         t = t->next;
+    }
+
+    /*
+     * === STARVATION PREVENTION ===
+     * Setiap STARVATION_BOOST_INTERVAL ticks, reset priority semua task
+     * ke base_priority. Ini mencegah task prioritas rendah kelaparan
+     * jika ada task prioritas tinggi yang terus-menerus READY.
+     */
+    if (now - last_boost_tick >= STARVATION_BOOST_INTERVAL) {
+        last_boost_tick = now;
+        t = task_list_head;
+        while (t != NULL) {
+            if (t->state != TASK_DEAD) {
+                int eff = t->base_priority - t->nice;
+                t->priority = clamp_priority(eff);
+                t->quantum_max = quantum_table[t->priority];
+                t->quantum = t->quantum_max;
+            }
+            t = t->next;
+        }
     }
 
     /*
@@ -364,62 +434,92 @@ void schedule(struct registers* current_regs) {
     /* Jika hanya ada 1 task (atau tidak ada), tidak perlu switch */
     if (task_count <= 1) return;
 
-    /* Simpan state task saat ini (skip hanya task yang sudah DEAD)
-     *
-     * CRITICAL FIX: In x86-64 long mode, iretq ALWAYS pops all 5 values
-     * (RIP, CS, RFLAGS, RSP, SS) from the stack, regardless of whether
-     * the interrupt was from Ring 0 or Ring 3. This is different from
-     * 32-bit protected mode.
-     *
-     * Therefore, when an interrupt fires in Ring 0, the CPU still pushes
-     * SS and RSP onto the stack, and they ARE valid. We can safely do
-     * a full register copy in ALL cases.
-     *
-     * The old code tried to "preserve" SS/RSP for Ring 0 interrupts,
-     * but this caused init task (PID 0) to keep SS=0/RSP=0 forever
-     * (since they were never initialized), leading to triple fault
-     * when PID 0 was restored via iretq.
+    /*
+     * === QUANTUM CHECK ===
+     * Jika task saat ini masih RUNNING dan punya quantum > 0,
+     * JANGAN context-switch. Task masih punya jatah CPU.
+     * Ini membuat task prioritas tinggi berjalan lebih lama tanpa
+     * diganggu, meningkatkan throughput dan mengurangi context-switch overhead.
      */
-    if (current_task->state != TASK_DEAD) {
-        current_task->regs = *current_regs;
-        if (current_task->state == TASK_RUNNING) current_task->state = TASK_READY;
+    if (current_task->state == TASK_RUNNING && current_task->quantum > 0) {
+        current_task->quantum--;
+        current_task->cpu_ticks++;
+        return; /* Tetap di task ini, tidak switch */
     }
 
-    /* Cari task berikutnya yang READY (maks iterasi = jumlah task agar tidak loop selamanya) */
-    uint32_t attempts = 0;
-    do {
-        current_task = current_task->next;
-        if (current_task == NULL) current_task = task_list_head;
-        attempts++;
-        /* Hentikan pencarian jika sudah keliling semua task tanpa menemukan READY */
-        if (attempts > task_count) {
-            /* Semua task DEAD/SLEEPING/WAITING — kembali ke task kepala (init/idle task) */
-            current_task = task_list_head;
-            break;
+    /* Simpan state task saat ini */
+    if (current_task->state != TASK_DEAD) {
+        current_task->regs = *current_regs;
+        if (current_task->state == TASK_RUNNING) {
+            current_task->state = TASK_READY;
         }
-    } while (current_task->state == TASK_DEAD ||
-             current_task->state == TASK_SLEEPING ||
-             current_task->state == TASK_WAITING);
+        current_task->cpu_ticks++;
+    }
+
+    /*
+     * === PRIORITY-BASED TASK SELECTION ===
+     * Cari task READY dengan prioritas tertinggi.
+     * Jika ada beberapa task dengan prioritas sama, pilih yang pertama
+     * ditemukan setelah current_task (round-robin within same priority).
+     */
+    struct task* best = NULL;
+    int8_t best_prio = -1;
+
+    /* Pass 1: Cari prioritas tertinggi di antara task READY */
+    t = task_list_head;
+    while (t != NULL) {
+        if (t->state == TASK_READY && t->priority > best_prio) {
+            best_prio = t->priority;
+        }
+        t = t->next;
+    }
+
+    if (best_prio < 0) {
+        /* Tidak ada task READY — kembali ke idle task (head) */
+        current_task = task_list_head;
+    } else {
+        /* Pass 2: Round-robin di antara task READY dengan prioritas tertinggi.
+         * Mulai dari task setelah current_task untuk fairness. */
+        struct task* start = current_task->next;
+        if (start == NULL) start = task_list_head;
+
+        t = start;
+        uint32_t attempts = 0;
+        while (attempts < task_count) {
+            if (t->state == TASK_READY && t->priority == best_prio) {
+                best = t;
+                break;
+            }
+            t = t->next;
+            if (t == NULL) t = task_list_head;
+            attempts++;
+        }
+
+        if (best) {
+            current_task = best;
+        } else {
+            current_task = task_list_head;
+        }
+    }
+
+    /* Reset quantum untuk task yang baru terpilih */
+    current_task->quantum = current_task->quantum_max;
 
     /* Ganti address space (CR3) sesuai task yang dipilih */
     if (current_task->pml4 != NULL) {
         vmm_switch_pml4(current_task->pml4);
     }
-    /* Jika pml4 == NULL (kernel task), CR3 sudah benar dari boot */
 
-    /*
-     * BUG FIX: Update TSS.RSP0 to the CURRENT task's kernel stack.
-     * Without this, ALL tasks share the same Ring 0 stack when taking
-     * interrupts. On bare metal with 1000Hz timer, Task A's interrupt
-     * frame gets overwritten by Task B's interrupt → stack corruption
-     * → GPF/triple fault → reboot.
-     *
-     * Each task has its own kernel_stack allocated in create_task/
-     * create_user_task. We set TSS.RSP0 here so the CPU uses the
-     * correct per-task kernel stack for the next Ring 3→0 transition.
-     */
+    /* Update TSS.RSP0 AND kernel_stack_top for the CURRENT task.
+     * TSS.RSP0 = used by CPU for Ring 3→0 interrupt transitions.
+     * kernel_stack_top = used by syscall_entry assembly (mov rsp, kernel_stack_top).
+     * Both must point to the SAME per-task kernel stack.
+     * This enables preemptible syscalls: timer can safely preempt during
+     * any syscall because the syscall frame is on the per-task stack,
+     * not a shared global stack. */
     if (current_task->kernel_stack) {
         set_kernel_stack(current_task->kernel_stack);
+        kernel_stack_top = current_task->kernel_stack;
     }
 
     /* Muat register task baru ke CPU */
@@ -437,6 +537,12 @@ void schedule(struct registers* current_regs) {
             serial_write_string(buf);
             serial_write_string("] PID ");
             itoa(current_task->pid, buf, 10);
+            serial_write_string(buf);
+            serial_write_string(" PRI=");
+            itoa(current_task->priority, buf, 10);
+            serial_write_string(buf);
+            serial_write_string(" Q=");
+            itoa(current_task->quantum_max, buf, 10);
             serial_write_string(buf);
             serial_write_string(" CS=0x");
             itoa(current_task->regs.cs, buf, 16);
@@ -482,6 +588,7 @@ void sleep_current_task(uint64_t wake_tick) {
     if (current_task != NULL) {
         current_task->sleep_until = wake_tick;
         current_task->state = TASK_SLEEPING;
+        current_task->sleep_count++; /* Track I/O-bound behavior */
     }
 }
 
@@ -585,18 +692,23 @@ uint64_t* task_get_current_pml4(void) {
 }
 
 /*
- * task_fork() - Clone the current process (full address space copy).
+ * task_fork() - Clone the current process using Copy-on-Write (CoW).
  *
- * Creates a child process with:
- *   - Its own PML4 (new address space)
- *   - Physical copy of all parent's user pages (code, data, stack)
- *   - Copied register state (child RAX=0 so fork returns 0 to child)
- *   - Copied FD table (open file descriptors inherited)
- *   - Clean SHM attachments (child starts fresh)
+ * Instead of copying every page physically, we:
+ *   1. Map the SAME physical pages in both parent and child
+ *   2. Mark them READ-ONLY + CoW bit in both address spaces
+ *   3. Increment page reference count (pmm_ref_page)
+ *   4. On write, page fault handler copies the page on demand
+ *
+ * This makes fork() O(page_table_entries) instead of O(total_memory).
  *
  * Returns child PID (>0) to parent, or -1 on failure.
- * Child will return 0 when it starts executing.
  */
+
+/* PTE flag bits for CoW */
+#define PTE_WRITABLE 0x002
+#define PTE_COW      0x200  /* Bit 9 (Available): marks CoW page */
+
 int32_t task_fork(void) {
     if (!current_task) return -1;
     if (!current_task->pml4) {
@@ -614,8 +726,8 @@ int32_t task_fork(void) {
         return -1;
     }
 
-    /* 2. Walk parent's PML4 lower half, copy all mapped pages to child */
-    uint64_t child_pages[64];
+    /* 2. Walk parent's lower half, SHARE pages as CoW (read-only) */
+    uint64_t child_pages[256];
     uint32_t child_page_count = 0;
 
     for (int i = 0; i < 256; i++) {
@@ -650,31 +762,30 @@ int32_t task_fork(void) {
                     uint64_t parent_phys = pt[l] & ~0xFFF;
                     uint64_t flags = pt[l] & 0xFFF;
 
-                    /* Allocate new physical page for child */
-                    void* child_phys = pmm_alloc_page();
-                    if (!child_phys) {
-                        serial_write_string("[FORK] Out of memory during page copy!\n");
-                        goto fail_cleanup;
-                    }
+                    /*
+                     * CoW: Mark parent page READ-ONLY + CoW bit.
+                     * Clear WRITABLE (bit 1), set CoW (bit 9).
+                     */
+                    uint64_t cow_flags = (flags & ~PTE_WRITABLE) | PTE_COW;
+                    pt[l] = parent_phys | cow_flags;
 
-                    /* Copy page content via HHDM */
-                    uint8_t* src = (uint8_t*)(parent_phys + hhdm_offset);
-                    uint8_t* dst = (uint8_t*)((uint64_t)child_phys + hhdm_offset);
-                    for (int b = 0; b < 4096; b++) {
-                        dst[b] = src[b];
-                    }
+                    /* Map SAME physical page in child with CoW flags */
+                    vmm_map_page_in(child_pml4, va, parent_phys, cow_flags);
 
-                    /* Map in child's PML4 at same VA with same flags */
-                    vmm_map_page_in(child_pml4, va, (uint64_t)child_phys, flags);
+                    /* Increment reference count (page now shared) */
+                    pmm_ref_page((void*)parent_phys);
 
-                    /* Track for cleanup */
-                    if (child_page_count < 64) {
-                        child_pages[child_page_count++] = (uint64_t)child_phys;
+                    /* Track page for child cleanup */
+                    if (child_page_count < 256) {
+                        child_pages[child_page_count++] = parent_phys;
                     }
                 }
             }
         }
     }
+
+    /* Flush TLB: parent PTEs changed to read-only */
+    asm volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
     /* 3. Allocate child task struct */
     struct task* child = (struct task*)kmalloc(sizeof(struct task));
@@ -714,7 +825,7 @@ int32_t task_fork(void) {
     for (uint32_t pg = 0; pg < child_page_count; pg++) {
         child->user_pages[pg] = child_pages[pg];
     }
-    for (uint32_t pg = child_page_count; pg < 64; pg++) {
+    for (uint32_t pg = child_page_count; pg < 256; pg++) {
         child->user_pages[pg] = 0;
     }
 
@@ -730,16 +841,28 @@ int32_t task_fork(void) {
         child->shm_attached[i].page_count = 0;
     }
 
-    /* 8. Append child to task list */
+    /* 8. Inherit parent's scheduling priority */
+    child->base_priority = current_task->base_priority;
+    child->priority      = current_task->priority;
+    child->nice          = current_task->nice;
+    child->quantum_max   = current_task->quantum_max;
+    child->quantum       = child->quantum_max;
+    child->cpu_ticks     = 0;
+    child->sleep_count   = 0;
+
+    /* 9. Append child to task list */
     child->next = NULL;
     task_list_tail->next = child;
     task_list_tail = child;
 
-    serial_write_string("[FORK] Child process created with PID ");
+    serial_write_string("[FORK-CoW] Child PID ");
     char pid_buf[16];
     itoa(child->pid, pid_buf, 10);
     serial_write_string(pid_buf);
-    serial_write_string("\n");
+    serial_write_string(" shares ");
+    itoa(child_page_count, pid_buf, 10);
+    serial_write_string(pid_buf);
+    serial_write_string(" pages (0 copies)\n");
 
     return (int32_t)child->pid;
 
@@ -753,4 +876,86 @@ fail_cleanup:
     /* Destroy child's PML4 */
     vmm_destroy_address_space(child_pml4);
     return -1;
+}
+
+/*
+ * task_set_nice() - Atur nice value untuk task saat ini.
+ *
+ * Nice value mempengaruhi prioritas efektif:
+ *   effective_priority = base_priority - nice
+ *
+ * Nice negatif (-2, -1) = prioritas LEBIH TINGGI (lebih banyak CPU)
+ * Nice positif (+1, +2) = prioritas LEBIH RENDAH (lebih sedikit CPU)
+ * Nice 0               = default (tidak ada perubahan)
+ *
+ * Contoh: task PRIO_NORMAL (2) dengan nice=+1 → efektif PRIO_LOW (1)
+ */
+int task_set_nice(int nice_val) {
+    if (!current_task) return -1;
+
+    /* Clamp nice value to valid range */
+    if (nice_val < -2) nice_val = -2;
+    if (nice_val >  2) nice_val =  2;
+
+    current_task->nice = (int8_t)nice_val;
+
+    /* Recalculate effective priority */
+    int eff = current_task->base_priority - nice_val;
+    current_task->priority = clamp_priority(eff);
+    current_task->quantum_max = quantum_table[current_task->priority];
+
+    return 0;
+}
+
+/*
+ * task_get_sched_info() - Dapatkan informasi scheduling untuk task tertentu.
+ *
+ * Format output: "PID=N PRI=N NICE=N Q=N/M CPU=N SLP=N ST=X\n"
+ * Di mana ST = R(unning) | r(eady) | S(leeping) | W(aiting) | D(ead)
+ */
+int task_get_sched_info(uint32_t pid, char* out_buf) {
+    struct task* t;
+    if (pid == 0) {
+        t = current_task;
+    } else {
+        t = task_find_by_pid(pid);
+    }
+    if (!t || !out_buf) return -1;
+
+    char tmp[16];
+    char* p = out_buf;
+
+    /* Helper: append string */
+    #define APPEND(s) do { const char* _s = (s); while (*_s) *p++ = *_s++; } while(0)
+
+    APPEND("PID=");
+    itoa(t->pid, tmp, 10); APPEND(tmp);
+    APPEND(" PRI=");
+    itoa(t->priority, tmp, 10); APPEND(tmp);
+    APPEND(" NICE=");
+    if (t->nice < 0) { *p++ = '-'; itoa(-t->nice, tmp, 10); }
+    else { itoa(t->nice, tmp, 10); }
+    APPEND(tmp);
+    APPEND(" Q=");
+    itoa(t->quantum, tmp, 10); APPEND(tmp);
+    *p++ = '/';
+    itoa(t->quantum_max, tmp, 10); APPEND(tmp);
+    APPEND(" CPU=");
+    itoa(t->cpu_ticks, tmp, 10); APPEND(tmp);
+    APPEND(" SLP=");
+    itoa(t->sleep_count, tmp, 10); APPEND(tmp);
+    APPEND(" ST=");
+
+    switch (t->state) {
+        case TASK_RUNNING:  *p++ = 'R'; break;
+        case TASK_READY:    *p++ = 'r'; break;
+        case TASK_SLEEPING: *p++ = 'S'; break;
+        case TASK_WAITING:  *p++ = 'W'; break;
+        case TASK_DEAD:     *p++ = 'D'; break;
+    }
+    *p++ = '\n';
+    *p = '\0';
+
+    #undef APPEND
+    return 0;
 }
