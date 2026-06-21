@@ -32,6 +32,29 @@ SECTIONS
         *(.dynamic)
     } :data :dynamic
 
+    /* ====================================================================
+     * LIMINE v5.x BOOT PROTOCOL: Request markers + requests section.
+     *
+     * Limine v5.x bootloader WAJIB menemukan dua marker (start & end)
+     * yang membungkus section .requests. Jika marker hilang, Limine
+     * TIDAK akan memproses request apapun — semua response akan NULL.
+     * Akibatnya kernel hang di hcf() saat cek framebuffer/memmap.
+     *
+     * Marker & requests DIBUTUHKAN (KEEP) agar tidak ter-garbage collect.
+     * ==================================================================== */
+    . = ALIGN(8);
+    .requests_start_marker : {
+        KEEP(*(.requests_start_marker))
+    } :data
+
+    .requests : {
+        KEEP(*(.requests))
+    } :data
+
+    .requests_end_marker : {
+        KEEP(*(.requests_end_marker))
+    } :data
+
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

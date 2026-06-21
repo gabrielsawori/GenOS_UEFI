@@ -43,9 +43,14 @@ void pmm_init(void) {
     if (!mmap) return;
 
     for (uint64_t i = 0; i < mmap->entry_count; i++) {
-        uint64_t top = mmap->entries[i]->base + mmap->entries[i]->length;
-        if (top > highest_address) {
-            highest_address = top;
+        int type = mmap->entries[i]->type;
+        if (type == LIMINE_MEMMAP_USABLE || 
+            type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE || 
+            type == LIMINE_MEMMAP_KERNEL_AND_MODULES) {
+            uint64_t top = mmap->entries[i]->base + mmap->entries[i]->length;
+            if (top > highest_address) {
+                highest_address = top;
+            }
         }
     }
 
@@ -61,6 +66,12 @@ void pmm_init(void) {
                 break;
             }
         }
+    }
+
+    if (bitmap == NULL) {
+        serial_write_string("[FATAL] PMM: Tidak dapat menemukan memori berurutan yang cukup untuk bitmap!\n");
+        asm volatile ("cli");
+        for (;;) { asm volatile ("hlt"); }
     }
 
     for (uint64_t i = 0; i < bitmap_size; i++) {
@@ -102,9 +113,11 @@ void* pmm_alloc_page(void) {
 
 void pmm_free_page(void* ptr) {
     uint64_t page = (uint64_t)ptr / PAGE_SIZE;
-    if (bitmap_test(page)) {
-        bitmap_clear(page); 
-        free_pages++;
+    if (page < total_pages) {
+        if (bitmap_test(page)) {
+            bitmap_clear(page); 
+            free_pages++;
+        }
     }
 }
 
