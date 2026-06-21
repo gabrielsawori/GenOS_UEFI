@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "idt.h"
 #include "lapic.h"
+#include "percpu.h"
 #include "../drivers/serial.h"
 #include "../kernel/utils.h"
 #include "../mm/pmm.h"
@@ -78,14 +79,15 @@ static void ap_entry(struct limine_smp_info* info) {
     uint64_t new_stack = boot->stack_top;
     asm volatile("mov %0, %%rsp" : : "r"(new_stack) : "memory");
 
-    /* 3. Load BSP's GDT and IDT */
-    gdt_load_on_ap();
+    /* 3. Initialize per-CPU GDT+TSS (gives this AP its own TSS with RSP0)
+     * This REPLACES gdt_load_on_ap() — we load a DIFFERENT GDT per AP. */
+    percpu_init_ap(boot->cpu_index, boot->lapic_id, boot->stack_top);
     idt_load_on_ap();
 
     /* 4. Initialize LAPIC on this AP */
     lapic_init();
 
-    /* 5. Start LAPIC periodic timer at ~1000 Hz (same as BSP's PIT) */
+    /* 5. Start LAPIC periodic timer at ~1000 Hz */
     lapic_timer_init(1000);
 
     /* 6. Mark this CPU as active */
@@ -346,10 +348,11 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         }
     }
 
-    /* Phase 5: Initialize LAPIC on BSP */
+    /* Phase 5: Per-CPU data + LAPIC on BSP */
+    percpu_init_bsp();
     lapic_init();
     lapic_timer_init(1000);
-    serial_write_string("  [OK] BSP LAPIC timer started (1000 Hz)\n");
+    serial_write_string("  [OK] BSP per-CPU TSS + LAPIC timer ready\n");
 
     /* Summary */
     uint32_t active_count = 0;
