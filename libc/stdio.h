@@ -60,3 +60,24 @@ int create(const char* filename);
 
 /* Delete a file from tmpfs; return 0 on success, -1 on error */
 int unlink(const char* filename);
+
+/* === Mouse Input (syscall 30) === */
+
+/*
+ * State mouse (mirror dari drivers/mouse.h kernel, HANYA struct-nya).
+ * HARUS identik layout-nya dengan kernel side agar syscall copy benar.
+ *  buttons: bit0=kiri, bit1=kanan, bit2=tengah
+ *  changed: 1 jika ada event baru sejak read_mouse() terakhir (di-reset kernel)
+ */
+typedef struct {
+    int32_t  x;
+    int32_t  y;
+    uint8_t  buttons;
+    uint8_t  changed;
+} mouse_state_t;
+
+/*
+ * Ambil snapshot state mouse. Return 0 sukses / -1 jika pointer NULL.
+ * Setelah panggilan, flag 'changed' di-kernel di-reset (event dikonsumsi).
+ */
+int read_mouse(mouse_state_t* m);

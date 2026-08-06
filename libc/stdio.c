@@ -109,3 +109,14 @@ int create(const char* filename) {
 int unlink(const char* filename) {
     return (int)syscall(25, (uint64_t)filename, 0, 0);
 }
+
+/* === Mouse Input (syscall 30) === */
+
+/*
+ * read_mouse() - Ambil snapshot state mouse dari kernel.
+ * Kernel menyalin (x, y, buttons, changed) ke buffer user dan mereset
+ * flag 'changed' (event dikonsumsi).
+ */
+int read_mouse(mouse_state_t* m) {
+    return (int)syscall(30, (uint64_t)m, 0, 0);
+}
