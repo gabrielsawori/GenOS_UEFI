@@ -73,6 +73,10 @@ void task_init(void) {
     init_task->pml4 = NULL;          /* Kernel task: pakai kernel_pml4 */
     init_task->user_page_count = 0;
 
+    /* Kernel task tidak punya user-space heap */
+    init_task->heap_brk   = 0;
+    init_task->heap_limit = 0;
+
     /*
      * BUG FIX: Init task uses the boot_kernel_stack allocated in kernel.c.
      * This is the same stack set in TSS.RSP0 before interrupts are enabled.

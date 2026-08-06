@@ -3,6 +3,7 @@
 #include "../limine.h"
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
+#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../cpu/gdt.h"
 #include "../cpu/idt.h"
@@ -144,6 +145,17 @@ void _start(void) {
     vmm_init();
     heap_init();
 
+    /*
+     * === FASE 2.1: Mouse PS/2 ===
+     * Inisialisasi setelah PIC di-remap (FASE 1) dan setelah framebuffer
+     * tersedia (untuk clamp resolusi). HARUS sebelum timer_init/sti agar
+     * IRQ12 tidak pernah fire saat PIC belum siap.
+     */
+    mouse_init();
+    mouse_reset(fb->width, fb->height);
+    /* Show cursor at initial position (center of screen) */
+    cursor_update(fb->width / 2, fb->height / 2);
+
     /* === FASE 2.5: SMP/CPU Detection via ACPI MADT === */
     smp_init(
         smp_request.response,
@@ -192,14 +204,14 @@ void _start(void) {
 
     /* === FASE 7: Aktifkan Timer & Interrupt → Idle Loop ===
      *
-     * BUG FIX: Timer PIT diinisialisasi di sini, SETELAH semua subsistem
-     * (PMM, VMM, Heap, Task, Syscall) siap. Ini mencegah IRQ0 menyala
-     * saat scheduler/heap belum aktif — penyebab utama crash bare metal.
+     * BUG FIX (Bare Metal): Timer PIT + LAPIC diinisialisasi di sini,
+     * SETELAH semua subsistem (PMM, VMM, Heap, Task, Syscall, Shell)
+     * siap. Ini mencegah IRQ menyala saat scheduler/heap belum aktif.
      *
-     * Urutan HARUS: timer_init() → sti. Timer hanya mulai generate IRQ
-     * setelah PIT diprogram, dan interrupt hanya diterima setelah sti.
+     * smp_start_timers() juga melepas AP gate — APs mulai scheduling.
      */
     timer_init(1000);
+    smp_start_timers(); /* Start BSP LAPIC timer + release AP gate */
     asm volatile ("sti");
     serial_write_string("[INFO] Kernel idle. All user work runs in Ring 3.\n");
     while (1) { asm volatile ("hlt"); }

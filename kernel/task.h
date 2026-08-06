@@ -38,16 +38,31 @@ typedef enum {
 /* Starvation prevention: boost semua task setiap N ticks */
 #define STARVATION_BOOST_INTERVAL 500
 
+/*
+ * User-space heap region (brk-style).
+ * 0x60000000–0x67FFFFFF (128MB) — tidak konflik dengan app.elf (0x40000000),
+ * shell.elf (0x50000000), maupun stack (0x80000000+).
+ */
+#define HEAP_BASE       0x60000000ULL
+#define HEAP_SIZE_MAX   0x08000000ULL   /* 128MB */
+
 struct task {
-    uint32_t pid;             
+    uint32_t pid;
     uint32_t tgid;            // Thread Group ID (= PID of group leader)
-    task_state_t state;       
-    struct registers regs;    
-    uint64_t stack_base;      
+    task_state_t state;
+    struct registers regs;
+    uint64_t stack_base;
     uint64_t sleep_until;     // Tick target untuk bangun dari TASK_SLEEPING
     uint32_t wait_target_pid; // PID yang ditunggu (untuk TASK_WAITING)
     uint64_t* pml4;           // Address space PML4 (NULL = kernel task)
     uint64_t kernel_stack;    // Per-task kernel stack top (for TSS.RSP0)
+
+    /* === User-Space Heap (brk-style, per-process) ===
+     * heap_brk:   break saat ini (tumbuh ke atas dari HEAP_BASE).
+     *             sbrk(incr) menambah break & memetakan page baru bila perlu.
+     * heap_limit: batas atas break (= HEAP_BASE + HEAP_SIZE_MAX). */
+    uint64_t heap_brk;
+    uint64_t heap_limit;
 
     /* === Thread Support === */
     uint8_t  is_thread;       // 1 = thread (shares parent's PML4), 0 = process
