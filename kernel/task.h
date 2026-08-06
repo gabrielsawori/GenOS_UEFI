@@ -4,6 +4,7 @@
 #include "../cpu/isr.h"
 #include "../fs/vfs.h"
 #include "../mm/shm.h" 
+#include "../security/caps.h"
 
 typedef enum {
     TASK_RUNNING,
@@ -81,6 +82,8 @@ struct task {
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table
     shm_attach_record_t shm_attached[SHM_MAX_ATTACH]; // SHM attachments
+    uint32_t capabilities;    // Capability bitmask (CAP_FS_READ, CAP_EXEC, etc.)
+    uint64_t stack_canary;    // Random canary for stack overflow detection
     struct task* next;        
 };
 

@@ -14,6 +14,12 @@
 #include "../fs/vfs.h"
 #include "../fs/cache.h"
 #include "../mm/shm.h"
+#include "../crypto/sha256.h"
+#include "../crypto/random.h"
+#include "../crypto/hmac.h"
+#include "../crypto/aes.h"
+#include "../security/security.h"
+#include "../security/caps.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -112,7 +118,9 @@ void syscall_init(void) {
     serial_write_string("            21=cache_stats 22=fork\n");
     serial_write_string("            23=write 24=create 25=unlink\n");
     serial_write_string("            26=nice 27=sched_info\n");
-    serial_write_string("            28=clone 29=thread_count\n");
+    serial_write_string("            28=clone 29=thread_count 30=read_mouse\n");
+    serial_write_string("            31=sha256 32=random 33=hmac\n");
+    serial_write_string("            34=encrypt 35=decrypt 36=get_caps\n");
 
     /* Initialize VFS layer */
     vfs_init();
@@ -634,6 +642,151 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         out->changed = s->changed;
         s->changed   = 0; /* Konsumsi event */
         result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 31: sha256(void* data, uint64_t len, uint8_t* out_hash)
+     * Hitung SHA-256 hash dari data di user-space.
+     * out_hash harus menunjuk ke buffer minimal 32 byte.
+     * Return: 0 = sukses, -1 = error (NULL pointer atau no CAP_CRYPTO).
+     * ================================================================ */
+    case 31: {
+        uint8_t* data = (uint8_t*)arg1;
+        size_t len = (size_t)arg2;
+        uint8_t* out_hash = (uint8_t*)arg3;
+        if (!validate_user_ptr(data) || !validate_user_ptr(out_hash)) {
+            result = (uint64_t)-1; break;
+        }
+        sha256_hash(data, len, out_hash);
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 32: random(uint8_t* buf, uint64_t len)
+     * Isi buffer user-space dengan random bytes dari CSPRNG.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 32: {
+        uint8_t* buf = (uint8_t*)arg1;
+        size_t len = (size_t)arg2;
+        if (!validate_user_buffer(buf, len)) {
+            result = (uint64_t)-1; break;
+        }
+        csprng_get_bytes(buf, len);
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 33: hmac(void* key_and_data, uint64_t key_len, uint64_t data_len)
+     * Hitung HMAC-SHA256.
+     * arg1 = pointer ke struct { key_ptr, data_ptr, out_ptr }
+     *        (packed sebagai 3 uint64_t berurutan di user memory)
+     * arg2 = key_len
+     * arg3 = data_len
+     *
+     * Layout memory arg1: [uint64_t key_ptr][uint64_t data_ptr][uint64_t out_ptr]
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 33: {
+        uint64_t* ptrs = (uint64_t*)arg1;
+        if (!validate_user_buffer(ptrs, 24)) {
+            result = (uint64_t)-1; break;
+        }
+        uint8_t* key = (uint8_t*)ptrs[0];
+        uint8_t* data = (uint8_t*)ptrs[1];
+        uint8_t* out = (uint8_t*)ptrs[2];
+        size_t key_len = (size_t)arg2;
+        size_t data_len = (size_t)arg3;
+        if (!validate_user_buffer(key, key_len) ||
+            !validate_user_buffer(data, data_len) ||
+            !validate_user_buffer(out, 32)) {
+            result = (uint64_t)-1; break;
+        }
+        hmac_sha256(key, key_len, data, data_len, out);
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 34: encrypt(void* params, uint64_t unused1, uint64_t unused2)
+     * AES-256-CBC encrypt data in-place.
+     * arg1 = pointer ke struct:
+     *   [uint64_t key_ptr][uint64_t iv_ptr][uint64_t buf_ptr][uint64_t len]
+     * Data di buf_ptr harus sudah di-pad ke kelipatan 16 byte.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 34: {
+        uint64_t* params = (uint64_t*)arg1;
+        if (!validate_user_buffer(params, 32)) {
+            result = (uint64_t)-1; break;
+        }
+        uint8_t* key = (uint8_t*)params[0];
+        uint8_t* iv = (uint8_t*)params[1];
+        uint8_t* buf = (uint8_t*)params[2];
+        size_t len = (size_t)params[3];
+        if (!validate_user_buffer(key, 32) ||
+            !validate_user_buffer(iv, 16) ||
+            !validate_user_buffer(buf, len) ||
+            len % 16 != 0) {
+            result = (uint64_t)-1; break;
+        }
+        aes256_ctx_t aes_ctx;
+        aes256_init(&aes_ctx, key);
+        aes256_cbc_encrypt(&aes_ctx, iv, buf, len);
+        secure_memzero(&aes_ctx, sizeof(aes_ctx));
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 35: decrypt(void* params, uint64_t unused1, uint64_t unused2)
+     * AES-256-CBC decrypt data in-place.
+     * Same parameter layout as syscall 34.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 35: {
+        uint64_t* params = (uint64_t*)arg1;
+        if (!validate_user_buffer(params, 32)) {
+            result = (uint64_t)-1; break;
+        }
+        uint8_t* key = (uint8_t*)params[0];
+        uint8_t* iv = (uint8_t*)params[1];
+        uint8_t* buf = (uint8_t*)params[2];
+        size_t len = (size_t)params[3];
+        if (!validate_user_buffer(key, 32) ||
+            !validate_user_buffer(iv, 16) ||
+            !validate_user_buffer(buf, len) ||
+            len % 16 != 0) {
+            result = (uint64_t)-1; break;
+        }
+        aes256_ctx_t aes_ctx;
+        aes256_init(&aes_ctx, key);
+        aes256_cbc_decrypt(&aes_ctx, iv, buf, len);
+        secure_memzero(&aes_ctx, sizeof(aes_ctx));
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 36: get_caps(uint32_t* out_caps)
+     * Dapatkan capability bitmask proses saat ini.
+     * Return: 0 = sukses, -1 = error.
+     * ================================================================ */
+    case 36: {
+        uint32_t* out = (uint32_t*)arg1;
+        if (!validate_user_ptr(out)) {
+            result = (uint64_t)-1; break;
+        }
+        struct task* cur = task_find_by_pid(get_current_pid());
+        if (cur) {
+            *out = cur->capabilities;
+            result = 0;
+        } else {
+            result = (uint64_t)-1;
+        }
         break;
     }
 

@@ -11,6 +11,9 @@
 #include "../cpu/lapic.h"
 #include "../limine.h"
 #include "utils.h"
+#include "../security/security.h"
+#include "../security/caps.h"
+#include "../crypto/random.h"
 #include <stddef.h>
 
 /* SMP scheduler spinlock — protects task list and current_task */
@@ -123,6 +126,10 @@ void task_init(void) {
     for (int i = 0; i < SHM_MAX_ATTACH; i++) {
         init_task->shm_attached[i].shmid = -1;
     }
+
+    /* Kernel idle task gets full capabilities */
+    init_task->capabilities = CAP_ALL;
+    init_task->stack_canary = 0; /* No canary for boot task */
 
     current_task = init_task;
     task_list_head = init_task;
@@ -325,6 +332,19 @@ struct task* create_user_task(uint8_t* binary_data) {
     } else {
         task_init_priority(new_task, PRIO_NORMAL);
     }
+
+    /*
+     * === CAPABILITIES & SECURITY ===
+     * Shell (first user task, PID 1-2) gets ALL capabilities.
+     * Subsequent tasks get DEFAULT capabilities (no admin, no raw I/O).
+     * Stack canary is set from CSPRNG for overflow detection.
+     */
+    if (new_task->pid <= 2) {
+        new_task->capabilities = CAP_ALL;
+    } else {
+        new_task->capabilities = CAP_DEFAULT;
+    }
+    new_task->stack_canary = security_get_stack_canary();
 
     /* Tambahkan task ke antrean scheduler */
     task_list_tail->next = new_task;
@@ -907,6 +927,10 @@ int32_t task_fork(void) {
     child->cpu_ticks     = 0;
     child->sleep_count   = 0;
 
+    /* 8b. Inherit parent's capabilities (capped at DEFAULT for children) */
+    child->capabilities = caps_inherit(current_task->capabilities, CAP_DEFAULT);
+    child->stack_canary = security_get_stack_canary();
+
     /* 9. Append child to task list */
     child->next = NULL;
     task_list_tail->next = child;
@@ -1105,6 +1129,10 @@ int32_t task_clone(uint64_t entry, uint64_t stack_top) {
     thread->sleep_count   = 0;
     thread->sleep_until   = 0;
     thread->wait_target_pid = 0;
+
+    /* 7b. Threads inherit parent's full capabilities (same process) */
+    thread->capabilities = current_task->capabilities;
+    thread->stack_canary = security_get_stack_canary();
 
     /* 8. Increment parent's thread count */
     struct task* leader = task_find_by_pid(current_task->tgid);

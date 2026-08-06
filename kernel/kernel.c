@@ -16,6 +16,9 @@
 #include "../cpu/syscall.h"
 #include "../cpu/smp.h"
 #include "../fs/tar.h"
+#include "../crypto/random.h"
+#include "../security/security.h"
+#include "../security/caps.h"
 
 LIMINE_BASE_REVISION(1)
 
@@ -156,7 +159,19 @@ void _start(void) {
     /* Show cursor at initial position (center of screen) */
     cursor_update(fb->width / 2, fb->height / 2);
 
-    /* === FASE 2.5: SMP/CPU Detection via ACPI MADT === */
+    /* === FASE 2.5: Security & Cryptography ===
+     * CSPRNG harus diinisialisasi sebelum task_init() agar setiap task
+     * baru bisa mendapat stack canary dan capability random seed.
+     * Security module mengaktifkan SMEP/NX dan menyiapkan infrastruktur
+     * validasi pointer.
+     */
+    serial_write_string("[INFO] Initializing Cryptography & Security...\n");
+    csprng_init();     /* RDRAND/RDSEED → ChaCha20 CSPRNG */
+    security_init();   /* SMEP, NX, pointer validation */
+    caps_init();       /* Capability-based access control */
+    security_status(); /* Print security feature summary */
+
+    /* === FASE 2.6: SMP/CPU Detection via ACPI MADT === */
     smp_init(
         smp_request.response,
         rsdp_request.response ? rsdp_request.response->address : (void*)0
