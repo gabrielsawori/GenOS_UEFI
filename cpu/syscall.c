@@ -4,6 +4,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
@@ -40,6 +41,39 @@ uint64_t kernel_stack_top = 0;
  */
 volatile int in_syscall = 0;
 
+/*
+ * syscall_init_cpu() - Konfigurasi MSR syscall pada CPU *yang sedang berjalan*.
+ *
+ * MSRs (EFER, STAR, LSTAR, FMASK) bersifat PER-CPU — setiap core punya
+ * salinannya sendiri. Memanggil wrmsr() hanya pada BSP TIDAK mengaktifkan
+ * syscall pada Application Processor.
+ *
+ * Tanpa EFER.SCE=1 pada suatu core, instruksi 'syscall' (0F 05) di user-space
+ * memicu #UD (Invalid Opcode). Pada bare metal multi-core, scheduler memigrasi
+ * task dari BSP ke AP — bila AP belum meng-enable SCE, 'syscall' pertama di
+ * AP langsung #UD → kernel panic "Invalid Opcode".
+ *
+ * Fungsi ini HARUS dipanggil pada setiap CPU (BSP di syscall_init(), dan
+ * setiap AP di ap_entry()) sebelum interrupt/timer diaktifkan.
+ */
+void syscall_init_cpu(void) {
+    /* EFER.SCE (bit 0) — enable SYSCALL/SYSRET instruction pair */
+    uint64_t efer = rdmsr(MSR_EFER);
+    wrmsr(MSR_EFER, efer | 1);
+
+    /*
+     * STAR MSR Layout:
+     *   STAR[47:32] = Kernel CS (0x08)
+     *   STAR[63:48] = Base untuk SYSRETQ (0x10)
+     *     → User CS = (0x10 + 16) | 3 = 0x23 ✓
+     *     → User SS = (0x10 + 8)  | 3 = 0x1B ✓
+     */
+    uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
+    wrmsr(MSR_STAR, star);
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_FMASK, 0x200);
+}
+
 void syscall_init(void) {
     serial_write_string("[INFO] Membangun Pintu Gerbang System Call...\n");
 
@@ -67,20 +101,8 @@ void syscall_init(void) {
     kernel_stack_top = phys2 + hhdm_off + 4096;
     set_kernel_stack(kernel_stack_top);
 
-    uint64_t efer = rdmsr(MSR_EFER);
-    wrmsr(MSR_EFER, efer | 1);
-
-    /*
-     * STAR MSR Layout:
-     *   STAR[47:32] = Kernel CS (0x08)
-     *   STAR[63:48] = Base untuk SYSRETQ (0x10)
-     *     → User CS = (0x10 + 16) | 3 = 0x23 ✓
-     *     → User SS = (0x10 + 8)  | 3 = 0x1B ✓
-     */
-    uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
-    wrmsr(MSR_STAR, star);
-    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
-    wrmsr(MSR_FMASK, 0x200);
+    /* Aktifkan syscall MSRs pada BSP. AP mengaktifkannya sendiri di ap_entry(). */
+    syscall_init_cpu();
 
     serial_write_string("[OK] Pintu Gerbang Syscall Berhasil Dibuka!\n");
     serial_write_string("     Syscall: 1=print 2=exit 3=read_key 4=sleep\n");
@@ -593,6 +615,25 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 29: {
         result = (uint64_t)task_get_thread_count();
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 30: read_mouse(mouse_state_t* out)
+     * Salin snapshot state mouse (x, y, buttons, changed) ke buffer user.
+     * Flag 'changed' di-reset ke 0 setelah dibaca (event dikonsumsi).
+     * Return: 0 = sukses, -1 = pointer NULL.
+     * ================================================================ */
+    case 30: {
+        mouse_state_t* out = (mouse_state_t*)arg1;
+        if (!out) { result = (uint64_t)-1; break; }
+        mouse_state_t* s = mouse_get_state();
+        out->x       = s->x;
+        out->y       = s->y;
+        out->buttons = s->buttons;
+        out->changed = s->changed;
+        s->changed   = 0; /* Konsumsi event */
+        result = 0;
         break;
     }
 

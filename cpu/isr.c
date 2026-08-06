@@ -3,6 +3,7 @@
 #include "../drivers/framebuffer.h"
 #include "../drivers/io.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../kernel/task.h"
 #include "../kernel/utils.h"
@@ -402,6 +403,17 @@ void isr_handler(struct registers *regs) {
         else if (regs->int_no == 33) {
             uint8_t scancode = inb(0x60);
             keyboard_handler(scancode);
+        }
+        /* IRQ 12 (INT 44): Mouse PS/2 — input pointer */
+        else if (regs->int_no == 44) {
+            uint8_t data = inb(0x60);
+            mouse_handler(data);
+            /* Render cursor overlay immediately for instant response */
+            extern void cursor_update(int32_t x, int32_t y);
+            mouse_state_t* ms = mouse_get_state();
+            if (ms->changed) {
+                cursor_update(ms->x, ms->y);
+            }
         }
 
         /* Kirim EOI (End of Interrupt) ke PIC */

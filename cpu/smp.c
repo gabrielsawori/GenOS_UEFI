@@ -3,6 +3,7 @@
 #include "idt.h"
 #include "lapic.h"
 #include "percpu.h"
+#include "syscall.h"
 #include "../drivers/serial.h"
 #include "../kernel/utils.h"
 #include "../mm/pmm.h"
@@ -33,6 +34,15 @@ static uint32_t bsp_lapic_id = 0;
 
 /* Atomic counter: how many APs have booted successfully */
 static volatile uint32_t aps_booted = 0;
+
+/*
+ * Gate: APs spin-wait on this flag before enabling interrupts.
+ * BSP sets this to 1 AFTER all subsystems (scheduler, syscall, shell)
+ * are fully initialized. Without this gate, APs could fire LAPIC timer
+ * interrupts before the scheduler/syscall infrastructure is ready,
+ * causing crashes on bare metal (QEMU is more forgiving).
+ */
+static volatile uint32_t ap_go = 0;
 
 /* Per-AP boot data passed via extra_argument */
 struct ap_boot_info {
@@ -72,35 +82,48 @@ static uint64_t rdmsr(uint32_t msr) {
  * We load BSP's GDT + IDT, signal alive, and enter idle.
  */
 static void ap_entry(struct limine_smp_info* info) {
-    /* 1. Get our boot data from extra_argument */
     struct ap_boot_info* boot = (struct ap_boot_info*)info->extra_argument;
 
-    /* 2. Switch to our allocated stack */
+    /* 1. Switch to allocated stack */
     uint64_t new_stack = boot->stack_top;
     asm volatile("mov %0, %%rsp" : : "r"(new_stack) : "memory");
 
-    /* 3. Initialize per-CPU GDT+TSS (gives this AP its own TSS with RSP0)
-     * This REPLACES gdt_load_on_ap() — we load a DIFFERENT GDT per AP. */
+    /* 2. Per-CPU GDT+TSS (own TSS with RSP0) */
     percpu_init_ap(boot->cpu_index, boot->lapic_id, boot->stack_top);
     idt_load_on_ap();
 
-    /* 4. Initialize LAPIC on this AP */
+    /*
+     * 3. Enable syscall MSRs pada AP ini.
+     *
+     * CRITICAL (Bare Metal #UD Fix): MSRs EFER/STAR/LSTAR/FMASK bersifat
+     * PER-CPU. syscall_init() hanya mensetup MSR di BSP. Tanpa baris ini,
+     * EFER.SCE = 0 pada AP → instruksi 'syscall' (0F 05) memicu #UD.
+     * Saat scheduler memigrasi task user-space dari BSP ke AP, 'syscall'
+     * pertama di AP langsung #UD → kernel panic "Invalid Opcode".
+     *
+     * Harus dipanggil SETELAH GDT+IDT load (syscall_entry butuh GDT valid)
+     * dan SEBELUM LAPIC timer/sti (agar siap saat interrupt/preempt).
+     */
+    syscall_init_cpu();
+
+    /* 4. Enable LAPIC (but do NOT start timer yet) */
     lapic_init();
 
-    /* 5. Start LAPIC periodic timer at ~1000 Hz */
-    lapic_timer_init(1000);
-
-    /* 6. Mark this CPU as active */
+    /* 5. Mark alive */
     cpus[boot->cpu_index].active = 1;
-
-    /* 7. Signal to BSP that we're alive */
     __atomic_add_fetch(&aps_booted, 1, __ATOMIC_SEQ_CST);
 
-    /* 8. Enable interrupts and enter idle loop.
-     * LAPIC timer fires vector 48 → isr_handler → schedule().
-     * When scheduler picks a task for this CPU, it will context-switch
-     * to that task via iretq. The AP is now a fully active CPU! */
+    /* 6. WAIT for BSP to signal all subsystems ready.
+     * Without this gate, LAPIC timer could fire schedule() before
+     * task_init/syscall_init are done → crash on bare metal. */
+    while (!__atomic_load_n(&ap_go, __ATOMIC_SEQ_CST)) {
+        asm volatile("pause");
+    }
+
+    /* 7. NOW safe: start LAPIC timer + enable interrupts */
+    lapic_timer_init(1000);
     asm volatile("sti");
+
     while (1) {
         asm volatile("hlt");
     }
@@ -348,11 +371,12 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         }
     }
 
-    /* Phase 5: Per-CPU data + LAPIC on BSP */
+    /* Phase 5: Per-CPU data + LAPIC on BSP (timer deferred) */
     percpu_init_bsp();
     lapic_init();
-    lapic_timer_init(1000);
-    serial_write_string("  [OK] BSP per-CPU TSS + LAPIC timer ready\n");
+    /* NOTE: BSP LAPIC timer NOT started here — deferred to smp_start_timers()
+     * which is called from kernel.c AFTER all subsystems are ready. */
+    serial_write_string("  [OK] BSP per-CPU TSS + LAPIC initialized (timer deferred)\n");
 
     /* Summary */
     uint32_t active_count = 0;
@@ -388,4 +412,33 @@ struct cpu_info* smp_get_cpus(void) {
 
 uint32_t smp_get_bsp_lapic_id(void) {
     return bsp_lapic_id;
+}
+
+/*
+ * smp_start_timers() — Start LAPIC timers on ALL CPUs.
+ *
+ * MUST be called from kernel.c AFTER all subsystems are fully ready
+ * (task_init, syscall_init, shell loaded). This:
+ *   1. Starts the BSP LAPIC periodic timer
+ *   2. Sets ap_go = 1, releasing APs to start their LAPIC timers + sti
+ *
+ * Without this, APs would fire schedule() before scheduler/syscall is
+ * ready, causing Invalid Opcode (#UD) on bare metal.
+ */
+void smp_start_timers(void) {
+    char buf[16];
+
+    /* Start BSP LAPIC timer */
+    lapic_timer_init(1000);
+    serial_write_string("[OK] BSP LAPIC timer started (1000 Hz)\n");
+
+    /* Release AP gate — APs will now start their LAPIC timers + sti */
+    __atomic_store_n(&ap_go, 1, __ATOMIC_SEQ_CST);
+
+    if (cpu_count > 1) {
+        serial_write_string("[OK] AP gate released — ");
+        itoa(cpu_count - 1, buf, 10);
+        serial_write_string(buf);
+        serial_write_string(" AP(s) now scheduling\n");
+    }
 }

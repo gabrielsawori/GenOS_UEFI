@@ -54,3 +54,17 @@ void pic_remap(void) {
 
     serial_write_string("[OK] PIC diremap! Timer (IRQ0) dan Keyboard (IRQ1) diizinkan lewat.\n");
 }
+
+void pic_unmask_irq(uint8_t irq) {
+    uint16_t port;
+    uint8_t  bit;
+    if (irq < 8) {
+        port = PIC1_DATA;   /* Master PIC mask register (0x21) */
+        bit  = irq;
+    } else {
+        port = PIC2_DATA;   /* Slave PIC mask register (0xA1) */
+        bit  = irq - 8;
+    }
+    /* Clear bit untuk mengizinkan IRQ ini lewat (bit=1 = masked, bit=0 = enabled) */
+    outb(port, inb(port) & ~(1 << bit));
+}

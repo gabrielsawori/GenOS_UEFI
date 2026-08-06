@@ -59,3 +59,10 @@ struct cpu_info* smp_get_cpus(void);
 
 /* Get BSP's LAPIC ID */
 uint32_t smp_get_bsp_lapic_id(void);
+
+/*
+ * smp_start_timers() — Start LAPIC timers on all CPUs.
+ * MUST be called AFTER task_init + syscall_init + shell loaded.
+ * Releases APs from their spin-wait gate.
+ */
+void smp_start_timers(void);
