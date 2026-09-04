@@ -4,7 +4,6 @@
 #include "../cpu/isr.h"
 #include "../fs/vfs.h"
 #include "../mm/shm.h" 
-#include "../security/caps.h"
 
 typedef enum {
     TASK_RUNNING,
@@ -78,12 +77,15 @@ struct task {
     uint32_t cpu_ticks;       // Total CPU ticks consumed (for stats)
     uint32_t sleep_count;     // Jumlah kali task sleep (I/O indicator)
 
-    uint64_t user_pages[256]; // Daftar page fisik milik proses ini (was 64, now 256 = 1MB max)
+    uint64_t user_pages[256]; // Daftar page fisik milik proses ini
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table
     shm_attach_record_t shm_attached[SHM_MAX_ATTACH]; // SHM attachments
-    uint32_t capabilities;    // Capability bitmask (CAP_FS_READ, CAP_EXEC, etc.)
-    uint64_t stack_canary;    // Random canary for stack overflow detection
+
+    /* === Security / Credentials === */
+    uint32_t uid;             // User ID (0 = root, 1000 = mandor)
+    uint32_t gid;             // Group ID
+
     struct task* next;        
 };
 
@@ -193,3 +195,14 @@ int32_t task_clone(uint64_t entry, uint64_t stack_top);
  * Returns thread_count for the current task's thread group leader.
  */
 uint32_t task_get_thread_count(void);
+
+/*
+ * task_set_uid() - Set UID and GID on the current task.
+ * Called by the login syscall after successful authentication.
+ */
+void task_set_uid(uint32_t uid, uint32_t gid);
+
+/*
+ * task_get_uid() - Get UID of the current task.
+ */
+uint32_t task_get_uid(void);

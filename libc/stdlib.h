@@ -58,3 +58,8 @@ int cache_get_stats(cache_stats_t* out);
 
 /* Kloning proses saat ini; return PID child ke parent, 0 ke child, -1 error */
 int fork(void);
+
+/* === Timer (syscall 33) === */
+
+/* Ambil timer tick count dari kernel; digunakan untuk clock */
+uint64_t get_ticks(void);

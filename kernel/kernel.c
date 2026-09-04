@@ -15,10 +15,10 @@
 #include "task.h"
 #include "../cpu/syscall.h"
 #include "../cpu/smp.h"
+#include "../cpu/percpu.h"
 #include "../fs/tar.h"
 #include "../crypto/random.h"
-#include "../security/security.h"
-#include "../security/caps.h"
+#include "../security/cred.h"
 
 LIMINE_BASE_REVISION(1)
 
@@ -95,11 +95,14 @@ struct limine_framebuffer *fb;
  * dengan kernel sepenuhnya melalui system call.
  */
 /*
- * Temporary boot stack for TSS.RSP0 initialization.
- * Used before heap is available. After syscall_init(), kernel_stack_top
- * from heap replaces this. Aligned to 16 bytes per AMD64 ABI.
+ * Boot kernel stack — 16KB (was 8KB).
+ *
+ * BUG FIX: 8KB was too small for the crypto/security init call chain:
+ *   _start → cred_init → PBKDF2 → HMAC → SHA256 (~750 bytes deep)
+ * Combined with all other boot initialization, 8KB overflows on bare
+ * metal, corrupting the iretq frame and causing restart.
  */
-uint8_t __attribute__((aligned(16))) boot_kernel_stack[8192];
+uint8_t __attribute__((aligned(16))) boot_kernel_stack[16384];
 
 void _start(void) {
     /*
@@ -159,23 +162,49 @@ void _start(void) {
     /* Show cursor at initial position (center of screen) */
     cursor_update(fb->width / 2, fb->height / 2);
 
-    /* === FASE 2.5: Security & Cryptography ===
-     * CSPRNG harus diinisialisasi sebelum task_init() agar setiap task
-     * baru bisa mendapat stack canary dan capability random seed.
-     * Security module mengaktifkan SMEP/NX dan menyiapkan infrastruktur
-     * validasi pointer.
-     */
-    serial_write_string("[INFO] Initializing Cryptography & Security...\n");
-    csprng_init();     /* RDRAND/RDSEED → ChaCha20 CSPRNG */
-    security_init();   /* SMEP, NX, pointer validation */
-    caps_init();       /* Capability-based access control */
-    security_status(); /* Print security feature summary */
-
-    /* === FASE 2.6: SMP/CPU Detection via ACPI MADT === */
+    /* === FASE 2.5: SMP/CPU Detection via ACPI MADT === */
     smp_init(
         smp_request.response,
         rsdp_request.response ? rsdp_request.response->address : (void*)0
     );
+
+    /*
+     * === FASE 2.6: IST1 Stack (Double-Fault Safety Net) ===
+     *
+     * Alokasi dedicated stack untuk Double Fault (#DF) handler di tiap CPU.
+     * Tanpa IST, kernel stack overflow → #DF mencoba pakai stack yang sama
+     * yang sudah rusak → triple fault (reboot diam-diameter). Dengan IST1,
+     * CPU switch ke stack ini yang masih utuh, sehingga handler bisa cetak
+     * diagnostik ke layar + serial.
+     *
+     * 2 page (8 KB) per CPU cukup — handler double fault sengaja dibuat
+     * minimalis (tidak ada call chain dalam).
+     *
+     * HARUS setelah smp_init (tahu jumlah CPU) dan pmm_init (bisa alokasi),
+     * dan SEBELUM sti (interrupt di-enable).
+     */
+    {
+        extern volatile struct limine_hhdm_request hhdm_request;
+        uint64_t hhdm_off = hhdm_request.response->offset;
+        uint32_t ncpus = smp_get_cpu_count();
+        if (ncpus == 0) ncpus = 1;
+
+        for (uint32_t c = 0; c < ncpus; c++) {
+            uint64_t ist_phys = (uint64_t)pmm_alloc_contiguous_pages(2);
+            if (ist_phys) {
+                /* Stack grows down: top = base + 8KB (via HHDM) */
+                uint64_t ist_top = ist_phys + hhdm_off + (2 * 4096);
+                if (c == 0) {
+                    gdt_set_ist1(ist_top);  /* BSP */
+                } else {
+                    percpu_set_ist1(c, ist_top);  /* AP */
+                }
+            } else {
+                serial_write_string("[WARN] Cannot alloc IST1 stack for CPU\n");
+            }
+        }
+        serial_write_string("[OK] IST1 (double-fault) stacks allocated\n");
+    }
 
     /* === FASE 3: Task Scheduler === */
     serial_write_string("[INFO] Starting Task Scheduler...\n");
@@ -189,31 +218,42 @@ void _start(void) {
         serial_write_string("[WARN] No ramdisk module; TAR filesystem disabled.\n");
     }
 
-    /* === FASE 5: Syscall Gateway === */
+    /* === FASE 5: Cryptography & Security === */
+    random_init();
+    cred_init();
+
+    /* === FASE 6: Syscall Gateway === */
     syscall_init();
 
     /* === FASE 6: Launch User-Space Shell ===
      *
-     * Shell berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
+     * Desktop berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
      * Semua akses ke hardware (layar, keyboard, filesystem) dilakukan
-     * melalui system call. Jika shell crash, kernel tetap aman.
+     * melalui system call. Jika desktop crash, kernel tetap aman.
      *
-     * shell.elf di-link di alamat 0x50000000 (terpisah dari app.elf
-     * yang di 0x40000000) agar keduanya bisa berjalan bersamaan.
+     * desktop.elf di-link di alamat 0x45000000.
+     * shell.elf tetap tersedia di ramdisk sebagai aplikasi yang bisa
+     * di-launch dari dalam desktop via exec().
      */
-    serial_write_string("[INFO] Launching user-space shell (Ring 3)...\n");
+    serial_write_string("[INFO] Launching Desktop Environment (Ring 3)...\n");
     {
         size_t ukuran = 0;
-        char* shell_data = tar_read_file("shell.elf", &ukuran);
-        if (shell_data != NULL) {
-            create_user_task((uint8_t*)shell_data);
-            serial_write_string("[OK] Shell launched in Ring 3!\n");
+        char* desktop_data = tar_read_file("desktop.elf", &ukuran);
+        if (desktop_data != NULL) {
+            create_user_task((uint8_t*)desktop_data);
+            serial_write_string("[OK] Desktop launched in Ring 3!\n");
         } else {
-            serial_write_string("[FATAL] shell.elf not found in ramdisk!\n");
-            /* Tampilkan pesan darurat di layar */
-            fb_print("FATAL: shell.elf not found!", 50, 100, 0xFF0000, 0x002244, 2);
-            fb_print("Ramdisk must contain shell.elf", 50, 130, 0xFFFF00, 0x002244, 2);
-            hcf();
+            /* Fallback: try shell.elf if desktop.elf not found */
+            serial_write_string("[WARN] desktop.elf not found, falling back to shell...\n");
+            char* shell_data = tar_read_file("shell.elf", &ukuran);
+            if (shell_data != NULL) {
+                create_user_task((uint8_t*)shell_data);
+                serial_write_string("[OK] Shell launched in Ring 3!\n");
+            } else {
+                serial_write_string("[FATAL] No user-space binary found!\n");
+                fb_print("FATAL: desktop.elf and shell.elf not found!", 50, 100, 0xFF0000, 0x002244, 2);
+                hcf();
+            }
         }
     }
 

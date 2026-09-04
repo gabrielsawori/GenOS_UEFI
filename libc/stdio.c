@@ -120,3 +120,32 @@ int unlink(const char* filename) {
 int read_mouse(mouse_state_t* m) {
     return (int)syscall(30, (uint64_t)m, 0, 0);
 }
+
+/* === Screen Information (syscall 31) === */
+
+int get_screen_info(screen_info_t* info) {
+    return (int)syscall(31, (uint64_t)info, 0, 0);
+}
+
+/* === Pixel Drawing (syscall 32) === */
+
+void draw_pixel(int x, int y, uint32_t color) {
+    uint64_t packed_xy = ((uint64_t)(uint32_t)x << 32) | (uint32_t)y;
+    syscall(32, packed_xy, (uint64_t)color, 0);
+}
+
+/* === Framebuffer Back-Buffer (syscalls 34-35) === */
+
+uint32_t* map_framebuffer(void) {
+    return (uint32_t*)syscall(34, 0, 0, 0);
+}
+
+void flush_screen(void) {
+    syscall(35, 0, 0, 0);
+}
+
+/* === Mouse Diagnostics (syscall 36) === */
+
+int mouse_stats(mouse_stats_t* out) {
+    return (int)syscall(36, (uint64_t)out, 0, 0);
+}

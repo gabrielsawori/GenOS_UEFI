@@ -81,3 +81,45 @@ typedef struct {
  * Setelah panggilan, flag 'changed' di-kernel di-reset (event dikonsumsi).
  */
 int read_mouse(mouse_state_t* m);
+
+/* === Screen Information (syscall 31) === */
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+} screen_info_t;
+
+/* Ambil dimensi layar (width, height). Return 0 sukses / -1 error */
+int get_screen_info(screen_info_t* info);
+
+/* === Pixel Drawing (syscall 32) === */
+
+/* Gambar 1 piksel pada posisi (x, y) dengan warna tertentu */
+void draw_pixel(int x, int y, uint32_t color);
+
+/* === Framebuffer Back-Buffer (syscalls 34-35) === */
+
+/* Map a back-buffer into user space for direct pixel writes. Return: pointer or NULL */
+uint32_t* map_framebuffer(void);
+
+/* Flush (copy) the back-buffer to the real screen. Call once per frame. */
+void flush_screen(void);
+
+/* === Mouse Diagnostics (syscall 36) === */
+
+/*
+ * Diagnostic counters untuk debugging mouse di bare metal.
+ * Lihat dokumentasi lengkap di drivers/mouse.h (kernel side).
+ *
+ *   irq_bytes  = jumlah byte diterima IRQ12 (0 = IRQ12 tidak pernah fire)
+ *   packets    = jumlah paket 3-byte lengkap yang diproses
+ *   sync_drops = byte dibuang karena bukan byte-awal valid
+ */
+typedef struct {
+    uint32_t irq_bytes;
+    uint32_t packets;
+    uint32_t sync_drops;
+} mouse_stats_t;
+
+/* Ambil snapshot counter diagnostic mouse. Return 0 sukses / -1 error */
+int mouse_stats(mouse_stats_t* out);

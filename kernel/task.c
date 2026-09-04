@@ -9,11 +9,9 @@
 #include "../cpu/gdt.h"
 #include "../cpu/spinlock.h"
 #include "../cpu/lapic.h"
+#include "../cpu/smp.h"
 #include "../limine.h"
 #include "utils.h"
-#include "../security/security.h"
-#include "../security/caps.h"
-#include "../crypto/random.h"
 #include <stddef.h>
 
 /* SMP scheduler spinlock — protects task list and current_task */
@@ -27,7 +25,7 @@ extern volatile struct limine_hhdm_request hhdm_request;
 
 /* Boot kernel stack from kernel.c — used as init task's kernel stack */
 extern uint8_t boot_kernel_stack[];
-#define BOOT_KERNEL_STACK_SIZE 8192
+#define BOOT_KERNEL_STACK_SIZE 16384
 
 static struct task* current_task = NULL;
 static struct task* task_list_head = NULL;
@@ -127,10 +125,6 @@ void task_init(void) {
         init_task->shm_attached[i].shmid = -1;
     }
 
-    /* Kernel idle task gets full capabilities */
-    init_task->capabilities = CAP_ALL;
-    init_task->stack_canary = 0; /* No canary for boot task */
-
     current_task = init_task;
     task_list_head = init_task;
     task_list_tail = init_task;
@@ -163,16 +157,23 @@ void create_task(void (*entry_point)(void)) {
     task_init_priority(new_task, PRIO_NORMAL);
 
     /*
-     * BUG FIX: Allocate per-task kernel stack (2 pages = 8KB) via PMM.
+     * BUG FIX: Allocate per-task kernel stack (4 pages = 16KB) via PMM.
      * Each task needs its own kernel stack so TSS.RSP0 can be set
      * per-task on context switch.
+     *
+     * Previously only 2 pages (8 KB) — too thin for deep call chains
+     * (exec → elf_load → vmm_map_page_in) combined with preemptible
+     * syscalls (sti at syscall_handler entry) and the scheduler reaper
+     * (vmm_destroy_address_space 4-level walk). On bare metal the PIT
+     * fires at 1000 Hz and can preempt at the worst moment, pushing RSP
+     * past the 8 KB limit and corrupting the iretq frame → page fault at
+     * a garbage RIP. Linux uses 16 KB minimum for the same reason.
      */
-    uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
-    uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys = (uint64_t)pmm_alloc_contiguous_pages(4);
     uint64_t hhdm_offset = hhdm_request.response->offset;
-    if (kstack_phys1 && kstack_phys2) {
-        /* Use HHDM mapping to access the physical pages */
-        new_task->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    if (kstack_phys) {
+        /* Use HHDM mapping; stack top = base + 16KB */
+        new_task->kernel_stack = kstack_phys + hhdm_offset + (4 * 4096);
     } else {
         /* Fallback: use parent's stack (not ideal but prevents crash) */
         new_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
@@ -259,48 +260,57 @@ struct task* create_user_task(uint8_t* binary_data) {
         return NULL;
     }
 
-    /* 4. Siapkan Stack User Mode (1 page = 4096 byte)
+    /* 4. Siapkan Stack User Mode (4 pages = 16KB)
      *
-     * Setiap user task mendapat alamat stack virtual UNIK agar tidak saling
-     * menimpa. Alamat dimulai dari 0x80000000 dan bertambah 0x10000 (64KB)
-     * per task, memberikan ruang guard page antar stack.
+     * BUG FIX: Sebelumnya hanya 1 page (4KB) — terlalu kecil untuk
+     * desktop.elf yang melakukan rendering, event handling, dan string
+     * operations. Stack overflow menyebabkan page fault di alamat
+     * unmapped → exit_current_task() → desktop mati/restart.
+     *
+     * 16KB memberikan headroom yang aman. Setiap user task mendapat
+     * alamat stack virtual UNIK agar tidak saling menimpa.
      */
+    #define USER_STACK_PAGES 4
     static uint64_t next_user_stack = 0x80000000;
     uint64_t app_stack_virt = next_user_stack;
     next_user_stack += 0x10000; /* 64KB gap antar stack */
-    uint64_t phys_stack = (uint64_t)pmm_alloc_page();
-    if (!phys_stack) {
-        serial_write_string("[ERROR] Failed to allocate user stack!\n");
-        vmm_destroy_address_space(new_pml4);
-        kfree(new_task);
-        return NULL;
-    }
 
-    /* Catat stack page untuk cleanup */
-    if (new_task->user_page_count < 256) {
-        new_task->user_pages[new_task->user_page_count++] = phys_stack;
+    for (int sp = 0; sp < USER_STACK_PAGES; sp++) {
+        uint64_t phys_stack = (uint64_t)pmm_alloc_page();
+        if (!phys_stack) {
+            serial_write_string("[ERROR] Failed to allocate user stack page!\n");
+            vmm_destroy_address_space(new_pml4);
+            kfree(new_task);
+            return NULL;
+        }
+        /* Catat stack page untuk cleanup */
+        if (new_task->user_page_count < 256) {
+            new_task->user_pages[new_task->user_page_count++] = phys_stack;
+        }
+        /* Petakan stack ke address space proses baru (bukan kernel_pml4!) */
+        vmm_map_page_in(new_pml4, app_stack_virt + sp * 4096, phys_stack, 0x07); /* User, RW, Present */
     }
-
-    /* Petakan stack ke address space proses baru (bukan kernel_pml4!) */
-    vmm_map_page_in(new_pml4, app_stack_virt, phys_stack, 0x07); /* User, RW, Present */
 
     /*
-     * BUG FIX: Allocate per-task KERNEL stack (2 pages = 8KB) via PMM.
+     * BUG FIX: Allocate per-task KERNEL stack (4 pages = 16KB) via PMM.
      * When this user task takes an interrupt or syscall, CPU loads
      * TSS.RSP0 as the Ring 0 stack. Each task MUST have its own
      * kernel stack, otherwise concurrent interrupts on different tasks
      * corrupt each other's kernel stack frames.
      *
-     * On QEMU this rarely happens because emulation is single-threaded
-     * and interrupt timing is predictable. On bare metal, PIT fires
-     * at 1000Hz and can interrupt any task at any time.
+     * 16 KB (was 8 KB) gives headroom for deep call chains such as
+     * exec → create_user_task → elf_load → vmm_map_page_in combined
+     * with a timer-driven context switch and the reaper's page-table
+     * teardown loop. On bare metal PIT fires at 1000 Hz and can
+     * preempt at any point; a thin stack gets blown past its limit
+     * and corrupts the iretq frame, producing a page fault at a
+     * garbage RIP in kernel mode.
      */
-    uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
-    uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys = (uint64_t)pmm_alloc_contiguous_pages(4);
     uint64_t hhdm_offset = hhdm_request.response->offset;
-    if (kstack_phys1 && kstack_phys2) {
-        /* Stack grows down, so top = base of second page + PAGE_SIZE */
-        new_task->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    if (kstack_phys) {
+        /* Stack grows down, so top = base + 16KB */
+        new_task->kernel_stack = kstack_phys + hhdm_offset + (4 * 4096);
     } else {
         serial_write_string("[WARN] Could not allocate per-task kernel stack!\n");
         new_task->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
@@ -321,7 +331,7 @@ struct task* create_user_task(uint8_t* binary_data) {
     new_task->regs.rip    = entry_point;
     new_task->regs.cs     = 0x23; /* User Code Selector (Ring 3, RPL=3) */
     new_task->regs.rflags = 0x202;
-    new_task->regs.rsp = (app_stack_virt + 4096 - 16) & ~0xFULL;
+    new_task->regs.rsp = (app_stack_virt + USER_STACK_PAGES * 4096 - 16) & ~0xFULL;
     new_task->regs.ss  = 0x1B; /* User Data Selector (GDT[3], Ring 3, RPL=3) */
     new_task->next = NULL;
 
@@ -332,19 +342,6 @@ struct task* create_user_task(uint8_t* binary_data) {
     } else {
         task_init_priority(new_task, PRIO_NORMAL);
     }
-
-    /*
-     * === CAPABILITIES & SECURITY ===
-     * Shell (first user task, PID 1-2) gets ALL capabilities.
-     * Subsequent tasks get DEFAULT capabilities (no admin, no raw I/O).
-     * Stack canary is set from CSPRNG for overflow detection.
-     */
-    if (new_task->pid <= 2) {
-        new_task->capabilities = CAP_ALL;
-    } else {
-        new_task->capabilities = CAP_DEFAULT;
-    }
-    new_task->stack_canary = security_get_stack_canary();
 
     /* Tambahkan task ke antrean scheduler */
     task_list_tail->next = new_task;
@@ -382,6 +379,22 @@ extern uint64_t kernel_stack_top;
 
 void schedule(struct registers* current_regs) {
     if (!current_task) return;
+
+    /*
+     * SMP SAFETY: Only BSP runs the scheduler.
+     *
+     * current_task, kernel_stack_top (syscall.c), and user_rsp_tmp
+     * (syscall_asm.S) are single global variables. If multiple CPUs
+     * call schedule() concurrently, they corrupt each other's saved
+     * register state and kernel stack pointers, causing triple faults.
+     *
+     * APs return immediately — they continue running their idle (hlt)
+     * loop. Full per-CPU scheduling with swapgs + per-CPU run queues
+     * can be added later.
+     */
+    if (smp_get_cpu_count() > 1 && lapic_get_id() != smp_get_bsp_lapic_id()) {
+        return;
+    }
 
     /* SMP: Try to acquire scheduler lock. If another CPU already holds it,
      * skip this tick (non-blocking). This prevents deadlock if timer fires
@@ -888,11 +901,15 @@ int32_t task_fork(void) {
     child->sleep_until = 0;
     child->wait_target_pid = 0;
 
-    /* Allocate per-task kernel stack for child */
+    /* Allocate per-task kernel stack for child (4 pages = 16 KB).
+     * See create_user_task() for why 8 KB is no longer enough. */
     uint64_t fork_kstack_phys1 = (uint64_t)pmm_alloc_page();
     uint64_t fork_kstack_phys2 = (uint64_t)pmm_alloc_page();
-    if (fork_kstack_phys1 && fork_kstack_phys2) {
-        child->kernel_stack = fork_kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    uint64_t fork_kstack_phys3 = (uint64_t)pmm_alloc_page();
+    uint64_t fork_kstack_phys4 = (uint64_t)pmm_alloc_page();
+    if (fork_kstack_phys1 && fork_kstack_phys2 &&
+        fork_kstack_phys3 && fork_kstack_phys4) {
+        child->kernel_stack = fork_kstack_phys4 + hhdm_offset + PAGE_SIZE;
     } else {
         child->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
     }
@@ -926,10 +943,6 @@ int32_t task_fork(void) {
     child->quantum       = child->quantum_max;
     child->cpu_ticks     = 0;
     child->sleep_count   = 0;
-
-    /* 8b. Inherit parent's capabilities (capped at DEFAULT for children) */
-    child->capabilities = caps_inherit(current_task->capabilities, CAP_DEFAULT);
-    child->stack_canary = security_get_stack_canary();
 
     /* 9. Append child to task list */
     child->next = NULL;
@@ -1098,11 +1111,14 @@ int32_t task_clone(uint64_t entry, uint64_t stack_top) {
     thread->user_page_count = 0;
     for (int i = 0; i < 256; i++) thread->user_pages[i] = 0;
 
-    /* 4. Allocate per-thread kernel stack */
+    /* 4. Allocate per-thread kernel stack (4 pages = 16 KB).
+     * See create_user_task() for why 8 KB is no longer enough. */
     uint64_t kstack_phys1 = (uint64_t)pmm_alloc_page();
     uint64_t kstack_phys2 = (uint64_t)pmm_alloc_page();
-    if (kstack_phys1 && kstack_phys2) {
-        thread->kernel_stack = kstack_phys2 + hhdm_offset + PAGE_SIZE;
+    uint64_t kstack_phys3 = (uint64_t)pmm_alloc_page();
+    uint64_t kstack_phys4 = (uint64_t)pmm_alloc_page();
+    if (kstack_phys1 && kstack_phys2 && kstack_phys3 && kstack_phys4) {
+        thread->kernel_stack = kstack_phys4 + hhdm_offset + PAGE_SIZE;
     } else {
         thread->kernel_stack = (uint64_t)(boot_kernel_stack + BOOT_KERNEL_STACK_SIZE);
     }
@@ -1129,10 +1145,6 @@ int32_t task_clone(uint64_t entry, uint64_t stack_top) {
     thread->sleep_count   = 0;
     thread->sleep_until   = 0;
     thread->wait_target_pid = 0;
-
-    /* 7b. Threads inherit parent's full capabilities (same process) */
-    thread->capabilities = current_task->capabilities;
-    thread->stack_canary = security_get_stack_canary();
 
     /* 8. Increment parent's thread count */
     struct task* leader = task_find_by_pid(current_task->tgid);
@@ -1164,4 +1176,16 @@ uint32_t task_get_thread_count(void) {
     if (!current_task) return 0;
     struct task* leader = task_find_by_pid(current_task->tgid);
     return leader ? leader->thread_count : 1;
+}
+
+void task_set_uid(uint32_t uid, uint32_t gid) {
+    if (current_task) {
+        current_task->uid = uid;
+        current_task->gid = gid;
+    }
+}
+
+uint32_t task_get_uid(void) {
+    if (!current_task) return 0;
+    return current_task->uid;
 }

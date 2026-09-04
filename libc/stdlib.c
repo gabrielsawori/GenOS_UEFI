@@ -75,3 +75,9 @@ int cache_get_stats(cache_stats_t* out) {
 int fork(void) {
     return (int)syscall(22, 0, 0, 0);
 }
+
+/* === Timer (syscall 33) === */
+
+uint64_t get_ticks(void) {
+    return syscall(33, 0, 0, 0);
+}
