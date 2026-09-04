@@ -174,9 +174,12 @@ isr_common:
     pop %rsi
     pop %rdi
 
-    /* Force kernel mode: CS=0x08, SS=0x10 */
+    /* Force kernel mode: CS=0x08, SS=0x10, DS/ES=0x10 */
     movw $0x08, 16(%rsp)
     movw $0x10, 40(%rsp)
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
     jmp .Lcs_done
 
 .Lcs_kernel:
@@ -184,13 +187,26 @@ isr_common:
      * If SS were 0x1B (user data, DPL=3), iretq to CPL=0 would
      * #GP(0x18) because SS.DPL(3) != target CPL(0). */
     movw $0x10, 40(%rsp)
+    /* Ensure DS/ES are kernel data too */
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
     jmp .Lcs_done
 
 .Lcs_user:
     /* CS=0x23 (user): SS MUST be 0x1B. Force it.
      * If SS were 0x10 (kernel data, DPL=0), iretq to CPL=3 would
-     * #GP because SS.DPL(0) != target CPL(3). */
+     * #GP because SS.DPL(0) != target CPL(3).
+     *
+     * BUG FIX: Also set DS/ES to user data selector (0x1B).
+     * iretq only restores CS and SS — DS, ES remain whatever
+     * the kernel left them as (0x10 = DPL 0). In 64-bit mode
+     * this is mostly harmless, but some instructions check
+     * segment DPL and can #GP if DS/ES have DPL < CPL. */
     movw $0x1B, 40(%rsp)
+    mov $0x1B, %ax
+    mov %ax, %ds
+    mov %ax, %es
 
 .Lcs_done:
     pop %rax

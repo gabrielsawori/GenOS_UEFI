@@ -77,10 +77,17 @@ void fb_print(const char *str, size_t x, size_t y, uint32_t fg, uint32_t bg, int
  * fb_draw_pixel() sudah meng-handle clipping di luar batas layar.
  */
 void fb_fill_rect(size_t x, size_t y, size_t w, size_t h, uint32_t color) {
+    if (!fb) return;
+    /* Clamp to screen bounds ONCE (no per-pixel check) */
+    if (x >= fb->width || y >= fb->height) return;
+    if (x + w > fb->width)  w = fb->width - x;
+    if (y + h > fb->height) h = fb->height - y;
+
+    uint32_t pitch_px = fb->pitch / 4;
     for (size_t dy = 0; dy < h; dy++) {
-        for (size_t dx = 0; dx < w; dx++) {
-            fb_draw_pixel(x + dx, y + dy, color);
-        }
+        uint32_t* row = fb_ptr + (y + dy) * pitch_px + x;
+        for (size_t dx = 0; dx < w; dx++)
+            row[dx] = color;
     }
 }
 
@@ -215,6 +222,28 @@ void cursor_hide(void) {
 void cursor_show(void) {
     if (!fb || cursor_visible) return;
     cursor_save_bg(cursor_x, cursor_y);
+    cursor_draw_at(cursor_x, cursor_y);
+    cursor_visible = 1;
+}
+
+/*
+ * cursor_force_redraw() — Force cursor redraw after framebuffer overwrite.
+ *
+ * When flush_screen() copies the back-buffer to the framebuffer, it
+ * overwrites the cursor pixels. This function re-captures the NEW
+ * background (from the freshly blitted content) and redraws the cursor
+ * sprite on top.
+ *
+ * Without this, the cursor is invisible on bare metal because:
+ *   1. flush_screen() memcpy → cursor erased
+ *   2. cursor_update() sees same position → skips (no-op)
+ *   3. Next frame → same thing → cursor never visible
+ */
+void cursor_force_redraw(void) {
+    if (!fb || cursor_x < 0) return;
+    /* Re-save background from the NEWLY flushed content */
+    cursor_save_bg(cursor_x, cursor_y);
+    /* Draw cursor sprite on top */
     cursor_draw_at(cursor_x, cursor_y);
     cursor_visible = 1;
 }

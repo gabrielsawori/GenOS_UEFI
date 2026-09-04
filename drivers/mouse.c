@@ -66,6 +66,11 @@
 static uint8_t  packet_cycle = 0;        /* 0..2: byte ke berapa yang ditunggu */
 static uint8_t  packet[MOUSE_PACKET_LEN]; /* Buffer paket sementara */
 
+/* === Diagnostic counters (lihat dokumentasi di mouse.h) === */
+static uint32_t irq_count   = 0;  /* Byte yang diterima IRQ12 */
+static uint32_t pkt_count   = 0;  /* Paket 3-byte lengkap */
+static uint32_t sync_drops  = 0;  /* Byte yang dibuang (mis-sync) */
+
 /* === Global mouse state (dibaca user-space via syscall) === */
 static mouse_state_t mouse_state = {
     .x = 0, .y = 0, .buttons = 0, .changed = 0
@@ -81,15 +86,15 @@ static uint32_t screen_height = 768;
 
 /* Tunggu sampai input buffer kosong (siap menerima command/data) */
 static void mouse_wait_write(void) {
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 500000; i++) {
         if (!(inb(0x64) & STATUS_IN_BUF_FULL)) return;
         io_wait();
     }
 }
 
-/* Tunggu sampai output buffer penuh (data siap dibaca) */
+/* Tunggu sampai output buffer penuh (data siap dibaca). */
 static void mouse_wait_read(void) {
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 500000; i++) {
         if (inb(0x64) & STATUS_OUT_BUF_FULL) return;
         io_wait();
     }
@@ -101,9 +106,10 @@ static void mouse_send_cmd(uint8_t cmd) {
     outb(0x64, CMD_WRITE_AUX);
     mouse_wait_write();
     outb(0x60, cmd);
-    /* Konsumsi ACK (0xFA) dari mouse */
-    mouse_wait_read();
-    inb(0x60);
+    /* Konsumsi ACK (0xFA) hanya jika tersedia, cegah hang */
+    if (inb(0x64) & STATUS_OUT_BUF_FULL) {
+        inb(0x60);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,12 +119,21 @@ static void mouse_send_cmd(uint8_t cmd) {
 void mouse_init(void) {
     serial_write_string("[INFO] Menginisialisasi mouse PS/2...\n");
 
+    /* 0. Disable keyboard and aux during initialization to prevent buffer corruption */
+    mouse_wait_write(); outb(0x64, 0xAD); /* Disable keyboard */
+    mouse_wait_write(); outb(0x64, 0xA7); /* Disable aux */
+
+    /* Flush output buffer (buang data sisa) */
+    for (int i = 0; i < 50; i++) {
+        if (inb(0x64) & STATUS_OUT_BUF_FULL) {
+            inb(0x60);
+        }
+        io_wait();
+    }
+
     /* 1. Enable auxiliary port (mouse port pada controller) */
     mouse_wait_write();
     outb(0x64, CMD_ENABLE_AUX);
-    /* Konsumsi ACK/response */
-    mouse_wait_read();
-    inb(0x60);
 
     /* 2. Baca Controller Configuration Byte */
     mouse_wait_write();
@@ -128,11 +143,7 @@ void mouse_init(void) {
 
     /* 3. Set bit aux interrupt enable. CLEAR aux clock disable bit.
      *    bit1 (CCB_SECOND_PORT_INT) = 1 → enable IRQ12 mouse
-     *    bit5 (CCB_SECOND_CLK)      = 0 → enable clock (0 = enabled!)
-     *
-     * BUG FIX: CCB bit 5 is "disable aux clock". Setting it DISABLES
-     * the mouse! Must be cleared. QEMU ignores this but bare metal
-     * strictly follows the spec. */
+     *    bit5 (CCB_SECOND_CLK)      = 0 → enable clock (0 = enabled!) */
     config |= CCB_SECOND_PORT_INT;   /* Enable IRQ12 */
     config &= ~CCB_SECOND_CLK;       /* Enable clock (clear = enable) */
 
@@ -142,16 +153,24 @@ void mouse_init(void) {
     mouse_wait_write();
     outb(0x60, config);
 
-    /* 5. Reset mouse device (0xFF) — required on some bare metal.
-     * Mouse runs self-test and responds 0xFA (ACK), 0xAA (pass), 0x00 (ID). */
-    mouse_send_cmd(0xFF);
-    /* Wait for self-test completion bytes (0xAA, 0x00) */
-    mouse_wait_read(); inb(0x60); /* 0xAA */
-    mouse_wait_read(); inb(0x60); /* 0x00 */
+    /* Re-enable keyboard (karena kita disable di awal) */
+    mouse_wait_write(); outb(0x64, 0xAE);
 
-    /* 6. Set sample rate to 100 (standard) */
-    mouse_send_cmd(0xF3); /* Set sample rate command */
-    mouse_send_cmd(100);  /* 100 samples/sec */
+    /* 5. Reset mouse device (0xFF). Flush sisa byte tanpa blocking lama. */
+    mouse_send_cmd(0xFF);
+    for (int i = 0; i < 10; i++) {
+        if (inb(0x64) & STATUS_OUT_BUF_FULL) inb(0x60);
+        io_wait();
+    }
+
+    /* 6. IntelliMouse wheel extension (membantu kompatibilitas touchpad) */
+    mouse_send_cmd(0xF3); mouse_send_cmd(200);
+    mouse_send_cmd(0xF3); mouse_send_cmd(100);
+    mouse_send_cmd(0xF3); mouse_send_cmd(80);
+
+    /* Set sample rate to 100 (standard) */
+    mouse_send_cmd(0xF3);
+    mouse_send_cmd(100);
 
     /* 7. Kirim 0xF4 ke mouse: enable data stream reporting */
     mouse_send_cmd(MOUSE_CMD_ENABLE);
@@ -164,14 +183,14 @@ void mouse_init(void) {
         io_wait();
     }
 
-    /* 7. Reset state machine paket */
+    /* 9. Reset state machine paket */
     packet_cycle = 0;
     mouse_state.x = (int32_t)(screen_width / 2);
     mouse_state.y = (int32_t)(screen_height / 2);
     mouse_state.buttons = 0;
     mouse_state.changed = 0;
 
-    /* 8. Enable interrupt: cascade master→slave (IRQ2) + mouse (IRQ12) */
+    /* 10. Enable interrupt: cascade master→slave (IRQ2) + mouse (IRQ12) */
     pic_unmask_irq(2);    /* Master IRQ2 = cascade ke slave PIC */
     pic_unmask_irq(12);   /* Slave IRQ4 (= IRQ12 global) = mouse */
 
@@ -196,12 +215,15 @@ mouse_state_t* mouse_get_state(void) {
 /* ------------------------------------------------------------------ */
 
 void mouse_handler(uint8_t data) {
+    irq_count++;  /* Diagnostic: setiap byte dari IRQ12 dihitung */
+
     /*
      * Sinkronisasi: byte pertama paket selalu punya bit 3 = 1 (reserved/always 1).
      * Jika kita belum di byte 0 tapi data ini bukan byte-awal valid, reset state
      * machine untuk hindari misalignment (mis. setelah IRQ hilang).
      */
     if (packet_cycle == 0 && !(data & 0x08)) {
+        sync_drops++;  /* Diagnostic: byte dibuang karena mis-sync */
         return; /* Bukan byte awal yang valid, buang */
     }
 
@@ -214,14 +236,29 @@ void mouse_handler(uint8_t data) {
 
     /* Paket lengkap (3 byte). Reset cycle untuk paket berikutnya. */
     packet_cycle = 0;
+    pkt_count++;  /* Diagnostic: paket lengkap berhasil diproses */
+
+    /* DEBUG: Log setiap 10 paket agar serial tidak flooding */
+    if (pkt_count % 10 == 0) {
+        serial_write_string("[DEBUG] Mouse: 10 packets received\n");
+    }
 
     uint8_t flags  = packet[0];
+
+
     int16_t dx     = (int16_t)(int8_t)packet[1];  /* sign-extend delta X */
     int16_t dy     = (int16_t)(int8_t)packet[2];  /* sign-extend delta Y */
 
-    /* Apply delta ke posisi absolut, clamp ke [0, width/height] */
+    /* Apply delta ke posisi absolut, clamp ke [0, width/height].
+     *
+     * BUG FIX (Bare Metal): PS/2 mouse spec: delta Y positif = ke ATAS.
+     * Tapi framebuffer Y positif = ke BAWAH. Harus negate dy.
+     * QEMU kadang meng-invert Y secara internal sehingga bug ini
+     * tidak terlihat di emulator, tapi bare metal/touchpad mengikuti
+     * spesifikasi PS/2 secara ketat.
+     */
     int32_t nx = mouse_state.x + dx;
-    int32_t ny = mouse_state.y + dy;
+    int32_t ny = mouse_state.y - dy;  /* NEGATE: PS/2 Y↑ → screen Y↓ */
 
     if (nx < 0) nx = 0;
     if (nx >= (int32_t)screen_width)  nx = (int32_t)screen_width - 1;
@@ -233,3 +270,8 @@ void mouse_handler(uint8_t data) {
     mouse_state.buttons = flags & 0x07;  /* Hanya 3 bit tombol */
     mouse_state.changed = 1;
 }
+
+/* === Diagnostic getters (lihat dokumentasi di mouse.h) === */
+uint32_t mouse_get_irq_count(void)  { return irq_count; }
+uint32_t mouse_get_pkt_count(void)  { return pkt_count; }
+uint32_t mouse_get_sync_drops(void) { return sync_drops; }

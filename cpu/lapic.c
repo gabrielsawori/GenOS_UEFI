@@ -46,6 +46,8 @@ static inline uint32_t lapic_read(uint32_t reg) {
 /*
  * lapic_init() — Enable the Local APIC on the current CPU.
  */
+extern uint32_t smp_get_bsp_lapic_id(void);
+
 void lapic_init(void) {
     if (lapic_base_virt == 0) {
         /* First call: compute virtual address from HHDM */
@@ -60,6 +62,16 @@ void lapic_init(void) {
 
     /* Set task priority to 0 (accept all interrupts) */
     lapic_write(LAPIC_TPR, 0);
+    
+    /* BUG FIX (Bare Metal): Route legacy 8259 PIC interrupts to the BSP.
+     * When LAPIC is enabled, it takes over interrupt routing. If LINT0 
+     * is not configured as ExtINT, PIC interrupts (like the mouse on IRQ12)
+     * will be dropped. Keyboard (IRQ1) might sometimes work if BIOS left it
+     * routed, but IRQ12 typically fails. */
+    if (lapic_get_id() == smp_get_bsp_lapic_id()) {
+        lapic_write(0x350, 0x00000700); /* LINT0: Delivery Mode = ExtINT, Unmasked */
+        lapic_write(0x360, 0x00000400); /* LINT1: Delivery Mode = NMI, Unmasked */
+    }
 }
 
 /*

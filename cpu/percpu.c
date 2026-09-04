@@ -40,7 +40,7 @@ static void install_tss_in_gdt(uint64_t* gdt, struct tss* tss_ptr) {
     uint32_t base_high = tss_base >> 32;
 
     gdt[5] = (tss_limit & 0xFFFF) |
-             ((base_low & 0xFFFFFF) << 16) |
+             ((uint64_t)(base_low & 0xFFFFFF) << 16) |
              (0x89ULL << 40) |
              (((uint64_t)((tss_limit >> 16) & 0xF)) << 48) |
              (((uint64_t)(base_low >> 24)) << 56);
@@ -123,4 +123,9 @@ void percpu_set_kernel_stack(uint32_t cpu_id, uint64_t stack_top) {
     if (cpu_id >= MAX_CPUS) return;
     percpu[cpu_id].tss.rsp0 = stack_top;
     percpu[cpu_id].kernel_stack_top = stack_top;
+}
+
+void percpu_set_ist1(uint32_t cpu_id, uint64_t ist_stack) {
+    if (cpu_id >= MAX_CPUS) return;
+    percpu[cpu_id].tss.ist1 = ist_stack;
 }

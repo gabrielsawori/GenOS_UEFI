@@ -335,6 +335,53 @@ static void handle_gpf(struct registers *regs) {
 }
 
 /*
+ * handle_double_fault() - Handler khusus untuk Double Fault (#DF, INT 8).
+ *
+ * Double Fault terjadi saat CPU menemui exception saat mencoba memanggil
+ * exception handler sebelumnya — paling sering karena kernel stack overflow
+ * atau corrupt. Tanpa IST, #DF mencoba pakai stack yang sama yang sudah
+ * rusak, lalu Triple Fault (reboot diam-diameter, tanpa diagnostik).
+ *
+ * Berkat IST1 (di-set di kernel.c), CPU memuat RSP dari TSS.ist1 yang masih
+ * utuh saat #DF fire, sehingga handler ini bisa berjalan dan mencetak
+ * diagnostik. Karena ini kondisi fatal yang tidak bisa di-recover, handler
+ * menghentikan CPU.
+ *
+ * Error code untuk #DF selalu 0 (zero error code), jadi tidak banyak info
+ * tambahan — RIP dan RSP dari regs adalah petunjuk utama.
+ */
+static void handle_double_fault(struct registers *regs) {
+    serial_write_string("\n========== DOUBLE FAULT (#DF, INT 8) ==========\n");
+    serial_write_string("  Penyebab kemungkinan: kernel stack overflow/corrupt\n");
+    print_hex_serial("RIP (Instruction)  ", regs->rip);
+    print_hex_serial("RSP (Stack Pointer)", regs->rsp);
+    print_hex_serial("CS  (Code Segment) ", regs->cs);
+    print_hex_serial("SS  (Stack Segment)", regs->ss);
+    print_hex_serial("RFLAGS             ", regs->rflags);
+    print_hex_serial("Error Code         ", regs->err_code);
+    serial_write_string("  Current PID: ");
+    char pid_buf[16];
+    itoa(get_current_pid(), pid_buf, 10);
+    serial_write_string(pid_buf);
+    serial_write_string("\n================================================\n");
+
+    /* Output ke layar */
+    size_t y = 200;
+    fb_print("======== DOUBLE FAULT (KERNEL STACK OVERFLOW?) ========", 50, y, 0xFF0000, 0x002244, 2);
+    y += 28;
+    print_hex_fb("RIP: ", regs->rip, 50, y, 0xFF8800);
+    y += 24;
+    print_hex_fb("RSP: ", regs->rsp, 50, y, 0xFF8800);
+    y += 24;
+    print_hex_fb("PID: ", (uint64_t)get_current_pid(), 50, y, 0xFF8800);
+    y += 24;
+    fb_print("Sistem dihentikan. Lihat serial log untuk detail.", 50, y, 0xFFFF00, 0x002244, 2);
+
+    asm volatile ("cli");
+    for (;;) { asm volatile ("hlt"); }
+}
+
+/*
  * isr_handler() - Dispatcher utama interrupt & exception.
  *
  * Fungsi ini dipanggil oleh isr_common (assembly) setiap kali CPU menerima
@@ -364,6 +411,12 @@ void isr_handler(struct registers *regs) {
              * - Kernel fault (cli+hlt inside handler, won't reach here)
              * So if we reach here, it was a CoW success — just return. */
             return;
+        }
+
+        /* INT 8: Double Fault — punya IST1 dedicated stack (di-set di kernel.c) */
+        if (regs->int_no == 8) {
+            handle_double_fault(regs);
+            /* handle_double_fault tidak kembali (cli; hlt loop) */
         }
 
         /* All other exceptions are fatal */

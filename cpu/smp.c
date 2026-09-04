@@ -314,15 +314,14 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
 
         /* === BOOT THIS AP === */
 
-        /* Allocate 8KB stack (2 pages) for this AP */
-        uint64_t sphys1 = (uint64_t)pmm_alloc_page();
-        uint64_t sphys2 = (uint64_t)pmm_alloc_page();
-        if (!sphys1 || !sphys2) {
+        /* Allocate 8KB contiguous stack (2 pages) for this AP */
+        uint64_t sphys = (uint64_t)pmm_alloc_contiguous_pages(2);
+        if (!sphys) {
             serial_write_string(" [AP, NO MEMORY — skipped]\n");
             continue;
         }
-        /* Stack grows down: top = end of second page */
-        uint64_t stack_top = sphys2 + hhdm_off + 4096;
+        /* Stack grows down: top = base + 8KB */
+        uint64_t stack_top = sphys + hhdm_off + (2 * 4096);
 
         /* Prepare boot data */
         ap_boot_data[i].stack_top  = stack_top;
@@ -408,6 +407,14 @@ uint8_t smp_get_apic_id(void) {
 
 struct cpu_info* smp_get_cpus(void) {
     return cpus;
+}
+
+uint32_t smp_get_current_cpu_id(void) {
+    uint32_t lid = lapic_get_id();
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        if (cpus[i].apic_id == lid) return i;
+    }
+    return 0;
 }
 
 uint32_t smp_get_bsp_lapic_id(void) {

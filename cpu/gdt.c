@@ -40,7 +40,20 @@ void gdt_init(void) {
     uint32_t base_low = tss_base & 0xFFFFFFFF;
     uint32_t base_high = tss_base >> 32;
 
-    gdt[5] = (tss_limit & 0xFFFF) | ((base_low & 0xFFFFFF) << 16) |
+    /*
+     * BUG FIX: Cast base_low to uint64_t before shifting.
+     *
+     * (base_low & 0xFFFFFF) can be up to 24 bits. Shifting left by 16
+     * produces up to 40 bits, which overflows uint32_t (32 bits).
+     * When tss_entry is at an address where bits 16-23 of the low
+     * 32 bits are non-zero (e.g., 0x80014ca0 → 0x014ca0), the top
+     * bits are silently truncated, causing TSS base to be wrong.
+     *
+     * This made every Ring 3→0 stack switch read RSP0 from garbage
+     * memory → #SS → #DF → triple fault on the first interrupt
+     * while running user-mode code.
+     */
+    gdt[5] = (tss_limit & 0xFFFF) | ((uint64_t)(base_low & 0xFFFFFF) << 16) |
              (0x89ULL << 40) | (((uint64_t)((tss_limit >> 16) & 0xF)) << 48) |
              (((uint64_t)(base_low >> 24)) << 56);
     gdt[6] = base_high;
@@ -58,6 +71,10 @@ void gdt_init(void) {
 
 void set_kernel_stack(uint64_t stack) {
     tss_entry.rsp0 = stack;
+}
+
+void gdt_set_ist1(uint64_t ist_stack) {
+    tss_entry.ist1 = ist_stack;
 }
 
 void gdt_load_on_ap(void) {

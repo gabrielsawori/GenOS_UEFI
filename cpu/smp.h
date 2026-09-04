@@ -57,6 +57,9 @@ uint8_t smp_get_apic_id(void);
 /* Get CPU info array */
 struct cpu_info* smp_get_cpus(void);
 
+/* Get current CPU index */
+uint32_t smp_get_current_cpu_id(void);
+
 /* Get BSP's LAPIC ID */
 uint32_t smp_get_bsp_lapic_id(void);
 

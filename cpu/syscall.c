@@ -8,6 +8,7 @@
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
+#include "../mm/vmm.h"
 #include "../kernel/task.h"
 #include "../kernel/utils.h"
 #include "../fs/tar.h"
@@ -15,11 +16,11 @@
 #include "../fs/cache.h"
 #include "../mm/shm.h"
 #include "../crypto/sha256.h"
-#include "../crypto/random.h"
-#include "../crypto/hmac.h"
 #include "../crypto/aes.h"
-#include "../security/security.h"
-#include "../security/caps.h"
+#include "../crypto/hmac.h"
+#include "../crypto/random.h"
+#include "../security/cred.h"
+#include "../security/keystore.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -28,8 +29,37 @@
 
 extern void syscall_entry(void);
 extern struct limine_framebuffer *fb;
+extern volatile struct limine_hhdm_request hhdm_request;
 
 uint64_t kernel_stack_top = 0;
+
+/*
+ * Framebuffer back-buffer page tracking (separate from user_pages[]).
+ * Tracked here to avoid bloating struct task (which caused kmalloc
+ * failures and triple faults on bare metal). Only one back-buffer
+ * can exist at a time. Pages are reused if map_framebuffer is called
+ * again by the same or different process.
+ */
+/*
+ * FB_MAX_PAGES: Maximum number of 4 KB pages we can allocate for the
+ * framebuffer back-buffer.
+ *
+ * BUG FIX (Bare Metal): Previously 1024 (4 MB), which silently truncated
+ * the buffer on screens larger than ~1366×768. On bare metal resolutions
+ * like 1920×1080 (2025 pages) or 4K 3840×2160 (8100 pages), the truncated
+ * buffer left the upper portion unmapped. Userspace (desktop.c) and
+ * syscall 35 (flush_screen) then read/wrote unmapped memory, corrupting
+ * the kernel iretq frame and causing a page-fault at a garbage RIP
+ * (RIP==CR2, error 0x10, kernel mode) — exactly the crash users saw
+ * when launching `desktop` on a real PC.
+ *
+ * 8192 pages = 32 MB, comfortably covers 4K UHD (8100 pages) with margin.
+ * The fb_phys_pages[] array grows in BSS (8192 × 8 B = 64 KB), acceptable.
+ */
+#define FB_MAX_PAGES 8192
+static uint64_t fb_phys_pages[FB_MAX_PAGES];
+static uint32_t fb_phys_count = 0;
+static uint64_t fb_mapped_va = 0;   /* 0 = not yet mapped */
 
 /*
  * in_syscall flag: DEPRECATED for scheduling purposes.
@@ -84,11 +114,15 @@ void syscall_init(void) {
     serial_write_string("[INFO] Membangun Pintu Gerbang System Call...\n");
 
     /*
-     * BUG FIX: Allocate syscall kernel stack via PMM (2 pages = 8KB)
+     * BUG FIX: Allocate syscall kernel stack via PMM (4 pages = 16KB)
      * instead of kmalloc(4096). This ensures:
-     *   1. Larger stack for complex syscalls (fork, exec)
+     *   1. Larger stack for complex syscalls (fork, exec, map_framebuffer)
      *   2. Physical page alignment (no heap header misalignment)
-     *   3. Consistent with per-task kernel stack scheme
+     *   3. Consistent with the 16 KB per-task kernel stack scheme
+     *
+     * Was 2 pages (8 KB) — too thin when a timer IRQ preempts a deep
+     * syscall call chain on bare metal (PIT @ 1000 Hz), causing RSP to
+     * overshoot the stack and corrupt the iretq frame.
      *
      * Note: This stack is used by syscall_entry (via kernel_stack_top)
      * and also set as TSS.RSP0. Per-task kernel stacks in schedule()
@@ -96,15 +130,14 @@ void syscall_init(void) {
      */
     extern volatile struct limine_hhdm_request hhdm_request;
     uint64_t hhdm_off = hhdm_request.response->offset;
-    uint64_t phys1 = (uint64_t)pmm_alloc_page();
-    uint64_t phys2 = (uint64_t)pmm_alloc_page();
-    if (!phys1 || !phys2) {
+    uint64_t phys = (uint64_t)pmm_alloc_contiguous_pages(4);
+    if (!phys) {
         serial_write_string("[FATAL] Cannot allocate syscall kernel stack!\n");
         asm volatile ("cli");
         for (;;) asm volatile ("hlt");
     }
-    /* Stack grows down: top = end of second page (via HHDM) */
-    kernel_stack_top = phys2 + hhdm_off + 4096;
+    /* Stack grows down: top = base + 16KB */
+    kernel_stack_top = phys + hhdm_off + (4 * 4096);
     set_kernel_stack(kernel_stack_top);
 
     /* Aktifkan syscall MSRs pada BSP. AP mengaktifkannya sendiri di ap_entry(). */
@@ -118,9 +151,9 @@ void syscall_init(void) {
     serial_write_string("            21=cache_stats 22=fork\n");
     serial_write_string("            23=write 24=create 25=unlink\n");
     serial_write_string("            26=nice 27=sched_info\n");
-    serial_write_string("            28=clone 29=thread_count 30=read_mouse\n");
-    serial_write_string("            31=sha256 32=random 33=hmac\n");
-    serial_write_string("            34=encrypt 35=decrypt 36=get_caps\n");
+    serial_write_string("            28=clone 29=thread_count\n");
+    serial_write_string("            37=random 38=sha256 39=aes_enc 40=aes_dec\n");
+    serial_write_string("            41=login 42=whoami 43=chmod 44=keystore\n");
 
     /* Initialize VFS layer */
     vfs_init();
@@ -231,11 +264,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Bersihkan seluruh layar framebuffer dengan warna background.
      * ================================================================ */
     case 5: {
-        for (size_t y = 0; y < fb->height; y++) {
-            for (size_t x = 0; x < fb->width; x++) {
-                fb_draw_pixel(x, y, 0x002244);
-            }
-        }
+        fb_fill_rect(0, 0, fb->width, fb->height, 0x002244);
+        cursor_force_redraw();
         result = 0;
         break;
     }
@@ -646,145 +676,351 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     }
 
     /* ================================================================
-     * SYSCALL 31: sha256(void* data, uint64_t len, uint8_t* out_hash)
-     * Hitung SHA-256 hash dari data di user-space.
-     * out_hash harus menunjuk ke buffer minimal 32 byte.
-     * Return: 0 = sukses, -1 = error (NULL pointer atau no CAP_CRYPTO).
+     * SYSCALL 31: get_screen_info(uint32_t* out)
+     * Return screen width and height to user-space.
+     * out[0] = width, out[1] = height.
+     * Return: 0 = success, -1 = error.
      * ================================================================ */
     case 31: {
-        uint8_t* data = (uint8_t*)arg1;
-        size_t len = (size_t)arg2;
-        uint8_t* out_hash = (uint8_t*)arg3;
-        if (!validate_user_ptr(data) || !validate_user_ptr(out_hash)) {
-            result = (uint64_t)-1; break;
-        }
-        sha256_hash(data, len, out_hash);
+        uint32_t* out = (uint32_t*)arg1;
+        if (!out || !fb) { result = (uint64_t)-1; break; }
+        out[0] = (uint32_t)fb->width;
+        out[1] = (uint32_t)fb->height;
         result = 0;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 32: random(uint8_t* buf, uint64_t len)
-     * Isi buffer user-space dengan random bytes dari CSPRNG.
-     * Return: 0 = sukses, -1 = error.
+     * SYSCALL 32: draw_pixel((x<<32)|y, color)
+     * Draw a single pixel at (x, y) with the given color.
+     * Return: 0.
      * ================================================================ */
     case 32: {
-        uint8_t* buf = (uint8_t*)arg1;
-        size_t len = (size_t)arg2;
-        if (!validate_user_buffer(buf, len)) {
-            result = (uint64_t)-1; break;
-        }
-        csprng_get_bytes(buf, len);
+        uint32_t x = (uint32_t)(arg1 >> 32);
+        uint32_t y = (uint32_t)(arg1 & 0xFFFFFFFF);
+        uint32_t color = (uint32_t)arg2;
+        fb_draw_pixel(x, y, color);
         result = 0;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 33: hmac(void* key_and_data, uint64_t key_len, uint64_t data_len)
-     * Hitung HMAC-SHA256.
-     * arg1 = pointer ke struct { key_ptr, data_ptr, out_ptr }
-     *        (packed sebagai 3 uint64_t berurutan di user memory)
-     * arg2 = key_len
-     * arg3 = data_len
-     *
-     * Layout memory arg1: [uint64_t key_ptr][uint64_t data_ptr][uint64_t out_ptr]
-     * Return: 0 = sukses, -1 = error.
+     * SYSCALL 33: get_ticks(void)
+     * Return current timer tick count (for clock/timing).
      * ================================================================ */
     case 33: {
-        uint64_t* ptrs = (uint64_t*)arg1;
-        if (!validate_user_buffer(ptrs, 24)) {
-            result = (uint64_t)-1; break;
-        }
-        uint8_t* key = (uint8_t*)ptrs[0];
-        uint8_t* data = (uint8_t*)ptrs[1];
-        uint8_t* out = (uint8_t*)ptrs[2];
-        size_t key_len = (size_t)arg2;
-        size_t data_len = (size_t)arg3;
-        if (!validate_user_buffer(key, key_len) ||
-            !validate_user_buffer(data, data_len) ||
-            !validate_user_buffer(out, 32)) {
-            result = (uint64_t)-1; break;
-        }
-        hmac_sha256(key, key_len, data, data_len, out);
-        result = 0;
+        result = timer_get_ticks();
         break;
     }
 
     /* ================================================================
-     * SYSCALL 34: encrypt(void* params, uint64_t unused1, uint64_t unused2)
-     * AES-256-CBC encrypt data in-place.
-     * arg1 = pointer ke struct:
-     *   [uint64_t key_ptr][uint64_t iv_ptr][uint64_t buf_ptr][uint64_t len]
-     * Data di buf_ptr harus sudah di-pad ke kelipatan 16 byte.
-     * Return: 0 = sukses, -1 = error.
+     * SYSCALL 34: map_framebuffer(void)
+     * Allocate a back-buffer the same size as the screen and map it
+     * into the calling task's address space at 0x70000000.
+     * User-space can then write pixels directly to this buffer
+     * without any syscalls, achieving near-native rendering speed.
+     * Return: virtual address of buffer, or 0 on failure.
      * ================================================================ */
     case 34: {
-        uint64_t* params = (uint64_t*)arg1;
-        if (!validate_user_buffer(params, 32)) {
-            result = (uint64_t)-1; break;
+        if (!fb) { result = 0; break; }
+
+        uint64_t* pml4 = task_get_current_pml4();
+        if (!pml4) { result = 0; break; }
+
+        uint64_t base_va = 0x70000000ULL;
+        uint32_t w = (uint32_t)fb->width;
+        uint32_t h = (uint32_t)fb->height;
+        uint64_t buf_size = (uint64_t)w * h * 4;
+        uint32_t pages_needed = (uint32_t)((buf_size + 4095) / 4096);
+
+        serial_write_string("[MAPFB] Resolution: ");
+        char num[16];
+        itoa(w, num, 10); serial_write_string(num);
+        serial_write_string("x");
+        itoa(h, num, 10); serial_write_string(num);
+        serial_write_string(" Pages: ");
+        itoa(pages_needed, num, 10); serial_write_string(num);
+        serial_write_string("\n");
+
+        if (pages_needed > FB_MAX_PAGES) {
+            serial_write_string("[MAPFB] FATAL: Too large!\n");
+            result = 0;
+            break;
         }
-        uint8_t* key = (uint8_t*)params[0];
-        uint8_t* iv = (uint8_t*)params[1];
-        uint8_t* buf = (uint8_t*)params[2];
-        size_t len = (size_t)params[3];
-        if (!validate_user_buffer(key, 32) ||
-            !validate_user_buffer(iv, 16) ||
-            !validate_user_buffer(buf, len) ||
-            len % 16 != 0) {
-            result = (uint64_t)-1; break;
+
+        /*
+         * Disable interrupts for the ENTIRE allocation.
+         * With O(1) PMM allocator, even 2000+ pages takes ~2ms.
+         * The batched cli/sti approach was causing race conditions
+         * where the scheduler could preempt between batches and
+         * corrupt state, causing crash on first boot.
+         */
+        asm volatile ("cli");
+
+        /* If pages already allocated (re-entry), just re-map */
+        if (fb_phys_count > 0 && fb_phys_count == pages_needed) {
+            for (uint32_t i = 0; i < fb_phys_count; i++)
+                vmm_map_page_in(pml4, base_va + (uint64_t)i * 4096, fb_phys_pages[i], 0x07);
+            fb_mapped_va = base_va;
+            asm volatile ("sti");
+            result = base_va;
+            break;
         }
-        aes256_ctx_t aes_ctx;
-        aes256_init(&aes_ctx, key);
-        aes256_cbc_encrypt(&aes_ctx, iv, buf, len);
-        secure_memzero(&aes_ctx, sizeof(aes_ctx));
-        result = 0;
+
+        /* Allocate pages and map them */
+        uint64_t hhdm_off = hhdm_request.response->offset;
+        int alloc_ok = 1;
+
+        for (uint32_t i = 0; i < pages_needed; i++) {
+            uint64_t phys = (uint64_t)pmm_alloc_page();
+            if (!phys) {
+                serial_write_string("[MAPFB] OOM!\n");
+                alloc_ok = 0;
+                break;
+            }
+            /* Zero the page via HHDM (use 64-bit writes for speed) */
+            uint64_t* page_ptr = (uint64_t*)(phys + hhdm_off);
+            for (int z = 0; z < 512; z++) page_ptr[z] = 0;
+
+            vmm_map_page_in(pml4, base_va + (uint64_t)i * 4096, phys, 0x07);
+            fb_phys_pages[i] = phys;
+            fb_phys_count = i + 1;
+        }
+
+        asm volatile ("sti");
+
+        if (!alloc_ok) {
+            result = 0;
+            break;
+        }
+
+        fb_mapped_va = base_va;
+        serial_write_string("[MAPFB] OK\n");
+        result = base_va;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 35: decrypt(void* params, uint64_t unused1, uint64_t unused2)
-     * AES-256-CBC decrypt data in-place.
-     * Same parameter layout as syscall 34.
-     * Return: 0 = sukses, -1 = error.
+     * SYSCALL 35: flush_screen(void)
+     * Copy the user's back-buffer (at 0x70000000) to the real
+     * framebuffer. Since the user's PML4 is active during syscall,
+     * we can read directly from the user virtual address.
+     * This is the ONLY syscall needed per frame — all pixel writes
+     * happen in user-space without any syscalls.
+     * Return: 0 on success.
      * ================================================================ */
     case 35: {
-        uint64_t* params = (uint64_t*)arg1;
-        if (!validate_user_buffer(params, 32)) {
-            result = (uint64_t)-1; break;
+        if (!fb) { result = (uint64_t)-1; break; }
+
+        uint32_t w = (uint32_t)fb->width;
+        uint32_t h = (uint32_t)fb->height;
+        uint32_t pitch_px = (uint32_t)(fb->pitch / 4);
+        uint32_t* src = (uint32_t*)0x70000000ULL;
+        uint32_t* dst = (uint32_t*)fb->address;
+
+        /*
+         * CRITICAL (Bare Metal): Disable interrupts during the copy.
+         *
+         * src (0x70000000) is mapped ONLY in the calling task's PML4.
+         * If the scheduler preempts us and switches CR3 to another
+         * task's PML4 (e.g. shell), 0x70000000 is unmapped there →
+         * reading src triggers #PF in kernel mode → triple fault →
+         * reboot. This is the root cause of the "desktop restart" bug.
+         *
+         * The copy of a 1920×1080 framebuffer takes ~2-5ms on modern
+         * hardware, well within safe cli window.
+         */
+        asm volatile ("cli");
+
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t* src_row = src + y * w;
+            uint32_t* dst_row = dst + y * pitch_px;
+            for (uint32_t x = 0; x < w; x++)
+                dst_row[x] = src_row[x];
         }
-        uint8_t* key = (uint8_t*)params[0];
-        uint8_t* iv = (uint8_t*)params[1];
-        uint8_t* buf = (uint8_t*)params[2];
-        size_t len = (size_t)params[3];
-        if (!validate_user_buffer(key, 32) ||
-            !validate_user_buffer(iv, 16) ||
-            !validate_user_buffer(buf, len) ||
-            len % 16 != 0) {
-            result = (uint64_t)-1; break;
-        }
-        aes256_ctx_t aes_ctx;
-        aes256_init(&aes_ctx, key);
-        aes256_cbc_decrypt(&aes_ctx, iv, buf, len);
-        secure_memzero(&aes_ctx, sizeof(aes_ctx));
+
+        cursor_force_redraw();
+        asm volatile ("sti");
         result = 0;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 36: get_caps(uint32_t* out_caps)
-     * Dapatkan capability bitmask proses saat ini.
-     * Return: 0 = sukses, -1 = error.
+     * SYSCALL 36: mouse_stats(mouse_stats_t* out)
+     * Ambil snapshot counter diagnostic mouse IRQ12 (bare-metal debug).
+     * Lihat dokumentasi interpretasi di drivers/mouse.h.
+     * Return: 0 = sukses, -1 = pointer NULL.
      * ================================================================ */
     case 36: {
-        uint32_t* out = (uint32_t*)arg1;
-        if (!validate_user_ptr(out)) {
+        mouse_stats_t* out = (mouse_stats_t*)arg1;
+        if (!out) { result = (uint64_t)-1; break; }
+        out->irq_bytes  = mouse_get_irq_count();
+        out->packets    = mouse_get_pkt_count();
+        out->sync_drops = mouse_get_sync_drops();
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 37: crypto_random(void* buf, size_t len)
+     * Fill buffer with cryptographically random bytes.
+     * Return: 0 = success, -1 = error.
+     * ================================================================ */
+    case 37: {
+        void* buf = (void*)arg1;
+        size_t len = (size_t)arg2;
+        if (!buf || len == 0 || len > 4096) { result = (uint64_t)-1; break; }
+        random_bytes(buf, len);
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 38: crypto_sha256(void* data, size_t len, uint8_t* digest)
+     * Compute SHA-256 hash of data.
+     * Return: 0 = success, -1 = error.
+     * ================================================================ */
+    case 38: {
+        const void* data = (const void*)arg1;
+        size_t len = (size_t)arg2;
+        uint8_t* digest = (uint8_t*)arg3;
+        if (!data || !digest) { result = (uint64_t)-1; break; }
+        sha256_hash(data, len, digest);
+        result = 0;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 39: crypto_aes_encrypt(crypto_aes_params_t* params)
+     * AES-256-CBC encrypt using parameter struct.
+     * Return: ciphertext length, or -1 on error.
+     * ================================================================ */
+    case 39: {
+        struct {
+            const uint8_t* key;
+            const uint8_t* iv;
+            const void*    input;
+            size_t         in_len;
+            void*          output;
+            size_t         out_max;
+        } *p = (void*)arg1;
+        if (!p || !p->key || !p->iv || !p->input || !p->output) {
             result = (uint64_t)-1; break;
         }
-        struct task* cur = task_find_by_pid(get_current_pid());
-        if (cur) {
-            *out = cur->capabilities;
-            result = 0;
-        } else {
+        int r = aes256_cbc_encrypt(p->key, p->iv, p->input, p->in_len,
+                                   p->output, p->out_max);
+        result = (uint64_t)(int64_t)r;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 40: crypto_aes_decrypt(crypto_aes_params_t* params)
+     * AES-256-CBC decrypt using parameter struct.
+     * Return: plaintext length, or -1 on error.
+     * ================================================================ */
+    case 40: {
+        struct {
+            const uint8_t* key;
+            const uint8_t* iv;
+            const void*    input;
+            size_t         in_len;
+            void*          output;
+            size_t         out_max;
+        } *p = (void*)arg1;
+        if (!p || !p->key || !p->iv || !p->input || !p->output) {
+            result = (uint64_t)-1; break;
+        }
+        int r = aes256_cbc_decrypt(p->key, p->iv, p->input, p->in_len,
+                                   p->output, p->out_max);
+        result = (uint64_t)(int64_t)r;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 41: crypto_login(char* username, char* password)
+     * Authenticate user; sets task UID on success.
+     * Return: UID >= 0 on success, -1 on failure.
+     * ================================================================ */
+    case 41: {
+        const char* username = (const char*)arg1;
+        const char* password = (const char*)arg2;
+        if (!username || !password) { result = (uint64_t)-1; break; }
+        int uid = cred_authenticate(username, password);
+        if (uid >= 0) {
+            /* Set UID on current task */
+            task_set_uid((uint32_t)uid, 0);
+        }
+        result = (uint64_t)(int64_t)uid;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 42: crypto_whoami(char* buf, size_t len)
+     * Get current user info.
+     * Writes username to buf, returns UID.
+     * ================================================================ */
+    case 42: {
+        char* buf = (char*)arg1;
+        size_t len = (size_t)arg2;
+        uint32_t uid = task_get_uid();
+        if (buf && len > 0) {
+            const char* name = cred_get_username(uid);
+            if (!name) name = "unknown";
+            size_t i;
+            for (i = 0; name[i] && i < len - 1; i++)
+                buf[i] = name[i];
+            buf[i] = '\0';
+        }
+        result = (uint64_t)uid;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 43: reserved (chmod placeholder)
+     * ================================================================ */
+    case 43: {
+        result = (uint64_t)-1; /* Not yet implemented */
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 44: crypto_keystore(crypto_keystore_params_t* params)
+     * Encrypted key-value store operations.
+     * params->op: 0=SET, 1=GET, 2=DELETE, 3=COUNT, 4=INIT
+     * Return: 0 = success, -1 = error. For COUNT, returns count.
+     * ================================================================ */
+    case 44: {
+        struct {
+            int         op;
+            const char* name;
+            void*       value;
+            size_t      val_len;
+            int*        out_len;
+        } *p = (void*)arg1;
+        if (!p) { result = (uint64_t)-1; break; }
+
+        switch (p->op) {
+        case 0: /* SET */
+            result = (uint64_t)(int64_t)keystore_set(p->name, p->value, p->val_len);
+            break;
+        case 1: /* GET */
+            result = (uint64_t)(int64_t)keystore_get(p->name, p->value, p->val_len, p->out_len);
+            break;
+        case 2: /* DELETE */
+            result = (uint64_t)(int64_t)keystore_delete(p->name);
+            break;
+        case 3: /* COUNT */
+            result = (uint64_t)keystore_count();
+            break;
+        case 4: /* INIT */
+            if (p->name) {
+                keystore_init(p->name);
+                result = 0;
+            } else {
+                result = (uint64_t)-1;
+            }
+            break;
+        default:
             result = (uint64_t)-1;
         }
         break;

@@ -25,10 +25,14 @@ extern uint64_t isr_stub_table[];
 extern uint64_t irq_stub_table[]; // Tabel IRQ baru
 
 void idt_set_descriptor(uint8_t vector, void* isr, uint8_t flags) {
+    idt_set_descriptor_ist(vector, isr, flags, 0);
+}
+
+void idt_set_descriptor_ist(uint8_t vector, void* isr, uint8_t flags, uint8_t ist) {
     uint64_t descriptor = (uint64_t)isr;
     idt[vector].isr_low    = (uint16_t)(descriptor & 0xFFFF);
-    idt[vector].kernel_cs  = 0x08; 
-    idt[vector].ist        = 0;
+    idt[vector].kernel_cs  = 0x08;
+    idt[vector].ist        = ist;       /* 0 = no IST (use current RSP), 1..7 = TSS.istN */
     idt[vector].attributes = flags;
     idt[vector].isr_mid    = (uint16_t)((descriptor >> 16) & 0xFFFF);
     idt[vector].isr_high   = (uint32_t)(descriptor >> 32);
@@ -43,7 +47,18 @@ void idt_init(void) {
 
     // 1. Daftarkan 32 Error CPU (Kamar 0 - 31)
     for (uint8_t i = 0; i < 32; i++) {
-        idt_set_descriptor(i, (void*)isr_stub_table[i], 0x8E);
+        /*
+         * Double Fault (#DF, vector 8) di-assign ke IST1. Jika kernel stack
+         * overflow/corrupt, CPU akan fault lagi mencoba push frame #DF ke
+         * stack yang sama rusak → triple fault (reboot diam-diam). Dengan
+         * IST1, CPU switch ke dedicated stack (TSS.ist1) yang masih utuh,
+         * sehingga handler double fault bisa cetak diagnostik.
+         */
+        if (i == 8) {
+            idt_set_descriptor_ist(i, (void*)isr_stub_table[i], 0x8E, 1);
+        } else {
+            idt_set_descriptor(i, (void*)isr_stub_table[i], 0x8E);
+        }
     }
 
     // 2. Daftarkan 16 Hardware IRQ (Kamar 32 - 47)
