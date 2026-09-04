@@ -100,101 +100,156 @@ static void mouse_wait_read(void) {
     }
 }
 
-/* Kirim 1 byte ke mouse device (aux) melalui cmd 0xD4 */
-static void mouse_send_cmd(uint8_t cmd) {
+/* Wait for mouse ACK (0xFA) with timeout. Returns 1 on ACK, 0 on timeout. */
+static int mouse_wait_ack(void) {
+    for (int i = 0; i < 100000; i++) {
+        if (inb(0x64) & STATUS_OUT_BUF_FULL) {
+            uint8_t resp = inb(0x60);
+            if (resp == 0xFA) return 1;  /* ACK */
+            if (resp == 0xFE) return 0;  /* NACK / resend */
+        }
+        io_wait();
+    }
+    return 0;
+}
+
+/* Send command to mouse and wait for ACK. Returns 1 on success. */
+static int mouse_cmd_ack(uint8_t cmd) {
     mouse_wait_write();
     outb(0x64, CMD_WRITE_AUX);
     mouse_wait_write();
     outb(0x60, cmd);
-    /* Konsumsi ACK (0xFA) hanya jika tersedia, cegah hang */
-    if (inb(0x64) & STATUS_OUT_BUF_FULL) {
-        inb(0x60);
-    }
+    return mouse_wait_ack();
 }
-
-/* ------------------------------------------------------------------ */
-/* Inisialisasi                                                        */
-/* ------------------------------------------------------------------ */
 
 void mouse_init(void) {
     serial_write_string("[INFO] Menginisialisasi mouse PS/2...\n");
 
-    /* 0. Disable keyboard and aux during initialization to prevent buffer corruption */
+    /* 0. Disable keyboard and aux during initialization */
     mouse_wait_write(); outb(0x64, 0xAD); /* Disable keyboard */
     mouse_wait_write(); outb(0x64, 0xA7); /* Disable aux */
 
-    /* Flush output buffer (buang data sisa) */
-    for (int i = 0; i < 50; i++) {
-        if (inb(0x64) & STATUS_OUT_BUF_FULL) {
-            inb(0x60);
-        }
+    /* Flush output buffer */
+    for (int i = 0; i < 100; i++) {
+        if (inb(0x64) & STATUS_OUT_BUF_FULL) inb(0x60);
         io_wait();
     }
 
-    /* 1. Enable auxiliary port (mouse port pada controller) */
+    /* 1. PS/2 Controller self-test (command 0xAA) */
+    mouse_wait_write();
+    outb(0x64, 0xAA);
+    mouse_wait_read();
+    uint8_t selftest = inb(0x60);
+    if (selftest == 0x55) {
+        serial_write_string("  [PS2] Controller self-test: PASS\n");
+    } else {
+        serial_write_string("  [PS2] Controller self-test: FAIL (0x");
+        /* Print hex byte */
+        char hex[3];
+        hex[0] = "0123456789ABCDEF"[(selftest >> 4) & 0xF];
+        hex[1] = "0123456789ABCDEF"[selftest & 0xF];
+        hex[2] = 0;
+        serial_write_string(hex);
+        serial_write_string(") — PS/2 controller may not exist\n");
+    }
+
+    /* 2. Enable auxiliary port */
     mouse_wait_write();
     outb(0x64, CMD_ENABLE_AUX);
 
-    /* 2. Baca Controller Configuration Byte */
+    /* 3. Test auxiliary port (command 0xA9) */
+    mouse_wait_write();
+    outb(0x64, 0xA9);
+    mouse_wait_read();
+    uint8_t auxtest = inb(0x60);
+    if (auxtest == 0x00) {
+        serial_write_string("  [PS2] Aux port test: PASS\n");
+    } else {
+        serial_write_string("  [PS2] Aux port test: FAIL — no PS/2 mouse port\n");
+        serial_write_string("  [PS2] Mouse will not work. Use arrow keys + Enter.\n");
+    }
+
+    /* 4. Re-enable aux port (self-test may have disabled it) */
+    mouse_wait_write();
+    outb(0x64, CMD_ENABLE_AUX);
+
+    /* 5. Read and configure Controller Configuration Byte */
     mouse_wait_write();
     outb(0x64, CMD_READ_CONFIG);
     mouse_wait_read();
     uint8_t config = inb(0x60);
 
-    /* 3. Set bit aux interrupt enable. CLEAR aux clock disable bit.
-     *    bit1 (CCB_SECOND_PORT_INT) = 1 → enable IRQ12 mouse
-     *    bit5 (CCB_SECOND_CLK)      = 0 → enable clock (0 = enabled!) */
     config |= CCB_SECOND_PORT_INT;   /* Enable IRQ12 */
-    config &= ~CCB_SECOND_CLK;       /* Enable clock (clear = enable) */
+    config |= CCB_FIRST_PORT_INT;    /* Keep IRQ1 (keyboard) enabled */
+    config &= ~CCB_SECOND_CLK;       /* Enable aux clock (clear = enable) */
 
-    /* 4. Tulis CCB kembali */
     mouse_wait_write();
     outb(0x64, CMD_WRITE_CONFIG);
     mouse_wait_write();
     outb(0x60, config);
 
-    /* Re-enable keyboard (karena kita disable di awal) */
+    /* 6. Re-enable keyboard */
     mouse_wait_write(); outb(0x64, 0xAE);
 
-    /* 5. Reset mouse device (0xFF). Flush sisa byte tanpa blocking lama. */
-    mouse_send_cmd(0xFF);
-    for (int i = 0; i < 10; i++) {
+    /* 7. Reset mouse device (0xFF) — wait for self-test response */
+    if (mouse_cmd_ack(0xFF)) {
+        serial_write_string("  [PS2] Mouse reset ACK received\n");
+        /* Wait for self-test pass (0xAA) and mouse ID (0x00) */
+        for (int i = 0; i < 500000; i++) {
+            if (inb(0x64) & STATUS_OUT_BUF_FULL) {
+                uint8_t b = inb(0x60);
+                if (b == 0xAA) {
+                    serial_write_string("  [PS2] Mouse self-test: PASS\n");
+                    /* Read mouse ID byte */
+                    mouse_wait_read();
+                    inb(0x60); /* Consume ID byte (usually 0x00) */
+                    break;
+                }
+            }
+            io_wait();
+        }
+    } else {
+        serial_write_string("  [PS2] Mouse reset: no ACK (device may not exist)\n");
+        /* Flush any leftover bytes */
+        for (int i = 0; i < 50; i++) {
+            if (inb(0x64) & STATUS_OUT_BUF_FULL) inb(0x60);
+            io_wait();
+        }
+    }
+
+    /* 8. Set default parameters */
+    mouse_cmd_ack(0xF6); /* Set defaults */
+
+    /* 9. Set sample rate 100 */
+    mouse_cmd_ack(0xF3);
+    mouse_cmd_ack(100);
+
+    /* 10. Enable data streaming (0xF4) */
+    if (mouse_cmd_ack(MOUSE_CMD_ENABLE)) {
+        serial_write_string("  [PS2] Mouse streaming enabled\n");
+    } else {
+        serial_write_string("  [PS2] Mouse streaming: no ACK\n");
+    }
+
+    /* 11. Flush leftover bytes */
+    for (int i = 0; i < 50; i++) {
         if (inb(0x64) & STATUS_OUT_BUF_FULL) inb(0x60);
         io_wait();
     }
 
-    /* 6. IntelliMouse wheel extension (membantu kompatibilitas touchpad) */
-    mouse_send_cmd(0xF3); mouse_send_cmd(200);
-    mouse_send_cmd(0xF3); mouse_send_cmd(100);
-    mouse_send_cmd(0xF3); mouse_send_cmd(80);
-
-    /* Set sample rate to 100 (standard) */
-    mouse_send_cmd(0xF3);
-    mouse_send_cmd(100);
-
-    /* 7. Kirim 0xF4 ke mouse: enable data stream reporting */
-    mouse_send_cmd(MOUSE_CMD_ENABLE);
-
-    /* 8. Flush sisa byte yang mungkin tersisa di buffer */
-    for (int i = 0; i < 20; i++) {
-        if (inb(0x64) & STATUS_OUT_BUF_FULL) {
-            inb(0x60);
-        }
-        io_wait();
-    }
-
-    /* 9. Reset state machine paket */
+    /* 12. Reset state machine */
     packet_cycle = 0;
     mouse_state.x = (int32_t)(screen_width / 2);
     mouse_state.y = (int32_t)(screen_height / 2);
     mouse_state.buttons = 0;
     mouse_state.changed = 0;
 
-    /* 10. Enable interrupt: cascade master→slave (IRQ2) + mouse (IRQ12) */
-    pic_unmask_irq(2);    /* Master IRQ2 = cascade ke slave PIC */
-    pic_unmask_irq(12);   /* Slave IRQ4 (= IRQ12 global) = mouse */
+    /* 13. Enable interrupts: cascade (IRQ2) + mouse (IRQ12) */
+    pic_unmask_irq(2);
+    pic_unmask_irq(12);
 
     serial_write_string("[OK] Mouse PS/2 siap! (IRQ12 di-unmask)\n");
+    serial_write_string("     Fallback: Arrow keys + Enter for cursor control\n");
 }
 
 void mouse_reset(uint32_t width, uint32_t height) {

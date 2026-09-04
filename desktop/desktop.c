@@ -337,17 +337,33 @@ static void draw_window(int idx) {
 
 static void draw_start_menu(void) {
     if (!start_menu_open) return;
-    int mx = 4, my = (int)SCR_H - TASKBAR_H - (MENU_ITEM_H*5+8);
-    buf_rect(mx-1, my-1, MENU_W+2, MENU_ITEM_H*5+10, COL_MENU_BORDER);
-    buf_rect(mx, my, MENU_W, MENU_ITEM_H*5+8, COL_MENU_BG);
+    /* 5 items (header + 4 apps) + separator + 2 power items = 8 rows */
+    int total_rows = 8;
+    int mx = 4, my = (int)SCR_H - TASKBAR_H - (MENU_ITEM_H*total_rows+8);
+    buf_rect(mx-1, my-1, MENU_W+2, MENU_ITEM_H*total_rows+10, COL_MENU_BORDER);
+    buf_rect(mx, my, MENU_W, MENU_ITEM_H*total_rows+8, COL_MENU_BG);
     buf_rect(mx, my, MENU_W, MENU_ITEM_H, COL_HIGHLIGHT);
     buf_text("GenOS v3", mx+12, my+10, COL_TEXT_PRIMARY);
+
+    /* App items */
     const char* items[] = {"About GenOS","File Manager","Terminal","System Info"};
     for (int i = 0; i < 4; i++) {
         int iy = my + MENU_ITEM_H*(i+1) + 4;
         buf_text(items[i], mx+16, iy+8, COL_TEXT_PRIMARY);
         if (i < 3) buf_rect(mx+8, iy+MENU_ITEM_H-2, MENU_W-16, 1, COL_WIN_BORDER);
     }
+
+    /* Separator line before power options */
+    int sep_y = my + MENU_ITEM_H*5 + 4;
+    buf_rect(mx+8, sep_y, MENU_W-16, 2, COL_WIN_BORDER);
+
+    /* Power: Restart */
+    int ry = my + MENU_ITEM_H*6 + 4;
+    buf_text("Restart", mx+16, ry+8, 0xF0883E);
+
+    /* Power: Shutdown */
+    int sy = my + MENU_ITEM_H*7 + 4;
+    buf_text("Shutdown", mx+16, sy+8, 0xF85149);
 }
 
 static void redraw_all(void) {
@@ -368,7 +384,10 @@ static void handle_click(int mx, int my) {
     const char* titles[] = {"About GenOS","File Manager","Terminal","System Info"};
 
     if (start_menu_open) {
-        int menu_y = ty - (MENU_ITEM_H*5+8);
+        int total_rows = 8;
+        int menu_y = ty - (MENU_ITEM_H*total_rows+8);
+
+        /* Check app items (4 items) */
         for (int i = 0; i < 4; i++) {
             int iy = menu_y + MENU_ITEM_H*(i+1) + 4;
             if (hit(mx, my, 4, iy, MENU_W, MENU_ITEM_H)) {
@@ -376,6 +395,33 @@ static void handle_click(int mx, int my) {
                 start_menu_open = 0; redraw_all(); return;
             }
         }
+
+        /* Check Restart (row 6) */
+        int ry = menu_y + MENU_ITEM_H*6 + 4;
+        if (hit(mx, my, 4, ry, MENU_W, MENU_ITEM_H)) {
+            start_menu_open = 0;
+            /* Show restart message */
+            buf_rect(0, 0, (int)SCR_W, (int)SCR_H, 0x0D1117);
+            buf_text("Restarting...", (int)SCR_W/2 - 100, (int)SCR_H/2, 0xF0883E);
+            flush_screen();
+            user_sleep(500);
+            power_restart();
+            return;
+        }
+
+        /* Check Shutdown (row 7) */
+        int sy = menu_y + MENU_ITEM_H*7 + 4;
+        if (hit(mx, my, 4, sy, MENU_W, MENU_ITEM_H)) {
+            start_menu_open = 0;
+            /* Show shutdown message */
+            buf_rect(0, 0, (int)SCR_W, (int)SCR_H, 0x0D1117);
+            buf_text("Shutting down...", (int)SCR_W/2 - 120, (int)SCR_H/2, 0xF85149);
+            flush_screen();
+            user_sleep(500);
+            power_shutdown();
+            return;
+        }
+
         start_menu_open = 0; redraw_all(); return;
     }
 
@@ -595,19 +641,74 @@ void _start(void) {
     mouse_state_t ms;
     uint64_t last_clock = 0;
 
+    /*
+     * Virtual cursor position — used for BOTH mouse and keyboard control.
+     * On bare metal where PS/2 mouse/touchpad may not work, arrow keys
+     * move this cursor instead. Enter key simulates a left click.
+     */
+    int32_t cursor_x = (int32_t)SCR_W / 2;
+    int32_t cursor_y = (int32_t)SCR_H / 2;
+    int kbd_cursor_active = 0;  /* Set to 1 when arrow keys are used */
+
+    /* Key codes from keyboard driver (must match keyboard.c) */
+    #define KEY_UP    0x80
+    #define KEY_DOWN  0x81
+    #define KEY_LEFT  0x82
+    #define KEY_RIGHT 0x83
+
     while (1) {
+        /* === Mouse input === */
         if (read_mouse(&ms) == 0 && ms.changed) {
             int btn = ms.buttons & 1;
             int clicked = (btn && !mouse_prev_btn);
             int released = (!btn && mouse_prev_btn);
+
+            /* Sync virtual cursor with mouse position */
+            cursor_x = ms.x;
+            cursor_y = ms.y;
+            kbd_cursor_active = 0;  /* Mouse is working, hide kbd cursor */
+
             if (clicked) handle_click(ms.x, ms.y);
             if (btn && mouse_prev_btn) handle_drag(ms.x, ms.y);
             if (released) handle_release();
             mouse_prev_btn = btn;
         }
 
+        /* === Keyboard input (cursor control fallback) === */
         char key = read_key();
-        if (key == 27) break; /* ESC */
+
+        if (key == 27) break; /* ESC = exit desktop */
+
+        if (key == (char)KEY_UP || key == (char)KEY_DOWN ||
+            key == (char)KEY_LEFT || key == (char)KEY_RIGHT) {
+            /* Arrow keys: move virtual cursor */
+            int step = 10;  /* pixels per keypress */
+            kbd_cursor_active = 1;
+
+            if (key == (char)KEY_UP)    cursor_y -= step;
+            if (key == (char)KEY_DOWN)  cursor_y += step;
+            if (key == (char)KEY_LEFT)  cursor_x -= step;
+            if (key == (char)KEY_RIGHT) cursor_x += step;
+
+            /* Clamp to screen */
+            if (cursor_x < 0) cursor_x = 0;
+            if (cursor_x >= (int32_t)SCR_W) cursor_x = (int32_t)SCR_W - 1;
+            if (cursor_y < 0) cursor_y = 0;
+            if (cursor_y >= (int32_t)SCR_H) cursor_y = (int32_t)SCR_H - 1;
+
+            /* Move the kernel hardware cursor to match */
+            set_cursor(cursor_x, cursor_y);
+        }
+
+        /* Enter key = simulate left click at virtual cursor position */
+        if (key == '\n' && kbd_cursor_active) {
+            handle_click(cursor_x, cursor_y);
+        }
+
+        /* Space key = also simulate click (easier on some keyboards) */
+        if (key == ' ' && kbd_cursor_active) {
+            handle_click(cursor_x, cursor_y);
+        }
 
         /* Update clock every second */
         uint64_t now = get_ticks();

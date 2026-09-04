@@ -49,9 +49,43 @@ const char scancode_to_ascii_shift[] = {
 
 static bool shift_pressed = false;
 static bool caps_lock_active = false;
+static bool extended_key = false;  /* PS/2 extended scancode (0xE0 prefix) */
+
+/*
+ * Special key codes for non-ASCII keys (pushed to key buffer).
+ * Desktop reads these to move cursor with arrow keys.
+ */
+#define KEY_UP    0x80
+#define KEY_DOWN  0x81
+#define KEY_LEFT  0x82
+#define KEY_RIGHT 0x83
 
 // Fungsi yang terpicu setiap jari menekan tuts keyboard
 void keyboard_handler(uint8_t scancode) {
+    /*
+     * PS/2 Extended Scancodes: Arrow keys, Home, End, etc.
+     * send a 0xE0 prefix byte FIRST, then the actual scancode.
+     * We set a flag and return; the NEXT IRQ delivers the real key.
+     */
+    if (scancode == 0xE0) {
+        extended_key = true;
+        return;
+    }
+
+    if (extended_key) {
+        extended_key = false;
+        /* Ignore key-up events for extended keys */
+        if (scancode & 0x80) return;
+        /* Map extended scancodes to special chars */
+        switch (scancode) {
+            case 0x48: buffer_push(KEY_UP);    return;
+            case 0x50: buffer_push(KEY_DOWN);  return;
+            case 0x4B: buffer_push(KEY_LEFT);  return;
+            case 0x4D: buffer_push(KEY_RIGHT); return;
+            default: return; /* Ignore other extended keys */
+        }
+    }
+
     // 1. Cek Key Up (Tombol Dilepas)
     if (scancode & 0x80) {
         uint8_t base_scancode = scancode & 0x7F;
@@ -76,7 +110,7 @@ void keyboard_handler(uint8_t scancode) {
             final_c = shift_pressed ? shift_c : base_c;
         }
 
-        // 4. MASUKKAN KE EMBER ANTREAN (TIDAK ADA LAGI MENGGAMBAR LAYAR DI SINI)
+        // 4. MASUKKAN KE EMBER ANTREAN
         if (final_c != 0) {
             buffer_push(final_c);
         }
