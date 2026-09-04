@@ -1026,6 +1026,88 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         break;
     }
 
+    /* ================================================================
+     * SYSCALL 45: power(uint32_t action)
+     * Power management: shutdown or restart the machine.
+     *   action=0 → Shutdown (ACPI S5)
+     *   action=1 → Restart (keyboard controller reset)
+     * Return: -1 on invalid action (should not return on success).
+     * ================================================================ */
+    case 45: {
+        uint32_t action = (uint32_t)arg1;
+        serial_write_string("[POWER] ");
+
+        if (action == 0) {
+            /* === SHUTDOWN === */
+            serial_write_string("Shutting down...\n");
+
+            /* Disable all interrupts */
+            asm volatile ("cli");
+
+            /* Method 1: QEMU/Bochs ACPI shutdown (port 0x604) */
+            asm volatile ("outw %0, %1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0x604));
+
+            /* Method 2: VirtualBox ACPI shutdown (port 0x4004) */
+            asm volatile ("outw %0, %1" : : "a"((uint16_t)0x3400), "Nd"((uint16_t)0x4004));
+
+            /* If still running, halt all CPUs */
+            serial_write_string("[POWER] ACPI shutdown failed, halting.\n");
+            while (1) asm volatile ("hlt");
+
+        } else if (action == 1) {
+            /* === RESTART === */
+            serial_write_string("Restarting...\n");
+
+            /* Disable all interrupts */
+            asm volatile ("cli");
+
+            /* Method 1: Keyboard controller reset (8042 pulse) */
+            /* Wait for input buffer to be empty */
+            for (int i = 0; i < 10000; i++) {
+                uint8_t status;
+                asm volatile ("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x64));
+                if (!(status & 0x02)) break;
+            }
+            /* Send reset command 0xFE to keyboard controller */
+            asm volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
+
+            /* Method 2: If 8042 reset didn't work, triple fault */
+            /* Load a null IDT and trigger interrupt → guaranteed triple fault */
+            struct { uint16_t limit; uint64_t base; } __attribute__((packed))
+                null_idt = { 0, 0 };
+            asm volatile ("lidt %0" : : "m"(null_idt));
+            asm volatile ("int $0x03");
+
+            /* Should never reach here */
+            while (1) asm volatile ("hlt");
+
+        } else {
+            result = (uint64_t)-1;
+        }
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 46: set_cursor(int32_t x, int32_t y)
+     * Set mouse cursor position from userspace.
+     * Used by keyboard cursor control when PS/2 mouse is unavailable.
+     * Updates both mouse state and kernel cursor overlay.
+     * Return: 0.
+     * ================================================================ */
+    case 46: {
+        int32_t x = (int32_t)arg1;
+        int32_t y = (int32_t)arg2;
+        mouse_state_t* ms = mouse_get_state();
+        ms->x = x;
+        ms->y = y;
+        ms->changed = 1;
+        /* Update kernel cursor overlay */
+        extern void cursor_update(int32_t x, int32_t y);
+        cursor_update(x, y);
+        result = 0;
+        break;
+    }
+
     default:
         serial_write_string("[WARN] Syscall tidak dikenal\n");
         result = (uint64_t)-1;

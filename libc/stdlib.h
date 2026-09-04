@@ -63,3 +63,11 @@ int fork(void);
 
 /* Ambil timer tick count dari kernel; digunakan untuk clock */
 uint64_t get_ticks(void);
+
+/* === Power Management (syscall 45) === */
+
+/* Matikan mesin (ACPI shutdown). Tidak pernah kembali. */
+void power_shutdown(void);
+
+/* Restart mesin (keyboard controller reset). Tidak pernah kembali. */
+void power_restart(void);

@@ -123,3 +123,8 @@ typedef struct {
 
 /* Ambil snapshot counter diagnostic mouse. Return 0 sukses / -1 error */
 int mouse_stats(mouse_stats_t* out);
+
+/* === Cursor Position (syscall 46) === */
+
+/* Set posisi cursor dari userspace (untuk keyboard cursor control) */
+void set_cursor(int x, int y);

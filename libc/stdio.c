@@ -149,3 +149,9 @@ void flush_screen(void) {
 int mouse_stats(mouse_stats_t* out) {
     return (int)syscall(36, (uint64_t)out, 0, 0);
 }
+
+/* === Cursor Position (syscall 46) === */
+
+void set_cursor(int x, int y) {
+    syscall(46, (uint64_t)(int64_t)x, (uint64_t)(int64_t)y, 0);
+}

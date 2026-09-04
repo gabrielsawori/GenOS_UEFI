@@ -81,3 +81,15 @@ int fork(void) {
 uint64_t get_ticks(void) {
     return syscall(33, 0, 0, 0);
 }
+
+/* === Power Management (syscall 45) === */
+
+void power_shutdown(void) {
+    syscall(45, 0, 0, 0);
+    while (1);  /* Should never reach here */
+}
+
+void power_restart(void) {
+    syscall(45, 1, 0, 0);
+    while (1);  /* Should never reach here */
+}
