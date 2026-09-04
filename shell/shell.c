@@ -18,6 +18,7 @@
 #include "../libc/stdio.h"
 #include "../libc/stdlib.h"
 #include "../libc/string.h"
+#include "../libc/crypto.h"
 
 /* === Geometri Terminal ===
  * Font 8x8 dengan scale=2 → 1 cell = 16x16 piksel.
@@ -92,18 +93,25 @@ void _start(void) {
                     /* --- HELP --- */
                     if (strcmp(cmd_buffer, "help") == 0) {
                         terminal_print("Available Commands:", 0xFFFF00);
-                        terminal_print("  help  : Show this message", 0xFFFFFF);
-                        terminal_print("  clear : Clear the terminal screen", 0xFFFFFF);
-                        terminal_print("  info  : OS Information", 0xFFFFFF);
-                        terminal_print("  ls    : List files (ramdisk + tmpfs)", 0xFFFFFF);
-                        terminal_print("  read  : Read pesan.txt from Ramdisk", 0xFFFFFF);
-                        terminal_print("  cat   : Read any file (TAR or tmpfs)", 0xFFFFFF);
-                        terminal_print("  write : Write text to tmpfs file", 0xFFFFFF);
-                        terminal_print("  rm    : Delete a tmpfs file", 0xFFFFFF);
-                        terminal_print("  shm   : Shared memory IPC demo", 0xFFFFFF);
-                        terminal_print("  cache : Buffer cache statistics", 0xFFFFFF);
-                        terminal_print("  fork  : Fork process demo", 0xFFFFFF);
-                        terminal_print("  run   : Execute app.elf in Ring 3!", 0x00FF00);
+                        terminal_print("  help    : Show this message", 0xFFFFFF);
+                        terminal_print("  clear   : Clear the terminal screen", 0xFFFFFF);
+                        terminal_print("  info    : OS Information", 0xFFFFFF);
+                        terminal_print("  ls      : List files (ramdisk + tmpfs)", 0xFFFFFF);
+                        terminal_print("  read    : Read pesan.txt from Ramdisk", 0xFFFFFF);
+                        terminal_print("  cat     : Read any file (TAR or tmpfs)", 0xFFFFFF);
+                        terminal_print("  write   : Write text to tmpfs file", 0xFFFFFF);
+                        terminal_print("  rm      : Delete a tmpfs file", 0xFFFFFF);
+                        terminal_print("  shm     : Shared memory IPC demo", 0xFFFFFF);
+                        terminal_print("  cache   : Buffer cache statistics", 0xFFFFFF);
+                        terminal_print("  fork    : Fork process demo", 0xFFFFFF);
+                        terminal_print("  run     : Execute app.elf in Ring 3!", 0x00FF00);
+                        terminal_print("  desktop : Launch Desktop Environment!", 0x00FF00);
+                        terminal_print("  mouse   : Show mouse diagnostic counters", 0x00FFFF);
+                        terminal_print("  whoami  : Show current user", 0x00FFFF);
+                        terminal_print("  login   : Login as user", 0x00FFFF);
+                        terminal_print("  hash    : SHA-256 hash demo", 0x00FFFF);
+                        terminal_print("  random  : Generate random bytes", 0x00FFFF);
+                        terminal_print("  encrypt : AES-256 encryption demo", 0x00FFFF);
                     }
                     /* --- CLEAR --- */
                     else if (strcmp(cmd_buffer, "clear") == 0) {
@@ -192,6 +200,89 @@ void _start(void) {
                             cursor_x = TERM_LEFT;
                             cursor_y = TERM_TOP;
                             terminal_print("[app.elf finished - terminal restored]", 0x00FFFF);
+                        }
+                    }
+                    /* --- DESKTOP: Launch Desktop Environment --- */
+                    else if (strcmp(cmd_buffer, "desktop") == 0) {
+                        terminal_print("Launching Desktop Environment...", 0x00FF00);
+                        int pid = exec("desktop.elf");
+                        if (pid <= 0) {
+                            terminal_print("[ERROR] desktop.elf not found!", 0xFF0000);
+                        } else {
+                            wait_pid(pid);
+                            clear_screen();
+                            cursor_x = TERM_LEFT;
+                            cursor_y = TERM_TOP;
+                            terminal_print("[Desktop closed - terminal restored]", 0x00FFFF);
+                        }
+                    }
+                    /* --- MOUSE: Diagnostic counters (bare-metal debugging) --- */
+                    else if (strcmp(cmd_buffer, "mouse") == 0) {
+                        terminal_print("=== Mouse PS/2 Diagnostic ===", 0xFFFF00);
+                        mouse_stats_t ms;
+                        if (mouse_stats(&ms) == 0) {
+                            char line[128];
+                            int j;
+
+                            /* IRQ bytes */
+                            j = 0;
+                            const char* h1 = "IRQ bytes received : ";
+                            for (int k = 0; h1[k]; k++) line[j++] = h1[k];
+                            {
+                                char num[16]; int ni = 0;
+                                uint32_t v = ms.irq_bytes;
+                                if (v == 0) { num[ni++] = '0'; }
+                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
+                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
+                            }
+                            line[j] = '\0';
+                            terminal_print(line, (ms.irq_bytes == 0) ? 0xFF6600 : 0x00FF00);
+
+                            /* Packets */
+                            j = 0;
+                            const char* h2 = "Packets decoded    : ";
+                            for (int k = 0; h2[k]; k++) line[j++] = h2[k];
+                            {
+                                char num[16]; int ni = 0;
+                                uint32_t v = ms.packets;
+                                if (v == 0) { num[ni++] = '0'; }
+                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
+                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
+                            }
+                            line[j] = '\0';
+                            terminal_print(line, (ms.packets == 0) ? 0xFF6600 : 0x00FF00);
+
+                            /* Sync drops */
+                            j = 0;
+                            const char* h3 = "Sync drops         : ";
+                            for (int k = 0; h3[k]; k++) line[j++] = h3[k];
+                            {
+                                char num[16]; int ni = 0;
+                                uint32_t v = ms.sync_drops;
+                                if (v == 0) { num[ni++] = '0'; }
+                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
+                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
+                            }
+                            line[j] = '\0';
+                            terminal_print(line, 0xFFFFFF);
+
+                            /* Diagnosis otomatis */
+                            terminal_print("--- Diagnosis ---", 0xAAAAAA);
+                            if (ms.irq_bytes == 0) {
+                                terminal_print("IRQ12 TIDAK pernah fire.", 0xFF0000);
+                                terminal_print("Kemungkinan:", 0xFFFF00);
+                                terminal_print(" - BIOS: USB Legacy Support OFF", 0xFFFFFF);
+                                terminal_print(" - Touchpad pakai I2C (bukan PS/2)", 0xFFFFFF);
+                                terminal_print(" - PS/2 controller tidak ada/dimask", 0xFFFFFF);
+                            } else if (ms.packets == 0) {
+                                terminal_print("IRQ12 masuk tapi paket gagal decode.", 0xFF6600);
+                                terminal_print("Kemungkinan: state machine tidak sinkron", 0xFFFFFF);
+                            } else {
+                                terminal_print("Mouse PS/2 berfungsi.", 0x00FF00);
+                                terminal_print("Jika kursor tetap diam, cek UI desktop.", 0xFFFFFF);
+                            }
+                        } else {
+                            terminal_print("[ERROR] mouse_stats failed!", 0xFF0000);
                         }
                     }
                     /* --- SHM: Shared Memory IPC demo --- */
@@ -402,6 +493,124 @@ void _start(void) {
                             terminal_print("[ERROR] Cannot delete: ", 0xFF0000);
                             terminal_print(fname, 0xFFFF00);
                             terminal_print("(only tmpfs files can be deleted)", 0xAAAAAA);
+                        }
+                    }
+                    /* --- WHOAMI: Show current user --- */
+                    else if (strcmp(cmd_buffer, "whoami") == 0) {
+                        char uname[32];
+                        int uid = crypto_whoami(uname, sizeof(uname));
+                        char line[128];
+                        int j = 0;
+                        const char* h1 = "User: ";
+                        for (int k = 0; h1[k]; k++) line[j++] = h1[k];
+                        for (int k = 0; uname[k] && j < 100; k++) line[j++] = uname[k];
+                        const char* h2 = "  (UID ";
+                        for (int k = 0; h2[k]; k++) line[j++] = h2[k];
+                        char num[16]; int ni = 0;
+                        int tmp = uid;
+                        if (tmp == 0) { num[ni++] = '0'; }
+                        else { while (tmp > 0) { num[ni++] = '0' + (tmp % 10); tmp /= 10; } }
+                        for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
+                        line[j++] = ')'; line[j] = '\0';
+                        terminal_print(line, 0x00FF00);
+                    }
+                    /* --- LOGIN: Authenticate as user --- */
+                    else if (cmd_buffer[0]=='l' && cmd_buffer[1]=='o' && cmd_buffer[2]=='g' &&
+                             cmd_buffer[3]=='i' && cmd_buffer[4]=='n' && cmd_buffer[5]==' ') {
+                        char* uname = &cmd_buffer[6];
+                        /* Ask for password */
+                        terminal_print("Password: ", 0xAAAAAA);
+                        char pass[64]; int pi = 0;
+                        while (1) {
+                            char k = read_key();
+                            if (k == '\n') break;
+                            if (k == '\b' && pi > 0) { pi--; continue; }
+                            if (k && k != '\b' && pi < 63) { pass[pi++] = k; }
+                        }
+                        pass[pi] = '\0';
+                        cursor_y += TERM_LINE_H;
+                        int uid = crypto_login(uname, pass);
+                        if (uid >= 0) {
+                            terminal_print("[OK] Login successful!", 0x00FF00);
+                            char line[80]; int j = 0;
+                            const char* h = "Now logged in as: ";
+                            for (int k = 0; h[k]; k++) line[j++] = h[k];
+                            for (int k = 0; uname[k] && j < 70; k++) line[j++] = uname[k];
+                            line[j] = '\0';
+                            terminal_print(line, 0x00CCFF);
+                        } else {
+                            terminal_print("[FAILED] Authentication failed!", 0xFF0000);
+                        }
+                    }
+                    /* --- HASH: SHA-256 demo --- */
+                    else if (cmd_buffer[0]=='h' && cmd_buffer[1]=='a' && cmd_buffer[2]=='s' &&
+                             cmd_buffer[3]=='h' && cmd_buffer[4]==' ') {
+                        char* text = &cmd_buffer[5];
+                        int tlen = 0; while (text[tlen]) tlen++;
+                        uint8_t digest[32];
+                        crypto_sha256(text, (unsigned long)tlen, digest);
+                        /* Convert to hex */
+                        char hex[65];
+                        const char* hc = "0123456789abcdef";
+                        for (int i = 0; i < 32; i++) {
+                            hex[i*2] = hc[(digest[i]>>4)&0xf];
+                            hex[i*2+1] = hc[digest[i]&0xf];
+                        }
+                        hex[64] = '\0';
+                        terminal_print("SHA-256:", 0xFFFF00);
+                        terminal_print(hex, 0x00FF00);
+                    }
+                    /* --- RANDOM: Generate random bytes --- */
+                    else if (strcmp(cmd_buffer, "random") == 0) {
+                        uint8_t rbuf[16];
+                        crypto_random(rbuf, 16);
+                        char hex[48]; int j = 0;
+                        const char* hc = "0123456789abcdef";
+                        for (int i = 0; i < 16; i++) {
+                            hex[j++] = hc[(rbuf[i]>>4)&0xf];
+                            hex[j++] = hc[rbuf[i]&0xf];
+                            if (i % 4 == 3 && i < 15) hex[j++] = ' ';
+                        }
+                        hex[j] = '\0';
+                        terminal_print("128-bit random:", 0xFFFF00);
+                        terminal_print(hex, 0x00FF00);
+                    }
+                    /* --- ENCRYPT: AES-256-CBC demo --- */
+                    else if (cmd_buffer[0]=='e' && cmd_buffer[1]=='n' && cmd_buffer[2]=='c' &&
+                             cmd_buffer[3]=='r' && cmd_buffer[4]=='y' && cmd_buffer[5]=='p' &&
+                             cmd_buffer[6]=='t' && cmd_buffer[7]==' ') {
+                        char* text = &cmd_buffer[8];
+                        int tlen = 0; while (text[tlen]) tlen++;
+                        /* Generate random key and IV */
+                        uint8_t key[32], iv[16];
+                        crypto_random(key, 32);
+                        crypto_random(iv, 16);
+                        /* Encrypt */
+                        uint8_t ct[256], pt[256];
+                        crypto_aes_params_t ep = {key, iv, text, (unsigned long)tlen, ct, sizeof(ct)};
+                        int ct_len = crypto_aes_encrypt(&ep);
+                        if (ct_len > 0) {
+                            terminal_print("AES-256-CBC Encrypted:", 0xFFFF00);
+                            /* Show first 16 bytes of ciphertext as hex */
+                            char hex[64]; int j = 0;
+                            const char* hc = "0123456789abcdef";
+                            int show = ct_len > 16 ? 16 : ct_len;
+                            for (int i = 0; i < show; i++) {
+                                hex[j++] = hc[(ct[i]>>4)&0xf];
+                                hex[j++] = hc[ct[i]&0xf];
+                            }
+                            hex[j++]='.'; hex[j++]='.'; hex[j++]='.'; hex[j]='\0';
+                            terminal_print(hex, 0xFF6600);
+                            /* Decrypt to verify */
+                            crypto_aes_params_t dp = {key, iv, ct, (unsigned long)ct_len, pt, sizeof(pt)};
+                            int pt_len = crypto_aes_decrypt(&dp);
+                            if (pt_len > 0) {
+                                pt[pt_len] = '\0';
+                                terminal_print("Decrypted back:", 0xFFFF00);
+                                terminal_print((char*)pt, 0x00FF00);
+                            }
+                        } else {
+                            terminal_print("[ERROR] Encryption failed!", 0xFF0000);
                         }
                     }
                     /* --- COMMAND NOT FOUND --- */

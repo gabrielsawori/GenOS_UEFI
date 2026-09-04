@@ -123,13 +123,43 @@ void pmm_init(void) {
     serial_write_string("[OK] PMM Aktif. Peta Bitmap telah dikalibrasi.\n");
 }
 
+static uint64_t last_alloc_index = 0;
+
 void* pmm_alloc_page(void) {
     for (uint64_t i = 0; i < total_pages; i++) {
-        if (!bitmap_test(i)) {
-            bitmap_set(i); 
-            refcounts[i] = 1; /* New page starts with refcount=1 */
+        uint64_t idx = (last_alloc_index + i) % total_pages;
+        if (!bitmap_test(idx)) {
+            bitmap_set(idx); 
+            refcounts[idx] = 1; /* New page starts with refcount=1 */
             free_pages--;
-            return (void*)(i * PAGE_SIZE); 
+            last_alloc_index = idx + 1;
+            return (void*)(idx * PAGE_SIZE); 
+        }
+    }
+    return NULL; 
+}
+
+void* pmm_alloc_contiguous_pages(uint64_t count) {
+    if (count == 0) return NULL;
+    if (count == 1) return pmm_alloc_page();
+
+    uint64_t run = 0;
+    uint64_t start_idx = 0;
+
+    for (uint64_t i = 0; i < total_pages; i++) {
+        if (!bitmap_test(i)) {
+            if (run == 0) start_idx = i;
+            run++;
+            if (run == count) {
+                for (uint64_t j = 0; j < count; j++) {
+                    bitmap_set(start_idx + j);
+                    refcounts[start_idx + j] = 1;
+                }
+                free_pages -= count;
+                return (void*)(start_idx * PAGE_SIZE);
+            }
+        } else {
+            run = 0;
         }
     }
     return NULL; 

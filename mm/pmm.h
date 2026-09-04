@@ -11,5 +11,6 @@ void pmm_free_page(void* ptr);    // Fungsi untuk mengembalikan petak RAM ke sis
 uint64_t pmm_get_free_ram(void);  // Melihat sisa RAM kosong
 
 /* === Copy-on-Write (CoW) Reference Counting === */
+void* pmm_alloc_contiguous_pages(uint64_t count);
 void pmm_ref_page(void* ptr);         // Tambah reference count (untuk CoW sharing)
 uint8_t pmm_get_refcount(void* ptr);  // Cek reference count (>1 = shared/CoW)

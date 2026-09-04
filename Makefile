@@ -4,13 +4,13 @@ CFLAGS = -Wall -Wextra -O2 -pipe -ffreestanding -fno-stack-protector -fno-stack-
 LD = ld
 LDFLAGS = -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 
-SRC_DIRS = kernel drivers cpu mm fs
+SRC_DIRS = kernel drivers cpu mm fs crypto security
 C_SRCS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)/*.c))
 ASM_SRCS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)/*.S))
 OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.S=.o)
 
 # Daftar file libc yang digunakan oleh semua aplikasi user-space
-LIBC_SRCS = libc/stdio.c libc/stdlib.c libc/string.c
+LIBC_SRCS = libc/stdio.c libc/stdlib.c libc/string.c libc/crypto.c
 LIBC_OBJS = $(LIBC_SRCS:.c=.o)
 
 .PHONY: all clean run iso ramdisk
@@ -39,10 +39,16 @@ app.elf: $(LIBC_OBJS)
 	$(CC) $(CFLAGS) -c app/app.c -o app/app.o
 	$(LD) -nostdlib -Ttext 0x40000000 app/app.o $(LIBC_OBJS) -o app.elf
 
+# --- KOMPILASI DESKTOP ENVIRONMENT SEBAGAI ELF ---
+desktop.elf: $(LIBC_OBJS)
+	mkdir -p desktop
+	$(CC) $(CFLAGS) -c desktop/desktop.c -o desktop/desktop.o
+	$(LD) -nostdlib -Ttext 0x45000000 desktop/desktop.o $(LIBC_OBJS) -o desktop.elf
+
 # --- BUNGKUS SEMUA KE RAMDISK ---
-ramdisk.tar: shell.elf app.elf
+ramdisk.tar: shell.elf app.elf desktop.elf
 	@echo "HELLO MANDOR! This is a secret from the outside world." > pesan.txt
-	@tar -cvf ramdisk.tar pesan.txt shell.elf app.elf
+	@tar -cvf ramdisk.tar pesan.txt shell.elf app.elf desktop.elf
 
 GenOS.iso: kernel.elf ramdisk.tar
 	mkdir -p iso_root
@@ -60,5 +66,5 @@ run: GenOS.iso
 
 clean:
 	rm -f $(OBJS) $(LIBC_OBJS) kernel.elf GenOS.iso ramdisk.tar pesan.txt
-	rm -f app.elf app/app.o shell.elf shell/shell.o
+	rm -f app.elf app/app.o shell.elf shell/shell.o desktop.elf desktop/desktop.o
 	rm -rf iso_root
