@@ -1,673 +1,699 @@
 /*
- * GenOS System Shell (Ring 3 — User Space)
+ * GenOS v4 Security Terminal (Ring 3 — User Space)
  *
- * Shell ini berjalan sepenuhnya di Ring 3. Semua komunikasi dengan kernel
- * dilakukan melalui system call. Jika shell crash, kernel tetap aman.
+ * Terminal berjalan sepenuhnya di Ring 3 dengan fitur:
+ *   - Scroll buffer 256 baris history
+ *   - Page Up/Down untuk navigasi history
+ *   - Cybersecurity-themed UI
+ *   - Status bar dengan info sistem
  *
- * Syscall yang digunakan:
- *   5  (clear_screen)  - bersihkan layar
- *   6  (print_at)      - cetak teks pada posisi (x,y)
- *   7  (draw_char)     - gambar 1 karakter
- *   3  (read_key)      - baca keyboard
- *   4  (sleep)         - delay
- *   8  (read_file)     - baca file dari ramdisk
- *   9  (exec)          - jalankan program ELF
- *   10 (fill_rect)     - isi area persegi (untuk membersihkan baris)
- *   2  (exit)          - keluar
+ * Semua komunikasi dengan kernel melalui system call.
  */
 #include "../libc/stdio.h"
 #include "../libc/stdlib.h"
 #include "../libc/string.h"
 #include "../libc/crypto.h"
 
-/* === Geometri Terminal ===
- * Font 8x8 dengan scale=2 → 1 cell = 16x16 piksel.
- * Tinggi baris 24 piksel (16 cell + 8 piksel jarak antar baris).
- * Margin kiri 50 piksel, area gambar dibatasi sampai x = 800.
- */
-#define TERM_LEFT     50
-#define TERM_TOP      50
-#define TERM_RIGHT    800
-#define TERM_LINE_H   24
-#define TERM_CELL_W   16
-#define TERM_BG       0x002244
+/* === Special Key Codes (matching keyboard driver) === */
+#define KEY_UP    0x80
+#define KEY_DOWN  0x81
+#define KEY_LEFT  0x82
+#define KEY_RIGHT 0x83
+#define KEY_PGUP  0x84
+#define KEY_PGDN  0x85
 
-/* Posisi kursor terminal (dikelola di user-space) */
-static int cursor_x = TERM_LEFT;
-static int cursor_y = TERM_TOP;
+/* === Cyber Security Theme === */
+#define COLOR_BG        0x0A0E14
+#define COLOR_TEXT       0x00FF41
+#define COLOR_PROMPT     0x00FFFF
+#define COLOR_ERROR      0xFF3333
+#define COLOR_WARN       0xFFCC00
+#define COLOR_SUCCESS    0x33FF33
+#define COLOR_INFO       0x00AAFF
+#define COLOR_HEADER     0xFFFFFF
+#define COLOR_DIM        0x556677
+#define COLOR_STATUS_BG  0x16192B
+#define COLOR_STATUS_FG  0x8888AA
+#define COLOR_ACCENT     0xFF6600
 
-/*
- * BUG FIX: Bersihkan area baris (rect) sebelum menulis teks.
- * Tanpa ini, ketika perintah dijalankan berulang kali, teks lama
- * di posisi (cursor_x, cursor_y) tetap terlihat di sela-sela glyph
- * baru karena font 8x8 tidak menutupi seluruh cell secara opaque
- * dan jarak antar baris (8 px) tidak ikut tertimpa.
- */
-static void terminal_clear_line(int y) {
-    fill_rect(TERM_LEFT, y, TERM_RIGHT - TERM_LEFT, TERM_LINE_H, TERM_BG);
+/* === Terminal Geometry === */
+#define TERM_LEFT    24
+#define TERM_CELL_W  16
+#define TERM_LINE_H  22
+#define STATUS_BAR_H 28
+
+/* === Scroll Buffer === */
+#define SCROLL_LINES 256
+#define SCROLL_COLS  120
+
+typedef struct {
+    char text[SCROLL_COLS + 1];
+    uint32_t color;
+} terminal_line_t;
+
+static terminal_line_t scroll_buf[SCROLL_LINES];
+static int buf_head  = 0;
+static int buf_count = 0;
+static int scroll_offset = 0;
+
+/* === Screen State === */
+static int screen_w = 1024;
+static int screen_h = 768;
+static int visible_lines = 28;
+static int term_top = 36;
+static int chars_per_line = 60;
+static int cursor_x;
+static int input_y;
+
+/* === Number-to-string helper === */
+static void u64_to_str(uint64_t val, char* buf, int* pos) {
+    char tmp[24];
+    int n = 0;
+    if (val == 0) { tmp[n++] = '0'; }
+    else { while (val > 0) { tmp[n++] = '0' + (val % 10); val /= 10; } }
+    for (int k = n - 1; k >= 0; k--) buf[(*pos)++] = tmp[k];
 }
 
-/* Cetak teks lalu pindah kursor ke baris berikutnya */
+static void i32_to_str(int val, char* buf, int* pos) {
+    if (val < 0) { buf[(*pos)++] = '-'; val = -val; }
+    u64_to_str((uint64_t)(unsigned int)val, buf, pos);
+}
+
+static void str_append(char* buf, int* pos, const char* s) {
+    while (*s && *pos < 120) buf[(*pos)++] = *s++;
+}
+
+/* === Status Bar === */
+static void render_status_bar(void) {
+    fill_rect(0, 0, screen_w, STATUS_BAR_H, COLOR_STATUS_BG);
+
+    /* Left: branding */
+    print_at(" GenOS v4", 8, 6, COLOR_ACCENT);
+    print_at(" Security Terminal", 8 + 9 * TERM_CELL_W, 6, COLOR_STATUS_FG);
+
+    /* Right: scroll indicator */
+    if (scroll_offset > 0) {
+        char info[32];
+        int j = 0;
+        str_append(info, &j, "[SCROLL ");
+        i32_to_str(scroll_offset, info, &j);
+        info[j++] = ']';
+        info[j] = '\0';
+        print_at(info, screen_w - (j + 1) * TERM_CELL_W, 6, COLOR_WARN);
+    }
+}
+
+/* === Viewport Renderer === */
+static void render_viewport(void) {
+    /* Clear terminal area */
+    fill_rect(0, term_top, screen_w, screen_h - term_top, COLOR_BG);
+
+    /* When scroll_offset > 0 (viewing history), use full area.
+     * When at bottom, reserve last line for input prompt. */
+    int max_lines = (scroll_offset > 0) ? visible_lines : visible_lines - 1;
+
+    /* Calculate first line index to display */
+    int first_line = buf_count - scroll_offset - max_lines;
+    if (first_line < 0) first_line = 0;
+
+    int oldest_pos = (buf_head - buf_count + SCROLL_LINES) % SCROLL_LINES;
+    if (oldest_pos < 0) oldest_pos += SCROLL_LINES;
+
+    int end_line = buf_count - scroll_offset;
+    int lines_drawn = 0;
+
+    for (int i = first_line; i < end_line && lines_drawn < max_lines; i++, lines_drawn++) {
+        int pos = (oldest_pos + i) % SCROLL_LINES;
+        int y = term_top + lines_drawn * TERM_LINE_H;
+        print_at(scroll_buf[pos].text, TERM_LEFT, y, scroll_buf[pos].color);
+    }
+
+    /* Input line Y position */
+    input_y = term_top + lines_drawn * TERM_LINE_H;
+
+    /* Status bar (update scroll indicator) */
+    render_status_bar();
+}
+
+/* === Terminal Output === */
 static void terminal_print(const char* text, uint32_t color) {
-    terminal_clear_line(cursor_y);
-    print_at(text, cursor_x, cursor_y, color);
-    cursor_y += TERM_LINE_H;
-    cursor_x = TERM_LEFT;
+    int i;
+    for (i = 0; i < SCROLL_COLS && text[i]; i++)
+        scroll_buf[buf_head].text[i] = text[i];
+    scroll_buf[buf_head].text[i] = '\0';
+    scroll_buf[buf_head].color = color;
+
+    buf_head = (buf_head + 1) % SCROLL_LINES;
+    if (buf_count < SCROLL_LINES) buf_count++;
+
+    /* Auto-scroll to bottom on new output */
+    scroll_offset = 0;
+
+    render_viewport();
 }
 
-/* Cetak prompt shell */
+/* === Prompt === */
+static int prompt_len = 0;
+
 static void print_prompt(void) {
-    terminal_clear_line(cursor_y);
-    print_at("Mandor@GenOS:~$ ", cursor_x, cursor_y, 0x00FFFF);
-    cursor_x += 16 * TERM_CELL_W; /* Lebar prompt = 16 karakter × 16 piksel */
+    char uname[32];
+    crypto_whoami(uname, sizeof(uname));
+
+    char prompt[64];
+    int j = 0;
+    for (int k = 0; uname[k] && j < 28; k++) prompt[j++] = uname[k];
+    str_append(prompt, &j, "@GenOS:~$ ");
+    prompt[j] = '\0';
+    prompt_len = j;
+
+    fill_rect(TERM_LEFT, input_y, screen_w - TERM_LEFT, TERM_LINE_H, COLOR_BG);
+    print_at(prompt, TERM_LEFT, input_y, COLOR_PROMPT);
+    cursor_x = TERM_LEFT + j * TERM_CELL_W;
 }
+
+/* === Welcome Screen === */
+static void show_welcome(void) {
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  ======================================================", COLOR_DIM);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("       G E N O S   v 4   S E C U R I T Y   K E R N E L", COLOR_ACCENT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  ======================================================", COLOR_DIM);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  [*] Ring 3 Isolated Terminal", COLOR_TEXT);
+    terminal_print("  [*] SMEP + NX/W^X Enforced", COLOR_TEXT);
+    terminal_print("  [*] User Pointer Validation Active", COLOR_TEXT);
+    terminal_print("  [*] AES-256 / SHA-256 / HMAC / PBKDF2", COLOR_TEXT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  Type 'help' for commands.  Page Up/Down to scroll.", COLOR_DIM);
+    terminal_print("", COLOR_TEXT);
+}
+
+/* ================================================================
+ *                     COMMAND HANDLERS
+ * ================================================================ */
+
+static void cmd_help(void) {
+    terminal_print("=== Available Commands ===", COLOR_INFO);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  System:", COLOR_WARN);
+    terminal_print("    help      Show this message", COLOR_TEXT);
+    terminal_print("    clear     Clear terminal + history", COLOR_TEXT);
+    terminal_print("    info      System information", COLOR_TEXT);
+    terminal_print("    run       Execute app.elf", COLOR_TEXT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  Filesystem:", COLOR_WARN);
+    terminal_print("    ls        List files (ramdisk + tmpfs)", COLOR_TEXT);
+    terminal_print("    cat <f>   Read file contents", COLOR_TEXT);
+    terminal_print("    read      Read pesan.txt", COLOR_TEXT);
+    terminal_print("    write <f> <text>   Write to tmpfs", COLOR_TEXT);
+    terminal_print("    rm <f>    Delete tmpfs file", COLOR_TEXT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  Security:", COLOR_WARN);
+    terminal_print("    whoami    Current user info", COLOR_TEXT);
+    terminal_print("    login <u> Authenticate as user", COLOR_TEXT);
+    terminal_print("    hash <t>  SHA-256 hash", COLOR_TEXT);
+    terminal_print("    random    Generate 128-bit random", COLOR_TEXT);
+    terminal_print("    encrypt <t>  AES-256-CBC demo", COLOR_TEXT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  IPC & Process:", COLOR_WARN);
+    terminal_print("    shm       Shared memory demo", COLOR_TEXT);
+    terminal_print("    cache     Buffer cache stats", COLOR_TEXT);
+    terminal_print("    fork      Fork process demo", COLOR_TEXT);
+    terminal_print("", COLOR_TEXT);
+    terminal_print("  Power:", COLOR_WARN);
+    terminal_print("    shutdown  Power off", COLOR_TEXT);
+    terminal_print("    restart   Reboot system", COLOR_TEXT);
+}
+
+static void cmd_info(void) {
+    terminal_print("[*] GenOS v4 Security Kernel (64-bit UEFI)", COLOR_SUCCESS);
+    terminal_print("[*] Architecture: x86_64 Long Mode", COLOR_TEXT);
+    terminal_print("[*] Isolation: Ring-3 User Space Terminal", COLOR_TEXT);
+    terminal_print("[*] Security: SMEP + NX/W^X + Pointer Validation", COLOR_TEXT);
+    terminal_print("[*] Crypto: AES-256-CBC, SHA-256, HMAC, PBKDF2", COLOR_TEXT);
+}
+
+static void cmd_ls(void) {
+    terminal_print("=== File Listing ===", COLOR_INFO);
+    int dir_fd = open("/", 0);
+    if (dir_fd < 0) { terminal_print("[ERROR] Cannot open ramdisk!", COLOR_ERROR); return; }
+    char name_buf[100];
+    long size_val = 0;
+    while (readdir(dir_fd, name_buf, (int*)&size_val)) {
+        char line[200];
+        int j = 0;
+        str_append(line, &j, "  ");
+        str_append(line, &j, name_buf);
+        /* Pad to 30 chars */
+        while (j < 30) line[j++] = ' ';
+        u64_to_str((uint64_t)size_val, line, &j);
+        str_append(line, &j, " bytes");
+        line[j] = '\0';
+        terminal_print(line, COLOR_TEXT);
+        size_val = 0;
+    }
+    close(dir_fd);
+}
+
+static void cmd_read(void) {
+    int fd = open("pesan.txt", 0);
+    if (fd < 0) { terminal_print("[ERROR] pesan.txt not found!", COLOR_ERROR); return; }
+    char file_buf[256];
+    int bytes = read(fd, file_buf, 255);
+    close(fd);
+    if (bytes > 0) {
+        file_buf[bytes] = '\0';
+        terminal_print("[pesan.txt]:", COLOR_INFO);
+        terminal_print(file_buf, COLOR_TEXT);
+    } else {
+        terminal_print("[INFO] File is empty", COLOR_DIM);
+    }
+}
+
+static void cmd_cat(const char* fname) {
+    int fd = open(fname, 0);
+    if (fd < 0) {
+        char line[128]; int j = 0;
+        str_append(line, &j, "[ERROR] File not found: ");
+        str_append(line, &j, fname);
+        line[j] = '\0';
+        terminal_print(line, COLOR_ERROR);
+        return;
+    }
+    char file_buf[512];
+    int bytes = read(fd, file_buf, 511);
+    close(fd);
+    if (bytes > 0) {
+        file_buf[bytes] = '\0';
+        terminal_print(file_buf, COLOR_TEXT);
+    } else {
+        terminal_print("[INFO] File is empty", COLOR_DIM);
+    }
+}
+
+static void cmd_write(const char* args) {
+    char fname[64];
+    int fi = 0;
+    while (*args && *args != ' ' && fi < 63) fname[fi++] = *args++;
+    fname[fi] = '\0';
+    if (*args == ' ') args++;
+    if (fi == 0) { terminal_print("Usage: write <filename> <text>", COLOR_ERROR); return; }
+
+    int fd = open(fname, 4);
+    if (fd < 0) { terminal_print("[ERROR] Cannot create file", COLOR_ERROR); return; }
+    int len = 0; while (args[len]) len++;
+    int written = write(fd, args, len);
+    close(fd);
+    if (written > 0) {
+        char line[128]; int j = 0;
+        str_append(line, &j, "[OK] Wrote ");
+        i32_to_str(written, line, &j);
+        str_append(line, &j, " bytes to ");
+        str_append(line, &j, fname);
+        line[j] = '\0';
+        terminal_print(line, COLOR_SUCCESS);
+    } else {
+        terminal_print("[ERROR] Write failed", COLOR_ERROR);
+    }
+}
+
+static void cmd_rm(const char* fname) {
+    int ret = unlink(fname);
+    if (ret == 0) {
+        char line[80]; int j = 0;
+        str_append(line, &j, "[OK] Deleted: ");
+        str_append(line, &j, fname);
+        line[j] = '\0';
+        terminal_print(line, COLOR_SUCCESS);
+    } else {
+        terminal_print("[ERROR] Cannot delete (only tmpfs)", COLOR_ERROR);
+    }
+}
+
+static void cmd_run(void) {
+    terminal_print("[*] Loading app.elf...", COLOR_INFO);
+    int pid = exec("app.elf");
+    if (pid <= 0) { terminal_print("[ERROR] app.elf not found!", COLOR_ERROR); return; }
+    wait_pid(pid);
+    clear_screen();
+    fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
+    render_status_bar();
+    render_viewport();
+    terminal_print("[app.elf finished - terminal restored]", COLOR_INFO);
+}
+
+static void cmd_shm(void) {
+    terminal_print("=== Shared Memory IPC Demo ===", COLOR_INFO);
+    int shmid = shm_create(4096);
+    if (shmid < 0) { terminal_print("[ERROR] shm_create failed!", COLOR_ERROR); return; }
+    char* shm = (char*)shm_attach(shmid);
+    if (!shm) { terminal_print("[ERROR] shm_attach failed!", COLOR_ERROR); return; }
+    const char* msg = "Hello from shared memory!";
+    int i; for (i = 0; msg[i]; i++) shm[i] = msg[i]; shm[i] = '\0';
+
+    char line[80]; int j = 0;
+    str_append(line, &j, "  Write: ");
+    str_append(line, &j, shm);
+    line[j] = '\0';
+    terminal_print(line, COLOR_TEXT);
+
+    j = 0;
+    str_append(line, &j, "  Read:  ");
+    str_append(line, &j, shm);
+    line[j] = '\0';
+    terminal_print(line, COLOR_SUCCESS);
+
+    shm_detach(shm);
+    shm_destroy(shmid);
+    terminal_print("[OK] Segment destroyed.", COLOR_DIM);
+}
+
+static void cmd_cache(void) {
+    terminal_print("=== Buffer Cache Statistics ===", COLOR_INFO);
+    cache_stats_t cs;
+    if (cache_get_stats(&cs) != 0) { terminal_print("[ERROR] Failed!", COLOR_ERROR); return; }
+
+    char line[128]; int j;
+
+    j = 0; str_append(line, &j, "  Hits:       "); u64_to_str(cs.hits, line, &j); line[j]=0;
+    terminal_print(line, COLOR_SUCCESS);
+    j = 0; str_append(line, &j, "  Misses:     "); u64_to_str(cs.misses, line, &j); line[j]=0;
+    terminal_print(line, COLOR_ACCENT);
+    j = 0; str_append(line, &j, "  Evictions:  "); u64_to_str(cs.evictions, line, &j); line[j]=0;
+    terminal_print(line, COLOR_ERROR);
+    j = 0; str_append(line, &j, "  Blocks:     "); u64_to_str(cs.used_blocks, line, &j);
+    str_append(line, &j, " / "); u64_to_str(cs.total_blocks, line, &j); line[j]=0;
+    terminal_print(line, COLOR_TEXT);
+
+    uint64_t total = cs.hits + cs.misses;
+    j = 0; str_append(line, &j, "  Hit Rate:   ");
+    if (total > 0) { u64_to_str((cs.hits * 100) / total, line, &j); line[j++] = '%'; }
+    else { str_append(line, &j, "N/A"); }
+    line[j] = 0;
+    terminal_print(line, COLOR_HEADER);
+}
+
+static void cmd_fork(void) {
+    terminal_print("=== Fork Demo ===", COLOR_INFO);
+    int child_pid = fork();
+    if (child_pid < 0) { terminal_print("[ERROR] fork() failed!", COLOR_ERROR); }
+    else if (child_pid == 0) {
+        terminal_print("[CHILD] I am the cloned process!", COLOR_SUCCESS);
+        terminal_print("[CHILD] Exiting...", COLOR_SUCCESS);
+        exit(0);
+    } else {
+        char line[80]; int j = 0;
+        str_append(line, &j, "[PARENT] Child PID: ");
+        i32_to_str(child_pid, line, &j);
+        line[j] = '\0';
+        terminal_print(line, COLOR_TEXT);
+        wait_pid(child_pid);
+        terminal_print("[PARENT] Child finished.", COLOR_DIM);
+    }
+}
+
+static void cmd_whoami(void) {
+    char uname[32];
+    int uid = crypto_whoami(uname, sizeof(uname));
+    char line[80]; int j = 0;
+    str_append(line, &j, "[*] User: ");
+    str_append(line, &j, uname);
+    str_append(line, &j, "  (UID ");
+    i32_to_str(uid, line, &j);
+    line[j++] = ')'; line[j] = '\0';
+    terminal_print(line, COLOR_SUCCESS);
+}
+
+static void cmd_login(const char* uname) {
+    terminal_print("Password: ", COLOR_DIM);
+    /* Render password prompt on input line */
+    fill_rect(TERM_LEFT, input_y, screen_w - TERM_LEFT, TERM_LINE_H, COLOR_BG);
+    print_at("Password: ", TERM_LEFT, input_y, COLOR_DIM);
+    int px = TERM_LEFT + 10 * TERM_CELL_W;
+
+    char pass[64]; int pi = 0;
+    while (1) {
+        char k = read_key();
+        if (k == '\n') break;
+        if (k == '\b' && pi > 0) {
+            pi--;
+            px -= TERM_CELL_W;
+            fill_rect(px, input_y, TERM_CELL_W, TERM_LINE_H, COLOR_BG);
+            continue;
+        }
+        if (k && k != '\b' && pi < 63) {
+            pass[pi++] = k;
+            draw_char('*', px, input_y, COLOR_DIM);
+            px += TERM_CELL_W;
+        }
+    }
+    pass[pi] = '\0';
+
+    int uid = crypto_login(uname, pass);
+    if (uid >= 0) {
+        char line[80]; int j = 0;
+        str_append(line, &j, "[OK] Authenticated as ");
+        str_append(line, &j, uname);
+        str_append(line, &j, " (UID ");
+        i32_to_str(uid, line, &j);
+        line[j++] = ')'; line[j] = '\0';
+        terminal_print(line, COLOR_SUCCESS);
+    } else {
+        terminal_print("[FAIL] Authentication failed!", COLOR_ERROR);
+    }
+}
+
+static void cmd_hash(const char* text) {
+    int tlen = 0; while (text[tlen]) tlen++;
+    uint8_t digest[32];
+    crypto_sha256(text, (unsigned long)tlen, digest);
+    const char* hc = "0123456789abcdef";
+    char hex[65];
+    for (int i = 0; i < 32; i++) {
+        hex[i*2]   = hc[(digest[i]>>4)&0xf];
+        hex[i*2+1] = hc[digest[i]&0xf];
+    }
+    hex[64] = '\0';
+    terminal_print("[SHA-256]", COLOR_INFO);
+    terminal_print(hex, COLOR_TEXT);
+}
+
+static void cmd_random(void) {
+    uint8_t rbuf[16];
+    crypto_random(rbuf, 16);
+    const char* hc = "0123456789abcdef";
+    char hex[48]; int j = 0;
+    for (int i = 0; i < 16; i++) {
+        hex[j++] = hc[(rbuf[i]>>4)&0xf];
+        hex[j++] = hc[rbuf[i]&0xf];
+        if (i % 4 == 3 && i < 15) hex[j++] = ' ';
+    }
+    hex[j] = '\0';
+    terminal_print("[RANDOM 128-bit]", COLOR_INFO);
+    terminal_print(hex, COLOR_SUCCESS);
+}
+
+static void cmd_encrypt(const char* text) {
+    int tlen = 0; while (text[tlen]) tlen++;
+    uint8_t key[32], iv[16];
+    crypto_random(key, 32);
+    crypto_random(iv, 16);
+    uint8_t ct[256], pt[256];
+    crypto_aes_params_t ep = {key, iv, text, (unsigned long)tlen, ct, sizeof(ct)};
+    int ct_len = crypto_aes_encrypt(&ep);
+    if (ct_len > 0) {
+        const char* hc = "0123456789abcdef";
+        char hex[64]; int j = 0;
+        int show = ct_len > 16 ? 16 : ct_len;
+        for (int i = 0; i < show; i++) {
+            hex[j++] = hc[(ct[i]>>4)&0xf];
+            hex[j++] = hc[ct[i]&0xf];
+        }
+        hex[j++]='.'; hex[j++]='.'; hex[j++]='.'; hex[j]='\0';
+        terminal_print("[AES-256-CBC Ciphertext]", COLOR_INFO);
+        terminal_print(hex, COLOR_ACCENT);
+
+        crypto_aes_params_t dp = {key, iv, ct, (unsigned long)ct_len, pt, sizeof(pt)};
+        int pt_len = crypto_aes_decrypt(&dp);
+        if (pt_len > 0) {
+            pt[pt_len] = '\0';
+            terminal_print("[Decrypted]", COLOR_INFO);
+            terminal_print((char*)pt, COLOR_SUCCESS);
+        }
+    } else {
+        terminal_print("[ERROR] Encryption failed!", COLOR_ERROR);
+    }
+}
+
+/* ================================================================
+ *                     MAIN ENTRY POINT
+ * ================================================================ */
 
 void _start(void) {
-    /* --- LAYAR SELAMAT DATANG --- */
+    /* Initialize screen geometry */
+    screen_info_t si;
+    if (get_screen_info(&si) == 0) {
+        screen_w = si.width;
+        screen_h = si.height;
+    }
+    term_top = STATUS_BAR_H + 8;
+    visible_lines = (screen_h - term_top - 16) / TERM_LINE_H;  /* 16px bottom margin */
+    if (visible_lines > 40) visible_lines = 40;
+    if (visible_lines < 10) visible_lines = 10;
+    chars_per_line = (screen_w - TERM_LEFT * 2) / TERM_CELL_W;
+    if (chars_per_line > SCROLL_COLS) chars_per_line = SCROLL_COLS;
+
+    /* Clear screen with new theme */
     clear_screen();
-    terminal_print("=============================================", 0xFFFFFF);
-    terminal_print("           GENOS SYSTEM TERMINAL V3          ", 0x00FF00);
-    terminal_print("        [Ring 3 - Isolated User Space]       ", 0x00CC00);
-    terminal_print("=============================================", 0xFFFFFF);
-    terminal_print("Type 'help' to see available commands.", 0xAAAAAA);
-    cursor_y += 10;
+    fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
+    render_status_bar();
+
+    /* Welcome message */
+    show_welcome();
 
     char cmd_buffer[256];
     int cmd_index = 0;
 
     print_prompt();
-    int prompt_batas_kiri = cursor_x;
 
-    /* --- LOOP UTAMA SHELL --- */
+    /* === MAIN LOOP === */
     while (1) {
         char c = read_key();
+        if (c == 0) continue;
 
-        if (c != 0) {
-            /* ===== ENTER: Eksekusi perintah ===== */
-            if (c == '\n') {
-                cmd_buffer[cmd_index] = '\0';
-                cursor_y += TERM_LINE_H;
-                cursor_x = TERM_LEFT;
+        /* --- Page Up: Scroll history up --- */
+        if (c == (char)KEY_PGUP) {
+            int max_scroll = buf_count - (visible_lines - 1);
+            if (max_scroll < 0) max_scroll = 0;
+            scroll_offset += visible_lines / 2;
+            if (scroll_offset > max_scroll) scroll_offset = max_scroll;
+            render_viewport();
+            if (scroll_offset == 0) print_prompt();
+            continue;
+        }
 
-                if (cmd_index > 0) {
-                    /* --- HELP --- */
-                    if (strcmp(cmd_buffer, "help") == 0) {
-                        terminal_print("Available Commands:", 0xFFFF00);
-                        terminal_print("  help    : Show this message", 0xFFFFFF);
-                        terminal_print("  clear   : Clear the terminal screen", 0xFFFFFF);
-                        terminal_print("  info    : OS Information", 0xFFFFFF);
-                        terminal_print("  ls      : List files (ramdisk + tmpfs)", 0xFFFFFF);
-                        terminal_print("  read    : Read pesan.txt from Ramdisk", 0xFFFFFF);
-                        terminal_print("  cat     : Read any file (TAR or tmpfs)", 0xFFFFFF);
-                        terminal_print("  write   : Write text to tmpfs file", 0xFFFFFF);
-                        terminal_print("  rm      : Delete a tmpfs file", 0xFFFFFF);
-                        terminal_print("  shm     : Shared memory IPC demo", 0xFFFFFF);
-                        terminal_print("  cache   : Buffer cache statistics", 0xFFFFFF);
-                        terminal_print("  fork    : Fork process demo", 0xFFFFFF);
-                        terminal_print("  run     : Execute app.elf in Ring 3!", 0x00FF00);
-                        terminal_print("  desktop : Launch Desktop Environment!", 0x00FF00);
-                        terminal_print("  mouse   : Show mouse diagnostic counters", 0x00FFFF);
-                        terminal_print("  whoami  : Show current user", 0x00FFFF);
-                        terminal_print("  login   : Login as user", 0x00FFFF);
-                        terminal_print("  hash    : SHA-256 hash demo", 0x00FFFF);
-                        terminal_print("  random  : Generate random bytes", 0x00FFFF);
-                        terminal_print("  encrypt : AES-256 encryption demo", 0x00FFFF);
-                    }
-                    /* --- CLEAR --- */
-                    else if (strcmp(cmd_buffer, "clear") == 0) {
-                        clear_screen();
-                        cursor_x = TERM_LEFT;
-                        cursor_y = TERM_TOP;
-                    }
-                    /* --- INFO --- */
-                    else if (strcmp(cmd_buffer, "info") == 0) {
-                        terminal_print("GenOS v3 (64-bit UEFI) - Built by Mandor", 0x00FF00);
-                        terminal_print("Architecture: x86_64 | Security: Ring-3 Shell", 0x00FF00);
-                        terminal_print("Shell berjalan di User Space (terisolasi)", 0x00FF00);
-                    }
-                    /* --- LS: List files via VFS readdir --- */
-                    else if (strcmp(cmd_buffer, "ls") == 0) {
-                        terminal_print("Ramdisk contents:", 0xFFFF00);
-                        int dir_fd = open("/", 0);
-                        if (dir_fd < 0) {
-                            terminal_print("[ERROR] Cannot open ramdisk!", 0xFF0000);
-                        } else {
-                            char name_buf[100];
-                            long size_val = 0;
-                            while (readdir(dir_fd, name_buf, (int*)&size_val)) {
-                                /* Format: "  filename (size bytes)" */
-                                char line[200];
-                                int j = 0;
-                                line[j++] = ' '; line[j++] = ' ';
-                                for (int k = 0; name_buf[k] && j < 150; k++) {
-                                    line[j++] = name_buf[k];
-                                }
-                                line[j++] = ' '; line[j++] = '(';
-                                /* Convert size to string */
-                                if (size_val == 0) {
-                                    line[j++] = '0';
-                                } else {
-                                    char num[16];
-                                    int ni = 0;
-                                    long tmp = size_val;
-                                    while (tmp > 0) { num[ni++] = '0' + (tmp % 10); tmp /= 10; }
-                                    for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                                }
-                                line[j++] = ' '; line[j++] = 'b'; line[j++] = 'y';
-                                line[j++] = 't'; line[j++] = 'e'; line[j++] = 's';
-                                line[j++] = ')'; line[j] = '\0';
-                                terminal_print(line, 0xFFFFFF);
-                                size_val = 0;
-                            }
-                            close(dir_fd);
-                        }
-                    }
-                    /* --- READ: Use VFS open/read/close --- */
-                    else if (strcmp(cmd_buffer, "read") == 0) {
-                        int fd = open("pesan.txt", 0);
-                        if (fd < 0) {
-                            terminal_print("[ERROR] pesan.txt not found!", 0xFF0000);
-                        } else {
-                            char file_buf[256];
-                            int bytes = read(fd, file_buf, 255);
-                            close(fd);
-                            if (bytes > 0) {
-                                file_buf[bytes] = '\0';
-                                terminal_print("Extracting pesan.txt via VFS:", 0xFFFF00);
-                                terminal_print(file_buf, 0xFFFFFF);
-                            } else {
-                                terminal_print("[ERROR] pesan.txt is empty!", 0xFF0000);
-                            }
-                        }
-                    }
-                    /* --- RUN ---
-                     *
-                     * wait_pid sekarang BLOCKING: shell tidur (TASK_WAITING)
-                     * sampai child mati, memberi CPU penuh ke app tanpa
-                     * polling busy-wait. Setelah child mati, reaper
-                     * membangunkan shell dan kita bersihkan layar.
-                     */
-                    else if (strcmp(cmd_buffer, "run") == 0) {
-                        terminal_print("Loading app.elf into Ring 3...", 0x00FF00);
-                        int pid = exec("app.elf");
-                        if (pid <= 0) {
-                            terminal_print("[ERROR] app.elf not found!", 0xFF0000);
-                        } else {
-                            /* Blokir sampai child task DEAD */
-                            wait_pid(pid);
-                            /* App selesai — bersihkan layar & reset terminal */
-                            clear_screen();
-                            cursor_x = TERM_LEFT;
-                            cursor_y = TERM_TOP;
-                            terminal_print("[app.elf finished - terminal restored]", 0x00FFFF);
-                        }
-                    }
-                    /* --- DESKTOP: Launch Desktop Environment --- */
-                    else if (strcmp(cmd_buffer, "desktop") == 0) {
-                        terminal_print("Launching Desktop Environment...", 0x00FF00);
-                        int pid = exec("desktop.elf");
-                        if (pid <= 0) {
-                            terminal_print("[ERROR] desktop.elf not found!", 0xFF0000);
-                        } else {
-                            wait_pid(pid);
-                            clear_screen();
-                            cursor_x = TERM_LEFT;
-                            cursor_y = TERM_TOP;
-                            terminal_print("[Desktop closed - terminal restored]", 0x00FFFF);
-                        }
-                    }
-                    /* --- MOUSE: Diagnostic counters (bare-metal debugging) --- */
-                    else if (strcmp(cmd_buffer, "mouse") == 0) {
-                        terminal_print("=== Mouse PS/2 Diagnostic ===", 0xFFFF00);
-                        mouse_stats_t ms;
-                        if (mouse_stats(&ms) == 0) {
-                            char line[128];
-                            int j;
+        /* --- Page Down: Scroll history down --- */
+        if (c == (char)KEY_PGDN) {
+            scroll_offset -= visible_lines / 2;
+            if (scroll_offset < 0) scroll_offset = 0;
+            render_viewport();
+            if (scroll_offset == 0) print_prompt();
+            continue;
+        }
 
-                            /* IRQ bytes */
-                            j = 0;
-                            const char* h1 = "IRQ bytes received : ";
-                            for (int k = 0; h1[k]; k++) line[j++] = h1[k];
-                            {
-                                char num[16]; int ni = 0;
-                                uint32_t v = ms.irq_bytes;
-                                if (v == 0) { num[ni++] = '0'; }
-                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
-                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                            }
-                            line[j] = '\0';
-                            terminal_print(line, (ms.irq_bytes == 0) ? 0xFF6600 : 0x00FF00);
-
-                            /* Packets */
-                            j = 0;
-                            const char* h2 = "Packets decoded    : ";
-                            for (int k = 0; h2[k]; k++) line[j++] = h2[k];
-                            {
-                                char num[16]; int ni = 0;
-                                uint32_t v = ms.packets;
-                                if (v == 0) { num[ni++] = '0'; }
-                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
-                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                            }
-                            line[j] = '\0';
-                            terminal_print(line, (ms.packets == 0) ? 0xFF6600 : 0x00FF00);
-
-                            /* Sync drops */
-                            j = 0;
-                            const char* h3 = "Sync drops         : ";
-                            for (int k = 0; h3[k]; k++) line[j++] = h3[k];
-                            {
-                                char num[16]; int ni = 0;
-                                uint32_t v = ms.sync_drops;
-                                if (v == 0) { num[ni++] = '0'; }
-                                else { while (v > 0) { num[ni++] = '0' + (v % 10); v /= 10; } }
-                                for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                            }
-                            line[j] = '\0';
-                            terminal_print(line, 0xFFFFFF);
-
-                            /* Diagnosis otomatis */
-                            terminal_print("--- Diagnosis ---", 0xAAAAAA);
-                            if (ms.irq_bytes == 0) {
-                                terminal_print("IRQ12 TIDAK pernah fire.", 0xFF0000);
-                                terminal_print("Kemungkinan:", 0xFFFF00);
-                                terminal_print(" - BIOS: USB Legacy Support OFF", 0xFFFFFF);
-                                terminal_print(" - Touchpad pakai I2C (bukan PS/2)", 0xFFFFFF);
-                                terminal_print(" - PS/2 controller tidak ada/dimask", 0xFFFFFF);
-                            } else if (ms.packets == 0) {
-                                terminal_print("IRQ12 masuk tapi paket gagal decode.", 0xFF6600);
-                                terminal_print("Kemungkinan: state machine tidak sinkron", 0xFFFFFF);
-                            } else {
-                                terminal_print("Mouse PS/2 berfungsi.", 0x00FF00);
-                                terminal_print("Jika kursor tetap diam, cek UI desktop.", 0xFFFFFF);
-                            }
-                        } else {
-                            terminal_print("[ERROR] mouse_stats failed!", 0xFF0000);
-                        }
-                    }
-                    /* --- SHM: Shared Memory IPC demo --- */
-                    else if (strcmp(cmd_buffer, "shm") == 0) {
-                        terminal_print("=== Shared Memory IPC Demo ===", 0xFFFF00);
-                        /* 1. Create a 4096-byte segment */
-                        int shmid = shm_create(4096);
-                        if (shmid < 0) {
-                            terminal_print("[ERROR] shm_create failed!", 0xFF0000);
-                        } else {
-                            /* 2. Attach it */
-                            char* shm = (char*)shm_attach(shmid);
-                            if (!shm) {
-                                terminal_print("[ERROR] shm_attach failed!", 0xFF0000);
-                            } else {
-                                /* 3. Write a message to shared memory */
-                                const char* msg = "Hello from shared memory!";
-                                int i;
-                                for (i = 0; msg[i]; i++) shm[i] = msg[i];
-                                shm[i] = '\0';
-                                terminal_print("Wrote to SHM: ", 0x00CCFF);
-                                terminal_print(shm, 0xFFFFFF);
-                                /* 4. Read it back */
-                                terminal_print("Read from SHM: ", 0x00CCFF);
-                                terminal_print(shm, 0x00FF00);
-                                /* 5. Detach */
-                                shm_detach(shm);
-                                terminal_print("[OK] Detached.", 0x00CCFF);
-                            }
-                            /* 6. Destroy */
-                            shm_destroy(shmid);
-                            terminal_print("[OK] Segment destroyed.", 0x00CCFF);
-                        }
-                    }
-                    /* --- CACHE: Buffer Cache Statistics --- */
-                    else if (strcmp(cmd_buffer, "cache") == 0) {
-                        terminal_print("=== Buffer Cache Statistics ===", 0xFFFF00);
-                        cache_stats_t cs;
-                        if (cache_get_stats(&cs) == 0) {
-                            char line[128];
-
-                            /* Helper: uint64 to string */
-                            #define U64_STR(val, buf, len) do { \
-                                char _t[24]; int _n = 0; \
-                                uint64_t _v = (val); \
-                                if (_v == 0) { _t[_n++] = '0'; } \
-                                else { while (_v > 0) { _t[_n++] = '0' + (_v % 10); _v /= 10; } } \
-                                for (int _k = _n - 1; _k >= 0 && (len) < 100; _k--) (buf)[(len)++] = _t[_k]; \
-                            } while(0)
-
-                            /* Hits */
-                            int j = 0;
-                            const char* h1 = "  Hits:      ";
-                            for (int k = 0; h1[k]; k++) line[j++] = h1[k];
-                            U64_STR(cs.hits, line, j);
-                            line[j] = '\0';
-                            terminal_print(line, 0x00FF00);
-
-                            /* Misses */
-                            j = 0;
-                            const char* h2 = "  Misses:    ";
-                            for (int k = 0; h2[k]; k++) line[j++] = h2[k];
-                            U64_STR(cs.misses, line, j);
-                            line[j] = '\0';
-                            terminal_print(line, 0xFF6600);
-
-                            /* Evictions */
-                            j = 0;
-                            const char* h3 = "  Evictions: ";
-                            for (int k = 0; h3[k]; k++) line[j++] = h3[k];
-                            U64_STR(cs.evictions, line, j);
-                            line[j] = '\0';
-                            terminal_print(line, 0xFF0000);
-
-                            /* Blocks used / total */
-                            j = 0;
-                            const char* h4 = "  Blocks:    ";
-                            for (int k = 0; h4[k]; k++) line[j++] = h4[k];
-                            U64_STR(cs.used_blocks, line, j);
-                            line[j++] = ' '; line[j++] = '/'; line[j++] = ' ';
-                            U64_STR(cs.total_blocks, line, j);
-                            line[j++] = ' '; line[j++] = '(';
-                            /* Calculate used KB */
-                            uint64_t used_kb = (uint64_t)cs.used_blocks * 4;
-                            U64_STR(used_kb, line, j);
-                            line[j++] = 'K'; line[j++] = 'B';
-                            line[j++] = ')'; line[j] = '\0';
-                            terminal_print(line, 0x00CCFF);
-
-                            /* Hit rate */
-                            uint64_t total = cs.hits + cs.misses;
-                            j = 0;
-                            const char* h5 = "  Hit Rate:  ";
-                            for (int k = 0; h5[k]; k++) line[j++] = h5[k];
-                            if (total > 0) {
-                                uint64_t pct = (cs.hits * 100) / total;
-                                U64_STR(pct, line, j);
-                                line[j++] = '%';
-                            } else {
-                                line[j++] = 'N'; line[j++] = '/'; line[j++] = 'A';
-                            }
-                            line[j] = '\0';
-                            terminal_print(line, 0xFFFFFF);
-
-                            #undef U64_STR
-                        } else {
-                            terminal_print("[ERROR] Failed to get cache stats!", 0xFF0000);
-                        }
-                    }
-                    /* --- FORK: Process cloning demo --- */
-                    else if (strcmp(cmd_buffer, "fork") == 0) {
-                        terminal_print("=== Fork Demo ===", 0xFFFF00);
-                        int child_pid = fork();
-                        if (child_pid < 0) {
-                            terminal_print("[ERROR] fork() failed!", 0xFF0000);
-                        } else if (child_pid == 0) {
-                            /* We are the CHILD process */
-                            terminal_print("[CHILD] I am the cloned process!", 0x00FF00);
-                            terminal_print("[CHILD] Exiting now...", 0x00FF00);
-                            exit(0);
-                        } else {
-                            /* We are the PARENT process */
-                            char line[80];
-                            int j = 0;
-                            const char* prefix = "[PARENT] Child created with PID: ";
-                            for (int k = 0; prefix[k]; k++) line[j++] = prefix[k];
-                            /* Convert PID to string */
-                            char num[16];
-                            int ni = 0;
-                            int tmp = child_pid;
-                            if (tmp == 0) { num[ni++] = '0'; }
-                            else { while (tmp > 0) { num[ni++] = '0' + (tmp % 10); tmp /= 10; } }
-                            for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                            line[j] = '\0';
-                            terminal_print(line, 0x00CCFF);
-                            /* Wait for child to finish */
-                            wait_pid(child_pid);
-                            terminal_print("[PARENT] Child finished.", 0x00CCFF);
-                        }
-                    }
-                    /* --- WRITE: Write text to tmpfs file --- */
-                    else if (cmd_buffer[0] == 'w' && cmd_buffer[1] == 'r' && cmd_buffer[2] == 'i' && 
-                             cmd_buffer[3] == 't' && cmd_buffer[4] == 'e' && cmd_buffer[5] == ' ') {
-                        /* Parse: write <filename> <text> */
-                        char* ptr = &cmd_buffer[6];
-                        char fname[64];
-                        int fi = 0;
-                        while (*ptr && *ptr != ' ' && fi < 63) {
-                            fname[fi++] = *ptr++;
-                        }
-                        fname[fi] = '\0';
-                        
-                        if (*ptr == ' ') ptr++; /* Skip space */
-                        
-                        if (fi == 0) {
-                            terminal_print("Usage: write <filename> <text>", 0xFF0000);
-                        } else {
-                            /* Create or open file */
-                            int fd = open(fname, 4); /* O_CREATE */
-                            if (fd < 0) {
-                                terminal_print("[ERROR] Cannot create file", 0xFF0000);
-                            } else {
-                                /* Calculate text length */
-                                int len = 0;
-                                while (ptr[len]) len++;
-                                
-                                int written = write(fd, ptr, len);
-                                close(fd);
-                                
-                                if (written > 0) {
-                                    terminal_print("[OK] Wrote to tmpfs: ", 0x00FF00);
-                                    terminal_print(fname, 0xFFFFFF);
-                                } else {
-                                    terminal_print("[ERROR] Write failed", 0xFF0000);
-                                }
-                            }
-                        }
-                    }
-                    /* --- CAT: Read and display any file --- */
-                    else if (cmd_buffer[0] == 'c' && cmd_buffer[1] == 'a' && cmd_buffer[2] == 't' && cmd_buffer[3] == ' ') {
-                        char* fname = &cmd_buffer[4];
-                        int fd = open(fname, 0);
-                        if (fd < 0) {
-                            terminal_print("[ERROR] File not found: ", 0xFF0000);
-                            terminal_print(fname, 0xFFFF00);
-                        } else {
-                            char file_buf[512];
-                            int bytes = read(fd, file_buf, 511);
-                            close(fd);
-                            if (bytes > 0) {
-                                file_buf[bytes] = '\0';
-                                terminal_print("--- File content ---", 0xFFFF00);
-                                terminal_print(file_buf, 0xFFFFFF);
-                                terminal_print("--- End of file ---", 0xFFFF00);
-                            } else {
-                                terminal_print("[INFO] File is empty", 0xAAAAAA);
-                            }
-                        }
-                    }
-                    /* --- RM: Delete a tmpfs file --- */
-                    else if (cmd_buffer[0] == 'r' && cmd_buffer[1] == 'm' && cmd_buffer[2] == ' ') {
-                        char* fname = &cmd_buffer[3];
-                        int ret = unlink(fname);
-                        if (ret == 0) {
-                            terminal_print("[OK] Deleted: ", 0x00FF00);
-                            terminal_print(fname, 0xFFFFFF);
-                        } else {
-                            terminal_print("[ERROR] Cannot delete: ", 0xFF0000);
-                            terminal_print(fname, 0xFFFF00);
-                            terminal_print("(only tmpfs files can be deleted)", 0xAAAAAA);
-                        }
-                    }
-                    /* --- WHOAMI: Show current user --- */
-                    else if (strcmp(cmd_buffer, "whoami") == 0) {
-                        char uname[32];
-                        int uid = crypto_whoami(uname, sizeof(uname));
-                        char line[128];
-                        int j = 0;
-                        const char* h1 = "User: ";
-                        for (int k = 0; h1[k]; k++) line[j++] = h1[k];
-                        for (int k = 0; uname[k] && j < 100; k++) line[j++] = uname[k];
-                        const char* h2 = "  (UID ";
-                        for (int k = 0; h2[k]; k++) line[j++] = h2[k];
-                        char num[16]; int ni = 0;
-                        int tmp = uid;
-                        if (tmp == 0) { num[ni++] = '0'; }
-                        else { while (tmp > 0) { num[ni++] = '0' + (tmp % 10); tmp /= 10; } }
-                        for (int k = ni - 1; k >= 0; k--) line[j++] = num[k];
-                        line[j++] = ')'; line[j] = '\0';
-                        terminal_print(line, 0x00FF00);
-                    }
-                    /* --- LOGIN: Authenticate as user --- */
-                    else if (cmd_buffer[0]=='l' && cmd_buffer[1]=='o' && cmd_buffer[2]=='g' &&
-                             cmd_buffer[3]=='i' && cmd_buffer[4]=='n' && cmd_buffer[5]==' ') {
-                        char* uname = &cmd_buffer[6];
-                        /* Ask for password */
-                        terminal_print("Password: ", 0xAAAAAA);
-                        char pass[64]; int pi = 0;
-                        while (1) {
-                            char k = read_key();
-                            if (k == '\n') break;
-                            if (k == '\b' && pi > 0) { pi--; continue; }
-                            if (k && k != '\b' && pi < 63) { pass[pi++] = k; }
-                        }
-                        pass[pi] = '\0';
-                        cursor_y += TERM_LINE_H;
-                        int uid = crypto_login(uname, pass);
-                        if (uid >= 0) {
-                            terminal_print("[OK] Login successful!", 0x00FF00);
-                            char line[80]; int j = 0;
-                            const char* h = "Now logged in as: ";
-                            for (int k = 0; h[k]; k++) line[j++] = h[k];
-                            for (int k = 0; uname[k] && j < 70; k++) line[j++] = uname[k];
-                            line[j] = '\0';
-                            terminal_print(line, 0x00CCFF);
-                        } else {
-                            terminal_print("[FAILED] Authentication failed!", 0xFF0000);
-                        }
-                    }
-                    /* --- HASH: SHA-256 demo --- */
-                    else if (cmd_buffer[0]=='h' && cmd_buffer[1]=='a' && cmd_buffer[2]=='s' &&
-                             cmd_buffer[3]=='h' && cmd_buffer[4]==' ') {
-                        char* text = &cmd_buffer[5];
-                        int tlen = 0; while (text[tlen]) tlen++;
-                        uint8_t digest[32];
-                        crypto_sha256(text, (unsigned long)tlen, digest);
-                        /* Convert to hex */
-                        char hex[65];
-                        const char* hc = "0123456789abcdef";
-                        for (int i = 0; i < 32; i++) {
-                            hex[i*2] = hc[(digest[i]>>4)&0xf];
-                            hex[i*2+1] = hc[digest[i]&0xf];
-                        }
-                        hex[64] = '\0';
-                        terminal_print("SHA-256:", 0xFFFF00);
-                        terminal_print(hex, 0x00FF00);
-                    }
-                    /* --- RANDOM: Generate random bytes --- */
-                    else if (strcmp(cmd_buffer, "random") == 0) {
-                        uint8_t rbuf[16];
-                        crypto_random(rbuf, 16);
-                        char hex[48]; int j = 0;
-                        const char* hc = "0123456789abcdef";
-                        for (int i = 0; i < 16; i++) {
-                            hex[j++] = hc[(rbuf[i]>>4)&0xf];
-                            hex[j++] = hc[rbuf[i]&0xf];
-                            if (i % 4 == 3 && i < 15) hex[j++] = ' ';
-                        }
-                        hex[j] = '\0';
-                        terminal_print("128-bit random:", 0xFFFF00);
-                        terminal_print(hex, 0x00FF00);
-                    }
-                    /* --- ENCRYPT: AES-256-CBC demo --- */
-                    else if (cmd_buffer[0]=='e' && cmd_buffer[1]=='n' && cmd_buffer[2]=='c' &&
-                             cmd_buffer[3]=='r' && cmd_buffer[4]=='y' && cmd_buffer[5]=='p' &&
-                             cmd_buffer[6]=='t' && cmd_buffer[7]==' ') {
-                        char* text = &cmd_buffer[8];
-                        int tlen = 0; while (text[tlen]) tlen++;
-                        /* Generate random key and IV */
-                        uint8_t key[32], iv[16];
-                        crypto_random(key, 32);
-                        crypto_random(iv, 16);
-                        /* Encrypt */
-                        uint8_t ct[256], pt[256];
-                        crypto_aes_params_t ep = {key, iv, text, (unsigned long)tlen, ct, sizeof(ct)};
-                        int ct_len = crypto_aes_encrypt(&ep);
-                        if (ct_len > 0) {
-                            terminal_print("AES-256-CBC Encrypted:", 0xFFFF00);
-                            /* Show first 16 bytes of ciphertext as hex */
-                            char hex[64]; int j = 0;
-                            const char* hc = "0123456789abcdef";
-                            int show = ct_len > 16 ? 16 : ct_len;
-                            for (int i = 0; i < show; i++) {
-                                hex[j++] = hc[(ct[i]>>4)&0xf];
-                                hex[j++] = hc[ct[i]&0xf];
-                            }
-                            hex[j++]='.'; hex[j++]='.'; hex[j++]='.'; hex[j]='\0';
-                            terminal_print(hex, 0xFF6600);
-                            /* Decrypt to verify */
-                            crypto_aes_params_t dp = {key, iv, ct, (unsigned long)ct_len, pt, sizeof(pt)};
-                            int pt_len = crypto_aes_decrypt(&dp);
-                            if (pt_len > 0) {
-                                pt[pt_len] = '\0';
-                                terminal_print("Decrypted back:", 0xFFFF00);
-                                terminal_print((char*)pt, 0x00FF00);
-                            }
-                        } else {
-                            terminal_print("[ERROR] Encryption failed!", 0xFF0000);
-                        }
-                    }
-                    /* --- COMMAND NOT FOUND --- */
-                    else {
-                        terminal_clear_line(cursor_y);
-                        print_at("Command not found: ", cursor_x, cursor_y, 0xFF0000);
-                        print_at(cmd_buffer, cursor_x + 260, cursor_y, 0xFFFF00);
-                        cursor_y += TERM_LINE_H;
-                    }
-                }
-
-                cmd_index = 0;
-                print_prompt();
-                prompt_batas_kiri = cursor_x;
+        /* Auto-scroll to bottom on any other key */
+        if (scroll_offset > 0) {
+            scroll_offset = 0;
+            render_viewport();
+            print_prompt();
+            /* Re-draw current input */
+            for (int i = 0; i < cmd_index; i++) {
+                int cx = TERM_LEFT + (prompt_len + i) * TERM_CELL_W;
+                draw_char(cmd_buffer[i], cx, input_y, COLOR_HEADER);
             }
-            /* ===== BACKSPACE: Hapus karakter ===== */
-            else if (c == '\b') {
-                if (cmd_index > 0) {
-                    cmd_index--;
-                    cursor_x -= TERM_CELL_W;
-                    /*
-                     * BUG FIX: gunakan fill_rect agar piksel di gap antar
-                     * cell juga tertimpa, mencegah artefak karakter lama.
-                     */
-                    fill_rect(cursor_x, cursor_y, TERM_CELL_W, TERM_LINE_H, TERM_BG);
+            cursor_x = TERM_LEFT + (prompt_len + cmd_index) * TERM_CELL_W;
+        }
+
+        /* --- ENTER: Execute command --- */
+        if (c == '\n') {
+            cmd_buffer[cmd_index] = '\0';
+
+            /* Add typed command to scroll buffer */
+            {
+                char uname[32];
+                crypto_whoami(uname, sizeof(uname));
+                char prompt_line[200]; int j = 0;
+                for (int k = 0; uname[k] && j < 28; k++) prompt_line[j++] = uname[k];
+                str_append(prompt_line, &j, "@GenOS:~$ ");
+                str_append(prompt_line, &j, cmd_buffer);
+                prompt_line[j] = '\0';
+                terminal_print(prompt_line, COLOR_PROMPT);
+            }
+
+            if (cmd_index > 0) {
+                /* === COMMAND DISPATCH === */
+                if (strcmp(cmd_buffer, "help") == 0)           cmd_help();
+                else if (strcmp(cmd_buffer, "clear") == 0) {
+                    buf_head = 0; buf_count = 0; scroll_offset = 0;
+                    fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
+                    render_status_bar();
+                    render_viewport();
+                }
+                else if (strcmp(cmd_buffer, "info") == 0)      cmd_info();
+                else if (strcmp(cmd_buffer, "ls") == 0)         cmd_ls();
+                else if (strcmp(cmd_buffer, "read") == 0)       cmd_read();
+                else if (strcmp(cmd_buffer, "run") == 0)        cmd_run();
+                else if (strcmp(cmd_buffer, "shm") == 0)        cmd_shm();
+                else if (strcmp(cmd_buffer, "cache") == 0)      cmd_cache();
+                else if (strcmp(cmd_buffer, "fork") == 0)       cmd_fork();
+                else if (strcmp(cmd_buffer, "whoami") == 0)     cmd_whoami();
+                else if (strcmp(cmd_buffer, "random") == 0)     cmd_random();
+                else if (strcmp(cmd_buffer, "hash") == 0)
+                    terminal_print("Usage: hash <text>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "encrypt") == 0)
+                    terminal_print("Usage: encrypt <text>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "login") == 0)
+                    terminal_print("Usage: login <username>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "cat") == 0)
+                    terminal_print("Usage: cat <filename>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "write") == 0)
+                    terminal_print("Usage: write <filename> <text>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "rm") == 0)
+                    terminal_print("Usage: rm <filename>", COLOR_WARN);
+                else if (strcmp(cmd_buffer, "shutdown") == 0)
+                    power_shutdown();
+                else if (strcmp(cmd_buffer, "restart") == 0)
+                    power_restart();
+                /* Commands with arguments */
+                else if (cmd_buffer[0]=='c' && cmd_buffer[1]=='a' && cmd_buffer[2]=='t' && cmd_buffer[3]==' ')
+                    cmd_cat(&cmd_buffer[4]);
+                else if (cmd_buffer[0]=='w' && cmd_buffer[1]=='r' && cmd_buffer[2]=='i' &&
+                         cmd_buffer[3]=='t' && cmd_buffer[4]=='e' && cmd_buffer[5]==' ')
+                    cmd_write(&cmd_buffer[6]);
+                else if (cmd_buffer[0]=='r' && cmd_buffer[1]=='m' && cmd_buffer[2]==' ')
+                    cmd_rm(&cmd_buffer[3]);
+                else if (cmd_buffer[0]=='l' && cmd_buffer[1]=='o' && cmd_buffer[2]=='g' &&
+                         cmd_buffer[3]=='i' && cmd_buffer[4]=='n' && cmd_buffer[5]==' ')
+                    cmd_login(&cmd_buffer[6]);
+                else if (cmd_buffer[0]=='h' && cmd_buffer[1]=='a' && cmd_buffer[2]=='s' &&
+                         cmd_buffer[3]=='h' && cmd_buffer[4]==' ')
+                    cmd_hash(&cmd_buffer[5]);
+                else if (cmd_buffer[0]=='e' && cmd_buffer[1]=='n' && cmd_buffer[2]=='c' &&
+                         cmd_buffer[3]=='r' && cmd_buffer[4]=='y' && cmd_buffer[5]=='p' &&
+                         cmd_buffer[6]=='t' && cmd_buffer[7]==' ')
+                    cmd_encrypt(&cmd_buffer[8]);
+                else {
+                    char line[128]; int j = 0;
+                    str_append(line, &j, "[?] Unknown command: ");
+                    str_append(line, &j, cmd_buffer);
+                    line[j] = '\0';
+                    terminal_print(line, COLOR_ERROR);
                 }
             }
-            /* ===== KARAKTER BIASA: Tampilkan dan simpan ===== */
-            else {
-                if (cmd_index < 254) {
-                    cmd_buffer[cmd_index++] = c;
-                    /*
-                     * Bersihkan cell tujuan dulu agar tidak ada residu
-                     * piksel dari karakter sebelumnya (mis. setelah backspace
-                     * berulang lalu ketik karakter baru di kolom yang sama).
-                     */
-                    fill_rect(cursor_x, cursor_y, TERM_CELL_W, TERM_LINE_H, TERM_BG);
-                    draw_char(c, cursor_x, cursor_y, 0xFFFFFF);
-                    cursor_x += TERM_CELL_W;
-                    if (cursor_x > 750) {
-                        cursor_y += TERM_LINE_H;
-                        cursor_x = prompt_batas_kiri;
-                    }
-                }
+
+            cmd_index = 0;
+            print_prompt();
+        }
+        /* --- BACKSPACE --- */
+        else if (c == '\b') {
+            if (cmd_index > 0) {
+                cmd_index--;
+                cursor_x -= TERM_CELL_W;
+                fill_rect(cursor_x, input_y, TERM_CELL_W, TERM_LINE_H, COLOR_BG);
             }
         }
-        else {
-            /*
-             * Tidak ada input — langsung loop kembali ke read_key().
-             *
-             * CATATAN: Kita TIDAK menggunakan user_sleep() di sini karena
-             * sleep syscall melakukan sti;hlt di dalam kernel, yang konflik
-             * dengan scheduler saat context-switch. Sebagai gantinya, shell
-             * melakukan polling cepat. Keyboard IRQ tetap menyala di jendela
-             * singkat antara sysretq dan syscall berikutnya (saat shell di
-             * Ring 3 dengan IF=1).
-             */
+        /* --- Ignore arrow keys in input for now --- */
+        else if (c == (char)KEY_UP || c == (char)KEY_DOWN ||
+                 c == (char)KEY_LEFT || c == (char)KEY_RIGHT) {
+            /* Reserved for future command history */
+        }
+        /* --- Regular character --- */
+        else if (cmd_index < 254) {
+            cmd_buffer[cmd_index++] = c;
+            fill_rect(cursor_x, input_y, TERM_CELL_W, TERM_LINE_H, COLOR_BG);
+            draw_char(c, cursor_x, input_y, COLOR_HEADER);
+            cursor_x += TERM_CELL_W;
         }
     }
 }
