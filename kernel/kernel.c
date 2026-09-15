@@ -3,7 +3,6 @@
 #include "../limine.h"
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
-#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../cpu/gdt.h"
 #include "../cpu/idt.h"
@@ -145,22 +144,70 @@ void _start(void) {
     fb = framebuffer_request.response->framebuffers[0];
     fb_init(fb);
 
+    /*
+     * === FASE 1.5: CPU Security Hardening ===
+     *
+     * Enable hardware security features SEBELUM user-space berjalan.
+     * Fitur ini mencegah kelas serangan yang paling umum pada kernel.
+     */
+    {
+        /*
+         * SMEP (Supervisor Mode Execution Prevention) — CR4 bit 20
+         *
+         * Jika aktif, CPU akan #PF saat kernel mencoba EXECUTE kode di
+         * page yang bertanda User (Ring 3). Ini memblokir serangan
+         * ret2usr: attacker meletakkan shellcode di user-space, lalu
+         * mengalihkan kernel RIP ke sana → SMEP memicu page fault.
+         *
+         * Cek CPUID leaf 7, ECX=0: EBX bit 7 = SMEP supported.
+         */
+        uint32_t eax, ebx, ecx, edx;
+        asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(7), "c"(0));
+
+        if (ebx & (1 << 7)) {  /* SMEP supported */
+            uint64_t cr4;
+            asm volatile("mov %%cr4, %0" : "=r"(cr4));
+            cr4 |= (1ULL << 20);  /* Set SMEP bit */
+            asm volatile("mov %0, %%cr4" : : "r"(cr4));
+            serial_write_string("[SEC] SMEP enabled (kernel cannot exec user pages)\n");
+        } else {
+            serial_write_string("[SEC] SMEP not supported by CPU\n");
+        }
+
+        /*
+         * NXE (No-Execute Enable) — EFER MSR bit 11
+         *
+         * Mengaktifkan NX bit (bit 63) pada Page Table Entries.
+         * Setelah diaktifkan, page yang ditandai NX=1 tidak bisa
+         * dieksekusi → memungkinkan W^X (Write XOR Execute) policy:
+         *   - Stack: writable, NOT executable
+         *   - Heap: writable, NOT executable
+         *   - Code: executable, NOT writable
+         *
+         * Ini mencegah shellcode injection di stack/heap.
+         *
+         * Cek CPUID extended leaf 0x80000001: EDX bit 20 = NX supported.
+         */
+        asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000001), "c"(0));
+
+        if (edx & (1 << 20)) {  /* NX supported */
+            uint32_t efer_lo, efer_hi;
+            asm volatile("rdmsr" : "=a"(efer_lo), "=d"(efer_hi) : "c"(0xC0000080));
+            efer_lo |= (1 << 11);  /* Set NXE bit */
+            asm volatile("wrmsr" : : "a"(efer_lo), "d"(efer_hi), "c"(0xC0000080));
+            serial_write_string("[SEC] NXE enabled (NX bit active in page tables)\n");
+        } else {
+            serial_write_string("[SEC] NX not supported by CPU\n");
+        }
+    }
+
     /* === FASE 2: Memory Management === */
     serial_write_string("[INFO] Initializing Memory Management...\n");
     pmm_init();
     vmm_init();
     heap_init();
-
-    /*
-     * === FASE 2.1: Mouse PS/2 ===
-     * Inisialisasi setelah PIC di-remap (FASE 1) dan setelah framebuffer
-     * tersedia (untuk clamp resolusi). HARUS sebelum timer_init/sti agar
-     * IRQ12 tidak pernah fire saat PIC belum siap.
-     */
-    mouse_init();
-    mouse_reset(fb->width, fb->height);
-    /* Show cursor at initial position (center of screen) */
-    cursor_update(fb->width / 2, fb->height / 2);
 
     /* === FASE 2.5: SMP/CPU Detection via ACPI MADT === */
     smp_init(
@@ -227,33 +274,23 @@ void _start(void) {
 
     /* === FASE 6: Launch User-Space Shell ===
      *
-     * Desktop berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
+     * Shell berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
      * Semua akses ke hardware (layar, keyboard, filesystem) dilakukan
-     * melalui system call. Jika desktop crash, kernel tetap aman.
+     * melalui system call. Jika shell crash, kernel tetap aman.
      *
-     * desktop.elf di-link di alamat 0x45000000.
-     * shell.elf tetap tersedia di ramdisk sebagai aplikasi yang bisa
-     * di-launch dari dalam desktop via exec().
+     * shell.elf di-link di alamat 0x50000000.
      */
-    serial_write_string("[INFO] Launching Desktop Environment (Ring 3)...\n");
+    serial_write_string("[INFO] Launching Security Shell (Ring 3)...\n");
     {
         size_t ukuran = 0;
-        char* desktop_data = tar_read_file("desktop.elf", &ukuran);
-        if (desktop_data != NULL) {
-            create_user_task((uint8_t*)desktop_data);
-            serial_write_string("[OK] Desktop launched in Ring 3!\n");
+        char* shell_data = tar_read_file("shell.elf", &ukuran);
+        if (shell_data != NULL) {
+            create_user_task((uint8_t*)shell_data);
+            serial_write_string("[OK] Shell launched in Ring 3!\n");
         } else {
-            /* Fallback: try shell.elf if desktop.elf not found */
-            serial_write_string("[WARN] desktop.elf not found, falling back to shell...\n");
-            char* shell_data = tar_read_file("shell.elf", &ukuran);
-            if (shell_data != NULL) {
-                create_user_task((uint8_t*)shell_data);
-                serial_write_string("[OK] Shell launched in Ring 3!\n");
-            } else {
-                serial_write_string("[FATAL] No user-space binary found!\n");
-                fb_print("FATAL: desktop.elf and shell.elf not found!", 50, 100, 0xFF0000, 0x002244, 2);
-                hcf();
-            }
+            serial_write_string("[FATAL] shell.elf not found in ramdisk!\n");
+            fb_print("FATAL: shell.elf not found!", 50, 100, 0xFF0000, 0x002244, 2);
+            hcf();
         }
     }
 

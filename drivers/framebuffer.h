@@ -25,22 +25,3 @@ uint32_t fb_read_pixel(size_t x, size_t y);
 /* Get framebuffer dimensions */
 size_t fb_get_width(void);
 size_t fb_get_height(void);
-
-/*
- * Hardware Mouse Cursor Overlay
- *
- * Renders a 12x17 arrow cursor sprite directly on the framebuffer.
- * Saves/restores background pixels automatically for flicker-free movement.
- * Called from mouse IRQ handler for zero-latency cursor tracking.
- */
-void cursor_update(int32_t x, int32_t y);  /* Move cursor to (x,y) */
-void cursor_hide(void);                     /* Hide cursor (restore bg) */
-void cursor_show(void);                     /* Show cursor at last pos */
-
-/*
- * cursor_force_redraw() — Re-save background & redraw cursor at current pos.
- * MUST be called after flush_screen() overwrites the framebuffer, otherwise
- * the cursor sprite is erased by the blit. On QEMU the timing hides this
- * bug, but on bare metal the cursor is always invisible without this call.
- */
-void cursor_force_redraw(void);

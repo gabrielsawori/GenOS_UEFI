@@ -288,7 +288,7 @@ struct task* create_user_task(uint8_t* binary_data) {
             new_task->user_pages[new_task->user_page_count++] = phys_stack;
         }
         /* Petakan stack ke address space proses baru (bukan kernel_pml4!) */
-        vmm_map_page_in(new_pml4, app_stack_virt + sp * 4096, phys_stack, 0x07); /* User, RW, Present */
+        vmm_map_page_in(new_pml4, app_stack_virt + sp * 4096, phys_stack, VMM_FLAGS_USER_STACK);
     }
 
     /*
@@ -849,8 +849,11 @@ int32_t task_fork(void) {
                     if (va >= 0x800000000000ULL && !(va & (1ULL << 47))) continue;
                     if ((va >> 48) != 0 && (va >> 48) != 0xFFFF) continue;
 
-                    uint64_t parent_phys = pt[l] & ~0xFFF;
-                    uint64_t flags = pt[l] & 0xFFF;
+                    /* Extract physical address (clear flag bits 0-11 and NX bit 63) */
+                    uint64_t parent_phys = pt[l] & ~(0xFFFULL | PTE_NX);
+                    
+                    /* Extract flags (bits 0-11 and NX bit 63) */
+                    uint64_t flags = pt[l] & (0xFFFULL | PTE_NX);
 
                     /*
                      * CoW: Mark parent page READ-ONLY + CoW bit.

@@ -56,9 +56,11 @@ uint64_t elf_load(uint8_t* binary_data, uint64_t* target_pml4,
             uint64_t offset = phdr[i].offset;
 
             /* Tentukan flags berdasarkan ELF segment flags */
-            uint64_t page_flags = 0x01 | 0x04; /* Present + User */
-            if (phdr[i].flags & PF_W) {
-                page_flags |= 0x02; /* Writable */
+            uint64_t page_flags;
+            if (phdr[i].flags & PF_X) {
+                page_flags = VMM_FLAGS_USER_CODE;
+            } else {
+                page_flags = VMM_FLAGS_USER_DATA;
             }
 
             /* Alokasi dan petakan page fisik untuk segmen ini */

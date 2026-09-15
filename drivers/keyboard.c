@@ -59,6 +59,8 @@ static bool extended_key = false;  /* PS/2 extended scancode (0xE0 prefix) */
 #define KEY_DOWN  0x81
 #define KEY_LEFT  0x82
 #define KEY_RIGHT 0x83
+#define KEY_PGUP  0x84
+#define KEY_PGDN  0x85
 
 // Fungsi yang terpicu setiap jari menekan tuts keyboard
 void keyboard_handler(uint8_t scancode) {
@@ -82,6 +84,8 @@ void keyboard_handler(uint8_t scancode) {
             case 0x50: buffer_push(KEY_DOWN);  return;
             case 0x4B: buffer_push(KEY_LEFT);  return;
             case 0x4D: buffer_push(KEY_RIGHT); return;
+            case 0x49: buffer_push(KEY_PGUP);  return;
+            case 0x51: buffer_push(KEY_PGDN);  return;
             default: return; /* Ignore other extended keys */
         }
     }
