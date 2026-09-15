@@ -3,6 +3,20 @@
 
 void vmm_init(void);
 
+/* Page Table Entry flags */
+#define PTE_PRESENT  (1ULL << 0)
+#define PTE_WRITE    (1ULL << 1)
+#define PTE_USER     (1ULL << 2)
+#define PTE_NX       (1ULL << 63)  /* No-Execute: page cannot contain code */
+
+/* Common flag combinations */
+#define VMM_FLAGS_KERNEL     (PTE_PRESENT | PTE_WRITE)           /* 0x03 */
+#define VMM_FLAGS_USER_RO    (PTE_PRESENT | PTE_USER)            /* 0x05 */
+#define VMM_FLAGS_USER_RW    (PTE_PRESENT | PTE_WRITE | PTE_USER) /* 0x07 */
+#define VMM_FLAGS_USER_CODE  (PTE_PRESENT | PTE_USER)            /* 0x05, executable */
+#define VMM_FLAGS_USER_DATA  (PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX) /* writable, NOT executable */
+#define VMM_FLAGS_USER_STACK (PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX) /* writable, NOT executable */
+
 // === Operasi pada kernel PML4 (default, backward-compatible) ===
 
 // Fungsi Sakti untuk membuat Portal dari Alamat Palsu (Virtual) ke Alamat Asli (Fisik)

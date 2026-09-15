@@ -39,16 +39,10 @@ app.elf: $(LIBC_OBJS)
 	$(CC) $(CFLAGS) -c app/app.c -o app/app.o
 	$(LD) -nostdlib -Ttext 0x40000000 app/app.o $(LIBC_OBJS) -o app.elf
 
-# --- KOMPILASI DESKTOP ENVIRONMENT SEBAGAI ELF ---
-desktop.elf: $(LIBC_OBJS)
-	mkdir -p desktop
-	$(CC) $(CFLAGS) -c desktop/desktop.c -o desktop/desktop.o
-	$(LD) -nostdlib -Ttext 0x45000000 desktop/desktop.o $(LIBC_OBJS) -o desktop.elf
-
 # --- BUNGKUS SEMUA KE RAMDISK ---
-ramdisk.tar: shell.elf app.elf desktop.elf
+ramdisk.tar: shell.elf app.elf
 	@echo "HELLO MANDOR! This is a secret from the outside world." > pesan.txt
-	@tar -cvf ramdisk.tar pesan.txt shell.elf app.elf desktop.elf
+	@tar -cvf ramdisk.tar pesan.txt shell.elf app.elf
 
 GenOS.iso: kernel.elf ramdisk.tar
 	mkdir -p iso_root
@@ -66,5 +60,5 @@ run: GenOS.iso
 
 clean:
 	rm -f $(OBJS) $(LIBC_OBJS) kernel.elf GenOS.iso ramdisk.tar pesan.txt
-	rm -f app.elf app/app.o shell.elf shell/shell.o desktop.elf desktop/desktop.o
+	rm -f app.elf app/app.o shell.elf shell/shell.o
 	rm -rf iso_root

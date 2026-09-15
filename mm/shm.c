@@ -132,7 +132,7 @@ uint64_t shm_attach(int shmid, uint32_t pid, uint64_t* pml4) {
         vmm_map_page_in(pml4,
                         vaddr + p * PAGE_SIZE,
                         shm_segments[slot].phys_pages[p],
-                        0x07);
+                        VMM_FLAGS_USER_DATA);
     }
 
     /* Increment refcount */

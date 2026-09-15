@@ -1,105 +1,217 @@
-GenOS v3 (64-Bit)
+# GenOS v4 — Security Kernel (64-Bit x86-64 UEFI)
 
-Welcome to the official repository for GenOS, a custom-built, low-level 64-bit operating system developed from scratch for educational purposes and OS development exploration. This project utilizes the modern Limine bootloader (UEFI/BIOS compatible) and focuses on modularity, code readability, and the implementation of low-level hardware architecture.
+> Kernel minimalis yang didesain untuk **cybersecurity** dan **backend development**, dibangun dari nol di atas arsitektur x86-64 Long Mode dengan bootloader Limine (UEFI/BIOS).
 
-📚 Dokumentasi
-GenOS sekarang memiliki folder `documentation/` untuk panduan pengembang, roadmap, arsitektur kernel, fitur, kontribusi, dan material pelatihan AI. Baca dokumen-dokumen tersebut sebelum menambahkan fitur atau memperbaiki bug.
+---
 
-🌟 Current Features
+## ✨ Highlights
 
-GenOS v3 already includes the foundational implementations necessary to run a basic operating system. Here are the features currently implemented:
+| Fitur | Detail |
+|-------|--------|
+| 🔒 **SMEP** | Kernel tidak bisa execute kode user — blokir ret2usr |
+| 🛡️ **NX / W^X** | Stack & heap non-executable — blokir shellcode injection |
+| 🔑 **AES-256-CBC** | Enkripsi simetris bawaan kernel |
+| 🔐 **SHA-256 / HMAC / PBKDF2** | Hashing & key derivation |
+| 🎲 **CSPRNG** | Hardware RNG (RDRAND) + xoshiro256** |
+| 📜 **Scroll Terminal** | 256-line history + Page Up/Down |
+| 🧱 **Ring 3 Isolation** | Shell berjalan sepenuhnya di user-space |
 
-1. CPU & Interrupt Management
+---
 
-GDT (Global Descriptor Table): Memory segment configuration (Ring 0 / Kernel Mode).
+## 🏗️ Arsitektur
 
-IDT (Interrupt Descriptor Table): System interrupt mapping table.
+```
+┌─────────────────────────────────────────────────────┐
+│                    RING 3 (User)                    │
+│   shell.elf ── Security Terminal (scroll, crypto)   │
+│   app.elf   ── Test Application                     │
+├─────────────────────────────────────────────────────┤
+│                 SYSCALL BOUNDARY                    │
+│         49 syscalls + pointer validation            │
+├─────────────────────────────────────────────────────┤
+│                    RING 0 (Kernel)                  │
+│                                                     │
+│   CPU       GDT/TSS · IDT · PIC · LAPIC · SMP      │
+│   Memory    PMM · VMM (4-level paging + NX) · Heap  │
+│   Filesystem VFS · TAR ramdisk · tmpfs · cache      │
+│   Crypto    AES-256 · SHA-256 · HMAC · PBKDF2 · RNG│
+│   Security  Credentials · Keystore · SMEP · uaccess │
+│   Drivers   Framebuffer · Keyboard · Timer · Serial │
+│   Task      Preemptive scheduler · fork · clone     │
+│   IPC       Shared memory (POSIX-like)              │
+└─────────────────────────────────────────────────────┘
+```
 
-PIC (Programmable Interrupt Controller): Legacy PIC (8259) remapping to prevent conflicts with CPU exceptions.
+---
 
-ISR (Interrupt Service Routine): Handling for hardware interrupts and CPU exceptions.
+## 🔐 Security Features
 
-2. Memory Management
+### Hardware Security
+- **SMEP** (CR4 bit 20) — CPU menolak eksekusi kode user dari Ring 0
+- **NX bit** (EFER.NXE) — Page Table Entry bit 63 aktif pada stack, heap, data
+- **W^X Enforcement** — Halaman yang writable TIDAK executable, dan sebaliknya
 
-PMM (Physical Memory Manager): Allocation and management of physical RAM blocks/pages (Bitmap/Stack based).
+### Software Security
+- **User Pointer Validation** (`cpu/uaccess.h`) — Semua 20+ syscall yang menerima pointer divalidasi terhadap batas canonical x86-64 (`0x800000000000`)
+- **Kernel Heap Isolated** — Syscall `kmalloc/kfree/krealloc` dihapus dari Ring 3
+- **PBKDF2 Authentication** — Login dengan password hashing
+- **Encrypted Keystore** — Key-value store terenkripsi AES-256
 
-VMM (Virtual Memory Manager): Paging implementation (4-level paging in x86_64 architecture) for secure virtual memory.
+### Cryptography
+| Algoritma | Implementasi |
+|-----------|-------------|
+| AES-256-CBC | `crypto/aes.c` — Enkripsi/dekripsi simetris |
+| SHA-256 | `crypto/sha256.c` — Hash 256-bit |
+| HMAC-SHA256 | `crypto/hmac.c` — Message authentication |
+| PBKDF2 | `security/cred.c` — Key derivation dari password |
+| CSPRNG | `crypto/random.c` — RDRAND + xoshiro256** fallback |
 
-Heap Allocator (kmalloc, kfree): Dynamic memory allocation management within the kernel.
+---
 
-3. External Hardware Drivers
+## 💻 Terminal Commands
 
-Framebuffer & Visual Text: Custom font rendering library (based on PSF/Bitmap font8x8) capable of printing graphics and text independently to the screen.
+```
+  System:
+    help        Daftar semua command
+    clear       Bersihkan terminal + history
+    info        Informasi sistem
+    run         Jalankan app.elf
 
-Keyboard Driver: PS/2 driver to detect keystrokes (scancode to ASCII character conversion).
+  Filesystem:
+    ls          Daftar file (ramdisk + tmpfs)
+    cat <f>     Baca isi file
+    read        Baca pesan.txt
+    write <f> <text>   Tulis ke tmpfs
+    rm <f>      Hapus file tmpfs
 
-Timer (PIT - Programmable Interval Timer): Periodic timer interrupts for scheduling and delays.
+  Security:
+    whoami      Info user aktif
+    login <u>   Autentikasi (password masked)
+    hash <t>    SHA-256 hash
+    random      Generate 128-bit random
+    encrypt <t> Demo AES-256-CBC
 
-Serial Debugging (COM1): Interactive logging via serial port (monitorable via QEMU stdio or PuTTY).
+  IPC & Process:
+    shm         Demo shared memory
+    cache       Statistik buffer cache
+    fork        Demo fork process
 
-4. Multitasking & User Interface
+  Power:
+    shutdown    Matikan sistem
+    restart     Reboot
+```
 
-Basic Tasking System: Structures to run functions concurrently/separately (early multitasking implementation).
+**Navigasi:** Page Up / Page Down untuk scroll history (256 baris).
 
-Mandor Shell: A graphical terminal shell (Mandor@GenOS:~$) where users can type interactive commands directly on the OS screen!
+---
 
-🚀 Build Instructions & Usage
+## 🚀 Build & Run
 
-GenOS is designed to be easily built on Linux-based operating systems (e.g., Ubuntu/Debian/Arch) or WSL (Windows Subsystem for Linux).
+### Dependencies
 
-Dependencies
+```bash
+# Ubuntu/Debian
+sudo apt install build-essential xorriso qemu-system-x86 mtools
 
-Ensure you have the following compilation tools installed in your terminal:
+# Arch Linux
+sudo pacman -S base-devel xorriso qemu-full mtools
+```
 
-gcc (Compiler)
+Tools yang dibutuhkan: `gcc`, `ld`, `make`, `xorriso`, `qemu-system-x86_64`
 
-ld (GNU Linker)
+### Compile & Boot
 
-make (Build System)
+```bash
+# Clone repository
+git clone <repo-url>
+cd GenOS_v3
 
-xorriso (Mandatory utility for assembling and creating a bootable ISO file)
+# Siapkan Limine bootloader (jika belum ada)
+git clone https://github.com/limine-bootloader/limine.git \
+    --branch v7.x-branch-latest --depth=1
+make -C limine
 
-qemu-system-x86_64 (Emulator to run the OS without restarting your physical PC)
-
-git
-
-(For Ubuntu/Debian users, run: sudo apt install build-essential xorriso qemu-system-x86 mtools)
-
-Compilation Steps
-
-Clone This Repository
-Open your terminal and run the following commands:
-
-git clone <Your-GenOS-Repository-URL>
-cd GenOS_UEFI-main
-
-
-Prepare the Limine Bootloader
-Because GenOS uses the Limine Bootloader, ensure you have downloaded the limine folder into the root directory of this project if it wasn't cloned along with the repository. (Use the command git clone https://github.com/limine-bootloader/limine.git --branch v7.x-branch-latest --depth=1 if the limine folder is empty, then build Limine using make -C limine).
-
-Compile & Build the ISO
-To assemble all C and Assembly source code into a bootable OS (GenOS.iso), simply run:
-
+# Build GenOS
 make
 
-
-(The make system will automatically process all folders like kernel, CPU, memory, and drivers, outputting a ready-to-use file named GenOS.iso)
-
-Run GenOS in QEMU
-To immediately test the OS in a virtual machine and see the active shell, use:
-
+# Jalankan di QEMU
 make run
 
-
-(QEMU will open displaying the GenOS interface, while debug output will be printed to your computer's terminal via the Serial StdIo connection)
-
-Clean Build Artifacts
-If you modify any code, clean the old compilation files before rebuilding using:
-
+# Bersihkan build artifacts
 make clean
+```
 
+### Output Build
 
-📜 License & Contribution
+```
+kernel.elf  — Kernel Ring 0 (linked at HHDM)
+shell.elf   — Security Terminal Ring 3 (linked at 0x50000000)
+app.elf     — Test Application Ring 3 (linked at 0x40000000)
+ramdisk.tar — TAR archive (shell.elf + app.elf + pesan.txt)
+GenOS.iso   — Bootable ISO (UEFI + BIOS)
+```
 
-This project is licensed under the MIT License. You are free to study, duplicate, modify, and distribute this code. However, please note that the software is provided "AS IS"; the developer is not liable for any unforeseen losses or damages resulting from the use or experimental modification of the code (e.g., data corruption if the OS is installed on a bare-metal SSD/HDD containing important data).
-Always use QEMU/VirtualBox for experimentation!
+---
+
+## 📁 Struktur Kode
+
+```
+GenOS_v3/
+├── kernel/           Kernel entry point, task scheduler, utils
+│   ├── kernel.c      Boot flow + hardware init + SMEP/NXE
+│   └── task.c        Preemptive scheduler, fork, clone
+├── cpu/              CPU management
+│   ├── gdt.c         GDT + TSS (Ring 0/3 segments)
+│   ├── idt.c         IDT (256 interrupt gates)
+│   ├── isr.c         ISR handlers (exceptions + IRQs)
+│   ├── isr_asm.S     ISR stubs (push regs → call C handler)
+│   ├── syscall.c     49 syscalls + uaccess validation
+│   ├── uaccess.h     User pointer validation module
+│   ├── pic.c         Legacy 8259 PIC
+│   ├── lapic.c       Local APIC + SMP
+│   └── smp.c         Multi-core CPU detection
+├── mm/               Memory management
+│   ├── pmm.c         Physical page allocator (bitmap)
+│   ├── vmm.c         4-level paging + NX bit support
+│   ├── heap.c        Kernel heap (kmalloc/kfree)
+│   └── shm.c         POSIX-like shared memory IPC
+├── fs/               Filesystem
+│   ├── vfs.c         Virtual filesystem layer
+│   ├── tar.c         TAR ramdisk parser
+│   ├── tmpfs.c       In-memory temporary filesystem
+│   ├── elf.c         ELF64 loader (W^X page mapping)
+│   └── cache.c       Block cache with LRU eviction
+├── crypto/           Cryptography
+│   ├── aes.c         AES-256-CBC (S-box, MixColumns)
+│   ├── sha256.c      SHA-256 (FIPS 180-4)
+│   ├── hmac.c        HMAC-SHA256
+│   └── random.c      CSPRNG (RDRAND + xoshiro256**)
+├── security/         Security subsystem
+│   ├── cred.c        User credentials + PBKDF2 auth
+│   └── keystore.c    Encrypted key-value store
+├── drivers/          Hardware drivers
+│   ├── framebuffer.c Pixel/text rendering (8x8 bitmap font)
+│   ├── keyboard.c    PS/2 keyboard (scancode → ASCII)
+│   ├── timer.c       PIT timer (preemptive scheduling)
+│   └── serial.c      COM1 serial debug output
+├── shell/            User-space terminal
+│   └── shell.c       Security shell (scroll buffer, commands)
+├── libc/             Minimal C library (Ring 3)
+│   ├── stdio.c       Syscall wrappers (print, file I/O)
+│   ├── stdlib.c      malloc (bump allocator), exec, fork
+│   ├── string.c      String operations
+│   └── crypto.c      Crypto syscall wrappers
+├── app/              Test application
+│   └── app.c         Sample Ring 3 program
+├── Makefile          Build system
+├── linker.ld         Kernel linker script
+└── limine.cfg        Bootloader configuration
+```
+
+---
+
+## 📜 Lisensi
+
+MIT License — bebas dipelajari, dimodifikasi, dan didistribusikan.
+
+> ⚠️ **PERINGATAN:** Selalu gunakan QEMU/VirtualBox untuk eksperimen. Jangan install di hardware fisik yang berisi data penting.
