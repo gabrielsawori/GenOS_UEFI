@@ -49,7 +49,7 @@ ISR_ERRCODE   17
 ISR_NOERRCODE 18
 ISR_NOERRCODE 19
 ISR_NOERRCODE 20
-ISR_NOERRCODE 21
+ISR_ERRCODE   21
 ISR_NOERRCODE 22
 ISR_NOERRCODE 23
 ISR_NOERRCODE 24
@@ -112,6 +112,17 @@ isr_common:
      * DF=0, masking this bug.
      */
     cld
+
+    /*
+     * BUG FIX: Set DS/ES to kernel data segment BEFORE calling C handler.
+     * Without this, isr_handler() runs with whatever DS/ES was inherited
+     * from the interrupted context (could be user-mode 0x1B). While x86-64
+     * mostly ignores segment bases, some instructions check segment DPL.
+     * This ensures the C handler always runs with valid kernel segments.
+     */
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
 
     mov %rsp, %rdi
     call isr_handler

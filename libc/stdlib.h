@@ -1,5 +1,9 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
+
+/* Guard: prevent system <stdlib.h> from being included */
+#define _STDLIB_H
 
 /* Akhiri aplikasi (syscall 2) */
 void exit(int status);
@@ -71,3 +75,14 @@ void power_shutdown(void);
 
 /* Restart mesin (keyboard controller reset). Tidak pernah kembali. */
 void power_restart(void);
+
+/* === Dynamic Memory (syscalls 47-49) === */
+
+/* Alokasi memori dinamis. Return: pointer atau NULL */
+void* malloc(size_t size);
+
+/* Bebaskan memori yang dialokasikan */
+void free(void* ptr);
+
+/* Ubah ukuran blok memori. Return: pointer baru atau NULL */
+void* realloc(void* ptr, size_t new_size);

@@ -4,7 +4,6 @@
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/keyboard.h"
-#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
@@ -21,6 +20,7 @@
 #include "../crypto/random.h"
 #include "../security/cred.h"
 #include "../security/keystore.h"
+#include "uaccess.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -32,34 +32,6 @@ extern struct limine_framebuffer *fb;
 extern volatile struct limine_hhdm_request hhdm_request;
 
 uint64_t kernel_stack_top = 0;
-
-/*
- * Framebuffer back-buffer page tracking (separate from user_pages[]).
- * Tracked here to avoid bloating struct task (which caused kmalloc
- * failures and triple faults on bare metal). Only one back-buffer
- * can exist at a time. Pages are reused if map_framebuffer is called
- * again by the same or different process.
- */
-/*
- * FB_MAX_PAGES: Maximum number of 4 KB pages we can allocate for the
- * framebuffer back-buffer.
- *
- * BUG FIX (Bare Metal): Previously 1024 (4 MB), which silently truncated
- * the buffer on screens larger than ~1366×768. On bare metal resolutions
- * like 1920×1080 (2025 pages) or 4K 3840×2160 (8100 pages), the truncated
- * buffer left the upper portion unmapped. Userspace (desktop.c) and
- * syscall 35 (flush_screen) then read/wrote unmapped memory, corrupting
- * the kernel iretq frame and causing a page-fault at a garbage RIP
- * (RIP==CR2, error 0x10, kernel mode) — exactly the crash users saw
- * when launching `desktop` on a real PC.
- *
- * 8192 pages = 32 MB, comfortably covers 4K UHD (8100 pages) with margin.
- * The fb_phys_pages[] array grows in BSS (8192 × 8 B = 64 KB), acceptable.
- */
-#define FB_MAX_PAGES 8192
-static uint64_t fb_phys_pages[FB_MAX_PAGES];
-static uint32_t fb_phys_count = 0;
-static uint64_t fb_mapped_va = 0;   /* 0 = not yet mapped */
 
 /*
  * in_syscall flag: DEPRECATED for scheduling purposes.
@@ -202,6 +174,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 1: {
         char* pesan = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint64_t y_pos = arg2;
         if (y_pos == 0) y_pos = 100;
         serial_write_string("[APP] ");
@@ -265,7 +241,6 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 5: {
         fb_fill_rect(0, 0, fb->width, fb->height, 0x002244);
-        cursor_force_redraw();
         result = 0;
         break;
     }
@@ -277,6 +252,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 6: {
         char* text = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t x = (uint32_t)(arg2 >> 32);
         uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
         uint32_t color = (uint32_t)arg3;
@@ -308,6 +287,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         char* filename = (char*)arg1;
         char* user_buf = (char*)arg2;
         uint64_t max_size = arg3;
+        if (!verify_user_ptr((void*)arg1) || !is_user_range(arg2, arg3)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
 
         size_t file_size = 0;
         char* file_data = tar_read_file(filename, &file_size);
@@ -338,6 +321,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 9: {
         char* filename = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         size_t ukuran = 0;
         char* elf_data = tar_read_file(filename, &ukuran);
         if (elf_data == NULL) {
@@ -413,6 +400,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 12: {
         char* filename = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         int flags = (int)(int64_t)arg2;
         uint32_t pid = get_current_pid();
         int fd = vfs_open(pid, filename, flags);
@@ -429,6 +420,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         int fd = (int)(int64_t)arg1;
         char* buf = (char*)arg2;
         size_t count = (size_t)arg3;
+        if (!is_user_range(arg2, arg3)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t pid = get_current_pid();
         int bytes = vfs_read(pid, fd, buf, count);
         result = (uint64_t)(int64_t)bytes;
@@ -473,6 +468,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         int fd = (int)(int64_t)arg1;
         char* name_buf = (char*)arg2;
         size_t* size_buf = (size_t*)arg3;
+        if (!verify_user_ptr((void*)arg2) || !verify_user_ptr((void*)arg3)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t pid = get_current_pid();
         int ret = vfs_readdir(pid, fd, name_buf, size_buf);
         result = (uint64_t)ret;
@@ -540,6 +539,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 21: {
         cache_stats_t* out = (cache_stats_t*)arg1;
+        if (!is_user_range(arg1, sizeof(cache_stats_t))) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!out) { result = (uint64_t)-1; break; }
         cache_stats_t s = cache_get_stats();
         out->hits        = s.hits;
@@ -572,6 +575,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         int fd = (int)(int64_t)arg1;
         void* buf = (void*)arg2;
         size_t count = (size_t)arg3;
+        if (!is_user_range(arg2, arg3)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t pid = get_current_pid();
         int bytes = vfs_write(pid, fd, buf, count);
         result = (uint64_t)(int64_t)bytes;
@@ -585,6 +592,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 24: {
         char* filename = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t pid = get_current_pid();
         int ret = vfs_create(pid, filename);
         result = (uint64_t)(int64_t)ret;
@@ -598,6 +609,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 25: {
         char* filename = (char*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t pid = get_current_pid();
         int ret = vfs_unlink(pid, filename);
         result = (uint64_t)(int64_t)ret;
@@ -629,6 +644,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     case 27: {
         uint32_t target_pid = (uint32_t)arg1;
         char* buf = (char*)arg2;
+        if (!is_user_range(arg2, 128)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         result = (uint64_t)(int64_t)task_get_sched_info(target_pid, buf);
         break;
     }
@@ -657,21 +676,11 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     }
 
     /* ================================================================
-     * SYSCALL 30: read_mouse(mouse_state_t* out)
-     * Salin snapshot state mouse (x, y, buttons, changed) ke buffer user.
-     * Flag 'changed' di-reset ke 0 setelah dibaca (event dikonsumsi).
-     * Return: 0 = sukses, -1 = pointer NULL.
+     * SYSCALL 30: read_mouse (Removed: mouse driver)
      * ================================================================ */
     case 30: {
-        mouse_state_t* out = (mouse_state_t*)arg1;
-        if (!out) { result = (uint64_t)-1; break; }
-        mouse_state_t* s = mouse_get_state();
-        out->x       = s->x;
-        out->y       = s->y;
-        out->buttons = s->buttons;
-        out->changed = s->changed;
-        s->changed   = 0; /* Konsumsi event */
-        result = 0;
+        /* Removed: mouse driver */
+        result = (uint64_t)-1;
         break;
     }
 
@@ -683,6 +692,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 31: {
         uint32_t* out = (uint32_t*)arg1;
+        if (!is_user_range(arg1, sizeof(uint32_t)*2)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!out || !fb) { result = (uint64_t)-1; break; }
         out[0] = (uint32_t)fb->width;
         out[1] = (uint32_t)fb->height;
@@ -714,150 +727,27 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     }
 
     /* ================================================================
-     * SYSCALL 34: map_framebuffer(void)
-     * Allocate a back-buffer the same size as the screen and map it
-     * into the calling task's address space at 0x70000000.
-     * User-space can then write pixels directly to this buffer
-     * without any syscalls, achieving near-native rendering speed.
-     * Return: virtual address of buffer, or 0 on failure.
+     * SYSCALL 34: map_framebuffer (Removed)
      * ================================================================ */
     case 34: {
-        if (!fb) { result = 0; break; }
-
-        uint64_t* pml4 = task_get_current_pml4();
-        if (!pml4) { result = 0; break; }
-
-        uint64_t base_va = 0x70000000ULL;
-        uint32_t w = (uint32_t)fb->width;
-        uint32_t h = (uint32_t)fb->height;
-        uint64_t buf_size = (uint64_t)w * h * 4;
-        uint32_t pages_needed = (uint32_t)((buf_size + 4095) / 4096);
-
-        serial_write_string("[MAPFB] Resolution: ");
-        char num[16];
-        itoa(w, num, 10); serial_write_string(num);
-        serial_write_string("x");
-        itoa(h, num, 10); serial_write_string(num);
-        serial_write_string(" Pages: ");
-        itoa(pages_needed, num, 10); serial_write_string(num);
-        serial_write_string("\n");
-
-        if (pages_needed > FB_MAX_PAGES) {
-            serial_write_string("[MAPFB] FATAL: Too large!\n");
-            result = 0;
-            break;
-        }
-
-        /*
-         * Disable interrupts for the ENTIRE allocation.
-         * With O(1) PMM allocator, even 2000+ pages takes ~2ms.
-         * The batched cli/sti approach was causing race conditions
-         * where the scheduler could preempt between batches and
-         * corrupt state, causing crash on first boot.
-         */
-        asm volatile ("cli");
-
-        /* If pages already allocated (re-entry), just re-map */
-        if (fb_phys_count > 0 && fb_phys_count == pages_needed) {
-            for (uint32_t i = 0; i < fb_phys_count; i++)
-                vmm_map_page_in(pml4, base_va + (uint64_t)i * 4096, fb_phys_pages[i], 0x07);
-            fb_mapped_va = base_va;
-            asm volatile ("sti");
-            result = base_va;
-            break;
-        }
-
-        /* Allocate pages and map them */
-        uint64_t hhdm_off = hhdm_request.response->offset;
-        int alloc_ok = 1;
-
-        for (uint32_t i = 0; i < pages_needed; i++) {
-            uint64_t phys = (uint64_t)pmm_alloc_page();
-            if (!phys) {
-                serial_write_string("[MAPFB] OOM!\n");
-                alloc_ok = 0;
-                break;
-            }
-            /* Zero the page via HHDM (use 64-bit writes for speed) */
-            uint64_t* page_ptr = (uint64_t*)(phys + hhdm_off);
-            for (int z = 0; z < 512; z++) page_ptr[z] = 0;
-
-            vmm_map_page_in(pml4, base_va + (uint64_t)i * 4096, phys, 0x07);
-            fb_phys_pages[i] = phys;
-            fb_phys_count = i + 1;
-        }
-
-        asm volatile ("sti");
-
-        if (!alloc_ok) {
-            result = 0;
-            break;
-        }
-
-        fb_mapped_va = base_va;
-        serial_write_string("[MAPFB] OK\n");
-        result = base_va;
+        result = (uint64_t)-1;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 35: flush_screen(void)
-     * Copy the user's back-buffer (at 0x70000000) to the real
-     * framebuffer. Since the user's PML4 is active during syscall,
-     * we can read directly from the user virtual address.
-     * This is the ONLY syscall needed per frame — all pixel writes
-     * happen in user-space without any syscalls.
-     * Return: 0 on success.
+     * SYSCALL 35: flush_screen (Removed)
      * ================================================================ */
     case 35: {
-        if (!fb) { result = (uint64_t)-1; break; }
-
-        uint32_t w = (uint32_t)fb->width;
-        uint32_t h = (uint32_t)fb->height;
-        uint32_t pitch_px = (uint32_t)(fb->pitch / 4);
-        uint32_t* src = (uint32_t*)0x70000000ULL;
-        uint32_t* dst = (uint32_t*)fb->address;
-
-        /*
-         * CRITICAL (Bare Metal): Disable interrupts during the copy.
-         *
-         * src (0x70000000) is mapped ONLY in the calling task's PML4.
-         * If the scheduler preempts us and switches CR3 to another
-         * task's PML4 (e.g. shell), 0x70000000 is unmapped there →
-         * reading src triggers #PF in kernel mode → triple fault →
-         * reboot. This is the root cause of the "desktop restart" bug.
-         *
-         * The copy of a 1920×1080 framebuffer takes ~2-5ms on modern
-         * hardware, well within safe cli window.
-         */
-        asm volatile ("cli");
-
-        for (uint32_t y = 0; y < h; y++) {
-            uint32_t* src_row = src + y * w;
-            uint32_t* dst_row = dst + y * pitch_px;
-            for (uint32_t x = 0; x < w; x++)
-                dst_row[x] = src_row[x];
-        }
-
-        cursor_force_redraw();
-        asm volatile ("sti");
-        result = 0;
+        result = (uint64_t)-1;
         break;
     }
 
     /* ================================================================
-     * SYSCALL 36: mouse_stats(mouse_stats_t* out)
-     * Ambil snapshot counter diagnostic mouse IRQ12 (bare-metal debug).
-     * Lihat dokumentasi interpretasi di drivers/mouse.h.
-     * Return: 0 = sukses, -1 = pointer NULL.
+     * SYSCALL 36: mouse_stats (Removed: mouse driver)
      * ================================================================ */
     case 36: {
-        mouse_stats_t* out = (mouse_stats_t*)arg1;
-        if (!out) { result = (uint64_t)-1; break; }
-        out->irq_bytes  = mouse_get_irq_count();
-        out->packets    = mouse_get_pkt_count();
-        out->sync_drops = mouse_get_sync_drops();
-        result = 0;
+        /* Removed: mouse driver */
+        result = (uint64_t)-1;
         break;
     }
 
@@ -869,6 +759,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     case 37: {
         void* buf = (void*)arg1;
         size_t len = (size_t)arg2;
+        if (!is_user_range(arg1, arg2)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!buf || len == 0 || len > 4096) { result = (uint64_t)-1; break; }
         random_bytes(buf, len);
         result = 0;
@@ -884,6 +778,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         const void* data = (const void*)arg1;
         size_t len = (size_t)arg2;
         uint8_t* digest = (uint8_t*)arg3;
+        if (!is_user_range(arg1, arg2) || !is_user_range(arg3, 32)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!data || !digest) { result = (uint64_t)-1; break; }
         sha256_hash(data, len, digest);
         result = 0;
@@ -904,6 +802,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             void*          output;
             size_t         out_max;
         } *p = (void*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!p || !p->key || !p->iv || !p->input || !p->output) {
             result = (uint64_t)-1; break;
         }
@@ -927,6 +829,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             void*          output;
             size_t         out_max;
         } *p = (void*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!p || !p->key || !p->iv || !p->input || !p->output) {
             result = (uint64_t)-1; break;
         }
@@ -944,6 +850,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     case 41: {
         const char* username = (const char*)arg1;
         const char* password = (const char*)arg2;
+        if (verify_user_string((char*)arg1, 4096) == -1 || verify_user_string((char*)arg2, 4096) == -1) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!username || !password) { result = (uint64_t)-1; break; }
         int uid = cred_authenticate(username, password);
         if (uid >= 0) {
@@ -962,6 +872,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     case 42: {
         char* buf = (char*)arg1;
         size_t len = (size_t)arg2;
+        if (!is_user_range(arg1, arg2)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         uint32_t uid = task_get_uid();
         if (buf && len > 0) {
             const char* name = cred_get_username(uid);
@@ -997,6 +911,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             size_t      val_len;
             int*        out_len;
         } *p = (void*)arg1;
+        if (!verify_user_ptr((void*)arg1)) {
+            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+            result = (uint64_t)-1; break;
+        }
         if (!p) { result = (uint64_t)-1; break; }
 
         switch (p->op) {
@@ -1088,23 +1006,31 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     }
 
     /* ================================================================
-     * SYSCALL 46: set_cursor(int32_t x, int32_t y)
-     * Set mouse cursor position from userspace.
-     * Used by keyboard cursor control when PS/2 mouse is unavailable.
-     * Updates both mouse state and kernel cursor overlay.
-     * Return: 0.
+     * SYSCALL 46: set_cursor (Removed: mouse driver)
      * ================================================================ */
     case 46: {
-        int32_t x = (int32_t)arg1;
-        int32_t y = (int32_t)arg2;
-        mouse_state_t* ms = mouse_get_state();
-        ms->x = x;
-        ms->y = y;
-        ms->changed = 1;
-        /* Update kernel cursor overlay */
-        extern void cursor_update(int32_t x, int32_t y);
-        cursor_update(x, y);
-        result = 0;
+        /* Removed: mouse driver */
+        result = (uint64_t)-1;
+        break;
+    }
+
+    /* ================================================================
+     * SYSCALL 47: malloc(size_t size)
+     * Allocate memory from kernel heap for userspace.
+     * Return: pointer to allocated memory, or 0 (NULL) on failure.
+     * ================================================================ */
+    case 47:
+    case 48:
+    case 49: {
+        /*
+         * SECURITY: Syscalls kmalloc/kfree/krealloc DIHAPUS.
+         * Mengekspos kernel heap ke Ring 3 memungkinkan:
+         *   - Arbitrary kernel heap corruption via kfree(kernel_ptr)
+         *   - Kernel address leak via kmalloc() return value
+         * User-space sudah memiliki bump allocator internal di libc/stdlib.c.
+         */
+        serial_write_string("[SEC] Blocked: kernel heap syscall from Ring 3\n");
+        result = (uint64_t)-1;
         break;
     }
 

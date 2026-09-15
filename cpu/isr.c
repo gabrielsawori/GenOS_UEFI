@@ -3,7 +3,6 @@
 #include "../drivers/framebuffer.h"
 #include "../drivers/io.h"
 #include "../drivers/keyboard.h"
-#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../kernel/task.h"
 #include "../kernel/utils.h"
@@ -264,7 +263,7 @@ static void handle_gpf(struct registers *regs) {
     print_hex_serial("RSP (Stack Pointer)   ", regs->rsp);
     print_hex_serial("SS  (Stack Segment)   ", regs->ss);
     print_hex_serial("RFLAGS                ", regs->rflags);
-    print_hex_serial("int_no                ", regs->int_no);
+    print_hex_serial("vector                ", regs->vector);
 
     /* Dump all general-purpose registers for full context */
     print_hex_serial("RAX", regs->rax);
@@ -279,7 +278,7 @@ static void handle_gpf(struct registers *regs) {
      * When GPF fires at iretq, the CPU pushes a new exception frame
      * ON TOP of the original frame. The original is at:
      *   regs + sizeof(struct registers) = regs + 22*8 = regs + 176
-     * struct registers has 22 uint64_t fields (15 GPRs + int_no + err_code + 5 CPU state)
+     * struct registers has 22 uint64_t fields (15 GPRs + vector + err_code + 5 CPU state)
      */
     serial_write_string("\n  [Original iretq frame that faulted]:\n");
     uint64_t* orig = (uint64_t*)((uint8_t*)regs + 176);
@@ -399,11 +398,11 @@ static void handle_double_fault(struct registers *regs) {
  *              interrupt terjadi (disimpan oleh isr_common di stack).
  */
 void isr_handler(struct registers *regs) {
-    if (regs->int_no < 32) {
+    if (regs->vector < 32) {
         /* ===== CPU EXCEPTION ===== */
 
         /* INT 14: Page Fault — may be recoverable (CoW or user fault) */
-        if (regs->int_no == 14) {
+        if (regs->vector == 14) {
             handle_page_fault(regs);
             /* If handle_page_fault returns, it was either:
              * - CoW resolved (resume user code)
@@ -414,17 +413,17 @@ void isr_handler(struct registers *regs) {
         }
 
         /* INT 8: Double Fault — punya IST1 dedicated stack (di-set di kernel.c) */
-        if (regs->int_no == 8) {
+        if (regs->vector == 8) {
             handle_double_fault(regs);
             /* handle_double_fault tidak kembali (cli; hlt loop) */
         }
 
         /* All other exceptions are fatal */
         serial_write_string("\n[!!!] KERNEL PANIC: ");
-        serial_write_string(exception_messages[regs->int_no]);
+        serial_write_string(exception_messages[regs->vector]);
         serial_write_string(" [!!!]\n");
 
-        if (regs->int_no == 13) {
+        if (regs->vector == 13) {
             /* INT 13: General Protection Fault */
             handle_gpf(regs);
         } else {
@@ -432,7 +431,7 @@ void isr_handler(struct registers *regs) {
             fb_print("=============================================", 50, 300, 0xFF0000, 0x002244, 2);
             fb_print("                KERNEL PANIC!                ", 50, 320, 0xFF0000, 0x002244, 2);
             fb_print("=============================================", 50, 340, 0xFF0000, 0x002244, 2);
-            fb_print(exception_messages[regs->int_no], 50, 410, 0xFFFF00, 0x002244, 2);
+            fb_print(exception_messages[regs->vector], 50, 410, 0xFFFF00, 0x002244, 2);
 
             print_hex_fb("RIP: ", regs->rip, 50, 440, 0xFF8800);
             print_hex_fb("ERR: ", regs->err_code, 50, 464, 0xFF8800);
@@ -444,37 +443,27 @@ void isr_handler(struct registers *regs) {
         asm volatile ("cli");
         for (;;) { asm volatile ("hlt"); }
     }
-    else if (regs->int_no >= 32 && regs->int_no <= 47) {
+    else if (regs->vector >= 32 && regs->vector <= 47) {
         /* ===== HARDWARE IRQ ===== */
 
         /* IRQ 0 (INT 32): Timer PIT — detak jantung scheduler */
-        if (regs->int_no == 32) {
+        if (regs->vector == 32) {
             timer_tick();
             schedule(regs); /* Context switch 1000x per detik */
         }
         /* IRQ 1 (INT 33): Keyboard PS/2 — input pengguna */
-        else if (regs->int_no == 33) {
+        else if (regs->vector == 33) {
             uint8_t scancode = inb(0x60);
             keyboard_handler(scancode);
         }
-        /* IRQ 12 (INT 44): Mouse PS/2 — input pointer */
-        else if (regs->int_no == 44) {
-            uint8_t data = inb(0x60);
-            mouse_handler(data);
-            /* Render cursor overlay immediately for instant response */
-            extern void cursor_update(int32_t x, int32_t y);
-            mouse_state_t* ms = mouse_get_state();
-            if (ms->changed) {
-                cursor_update(ms->x, ms->y);
-            }
-        }
+        /* IRQ 12 (INT 44): Reserved (mouse driver removed) */
 
         /* Kirim EOI (End of Interrupt) ke PIC */
-        if (regs->int_no >= 40) { outb(0xA0, 0x20); } /* Slave PIC */
+        if (regs->vector >= 40) { outb(0xA0, 0x20); } /* Slave PIC */
         outb(0x20, 0x20); /* Master PIC */
     }
     /* ===== LAPIC TIMER (INT 48) — SMP per-CPU scheduler tick ===== */
-    else if (regs->int_no == 48) {
+    else if (regs->vector == 48) {
         extern void lapic_eoi(void);
         timer_tick();     /* Increment global tick counter */
         schedule(regs);   /* Context switch on this CPU */

@@ -1,5 +1,6 @@
 #include "stdlib.h"
 #include "syscall.h"
+#include "string.h"    /* memcpy for realloc */
 
 void exit(int status) {
     syscall(2, (uint64_t)status, 0, 0);
@@ -91,5 +92,49 @@ void power_shutdown(void) {
 
 void power_restart(void) {
     syscall(45, 1, 0, 0);
-    while (1);  /* Should never reach here */
+    while (1);
+}
+
+/* === Dynamic Memory (user-space static heap) === */
+
+/*
+ * User-space bump allocator menggunakan static buffer.
+ * Kernel heap (kmalloc) mengembalikan alamat kernel yang tidak
+ * bisa diakses Ring 3, jadi kita pakai buffer di .bss user ELF.
+ *
+ * Setiap alokasi disimpan dengan header berisi ukuran,
+ * sehingga realloc bisa meng-copy data dengan benar.
+ */
+#define USER_HEAP_SIZE (64 * 1024)  /* 64KB user heap */
+static char user_heap[USER_HEAP_SIZE] __attribute__((aligned(16)));
+static size_t heap_used = 0;
+
+void* malloc(size_t size) {
+    if (size == 0) return (void*)0;
+    size = (size + 15) & ~15;  /* 16-byte align */
+    size_t total = size + sizeof(size_t);  /* header + data */
+    if (heap_used + total > USER_HEAP_SIZE) return (void*)0;
+    size_t* header = (size_t*)&user_heap[heap_used];
+    *header = size;
+    heap_used += total;
+    return (void*)(header + 1);
+}
+
+void free(void* ptr) {
+    /* Bump allocator: individual free is a no-op.
+     * Memory is reclaimed when process exits. */
+    (void)ptr;
+}
+
+void* realloc(void* ptr, size_t new_size) {
+    if (!ptr) return malloc(new_size);
+    if (new_size == 0) { free(ptr); return (void*)0; }
+    size_t* header = (size_t*)ptr - 1;
+    size_t old_size = *header;
+    void* new_ptr = malloc(new_size);
+    if (new_ptr) {
+        size_t copy_size = old_size < new_size ? old_size : new_size;
+        memcpy(new_ptr, ptr, copy_size);
+    }
+    return new_ptr;
 }
