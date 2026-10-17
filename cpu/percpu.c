@@ -56,7 +56,7 @@ static void install_tss_in_gdt(uint64_t* gdt, struct tss* tss_ptr) {
  */
 void percpu_init_bsp(void) {
     percpu[0].cpu_id = 0;
-    percpu[0].lapic_id = 0;
+    percpu[0].lapic_id = smp_get_bsp_lapic_id();
     percpu[0].kernel_stack_top = 0;
 
     serial_write_string("  [PERCPU] BSP (CPU #0) registered\n");

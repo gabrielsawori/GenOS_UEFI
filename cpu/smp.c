@@ -15,9 +15,9 @@
  *   1. BSP allocates per-AP stacks (8KB each from PMM)
  *   2. BSP stores AP boot data in extra_argument
  *   3. BSP writes ap_entry address to goto_address
- *   4. AP wakes up, loads BSP's GDT + IDT
+ *   4. AP switches stacks in assembly, loads its own GDT + BSP's IDT
  *   5. AP signals alive via atomic counter
- *   6. AP enters idle loop (cli; hlt) until per-CPU scheduling is ready
+ *   6. AP waits for ap_go, then starts its timer and idles with interrupts
  *
  * Limine guarantees:
  *   - AP is in 64-bit long mode
@@ -53,6 +53,10 @@ struct ap_boot_info {
 
 static struct ap_boot_info ap_boot_data[MAX_CPUS];
 
+/* Switch stacks outside C so compiler-generated stack accesses remain valid. */
+extern void smp_ap_start(uint64_t stack_top, struct ap_boot_info* boot)
+    __attribute__((noreturn));
+
 /* Read CPUID */
 static void cpuid(uint32_t leaf, uint32_t* eax, uint32_t* ebx,
                   uint32_t* ecx, uint32_t* edx) {
@@ -79,15 +83,15 @@ static uint64_t rdmsr(uint32_t msr) {
  *   - Interrupts disabled
  *   - Limine's temporary GDT/stack
  *
- * We load BSP's GDT + IDT, signal alive, and enter idle.
+ * Hand off to assembly before entering C on the permanent stack.
  */
-static void ap_entry(struct limine_smp_info* info) {
+static void __attribute__((noreturn)) ap_entry(struct limine_smp_info* info) {
     struct ap_boot_info* boot = (struct ap_boot_info*)info->extra_argument;
+    smp_ap_start(boot->stack_top, boot);
+}
 
-    /* 1. Switch to allocated stack */
-    uint64_t new_stack = boot->stack_top;
-    asm volatile("mov %0, %%rsp" : : "r"(new_stack) : "memory");
-
+/* Called by smp_ap_start with a fresh, ABI-aligned stack frame. */
+void __attribute__((noreturn)) smp_ap_main(struct ap_boot_info* boot) {
     /* 2. Per-CPU GDT+TSS (own TSS with RSP0) */
     percpu_init_ap(boot->cpu_index, boot->lapic_id, boot->stack_top);
     idt_load_on_ap();
@@ -110,7 +114,7 @@ static void ap_entry(struct limine_smp_info* info) {
     lapic_init();
 
     /* 5. Mark alive */
-    cpus[boot->cpu_index].active = 1;
+    __atomic_store_n(&cpus[boot->cpu_index].active, 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&aps_booted, 1, __ATOMIC_SEQ_CST);
 
     /* 6. WAIT for BSP to signal all subsystems ready.
@@ -134,14 +138,14 @@ static void ap_entry(struct limine_smp_info* info) {
  */
 static void print_cpuid_info(void) {
     uint32_t eax, ebx, ecx, edx;
-    char buf[16];
+    char buf[21];
 
     /* Vendor string */
     cpuid(0, &eax, &ebx, &ecx, &edx);
     char vendor[13];
-    *((uint32_t*)&vendor[0]) = ebx;
-    *((uint32_t*)&vendor[4]) = edx;
-    *((uint32_t*)&vendor[8]) = ecx;
+    memcpy(&vendor[0], &ebx, sizeof(ebx));
+    memcpy(&vendor[4], &edx, sizeof(edx));
+    memcpy(&vendor[8], &ecx, sizeof(ecx));
     vendor[12] = '\0';
     serial_write_string("  CPU Vendor: ");
     serial_write_string(vendor);
@@ -155,8 +159,8 @@ static void print_cpuid_info(void) {
     uint32_t family   = (eax >> 8) & 0xF;
     uint32_t ext_model = (eax >> 16) & 0xF;
     uint32_t ext_family = (eax >> 20) & 0xFF;
-    if (family == 0xF) family += ext_family;
     if (family == 0x6 || family == 0xF) model += (ext_model << 4);
+    if (family == 0xF) family += ext_family;
 
     serial_write_string("  CPU Family: ");
     itoa(family, buf, 10);
@@ -227,7 +231,7 @@ static void print_acpi_info(void* rsdp_addr) {
     oem[6] = '\0';
     serial_write_string(oem);
 
-    char buf[16];
+    char buf[21];
     serial_write_string(" Rev: ");
     if (rsdp->revision >= 2) {
         serial_write_string("2.0+ (XSDT)\n");
@@ -245,8 +249,36 @@ static void print_acpi_info(void* rsdp_addr) {
 }
 
 /*
- * smp_init() — Full SMP initialization with AP boot.
+ * Reserve CPU #0 for the BSP, as required by percpu.c and the IST setup.
+ * Search the full response even when it exceeds MAX_CPUS: the BSP need
+ * not be one of the first MAX_CPUS entries. Leave excess APs with Limine.
  */
+static uint32_t select_cpus(struct limine_smp_response* response,
+                            struct limine_smp_info** selected) {
+    if (!response || !response->cpu_count || !response->cpus) return 0;
+
+    uint32_t count = 1;
+    selected[0] = NULL;
+    for (uint64_t i = 0; i < response->cpu_count; i++) {
+        struct limine_smp_info* info = response->cpus[i];
+        if (!info) continue;
+        if (info->lapic_id == response->bsp_lapic_id) {
+            selected[0] = info;
+        } else if (count < MAX_CPUS) {
+            selected[count++] = info;
+        }
+    }
+    return selected[0] ? count : 0;
+}
+
+/* Initialize the shared LAPIC base before publishing any AP entry point. */
+static void init_bsp(void) {
+    percpu_init_bsp();
+    lapic_init();
+    serial_write_string("  [OK] BSP per-CPU TSS + LAPIC initialized (timer deferred)\n");
+}
+
+/* smp_init() — Full SMP initialization with AP boot. */
 void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
     serial_write_string("[INFO] Detecting CPU topology (ACPI MADT + CPUID)...\n");
 
@@ -257,7 +289,9 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
     print_acpi_info(rsdp_addr);
 
     /* Phase 3: Enumerate and BOOT CPUs via Limine SMP */
-    if (!smp_response || smp_response->cpu_count == 0) {
+    struct limine_smp_info* selected[MAX_CPUS];
+    cpu_count = select_cpus(smp_response, selected);
+    if (cpu_count == 0) {
         serial_write_string("  [WARN] Limine SMP unavailable, single-CPU fallback\n");
         uint32_t eax, ebx, ecx, edx;
         cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -267,21 +301,19 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         cpus[0].active = 1;
         cpu_count = 1;
         bsp_lapic_id = cpus[0].apic_id;
+        init_bsp();
         serial_write_string("[OK] SMP: 1 CPU (CPUID fallback)\n");
         return;
     }
 
-    char buf[16];
+    char buf[21];
     bsp_lapic_id = smp_response->bsp_lapic_id;
+    init_bsp();
 
     serial_write_string("  BSP LAPIC ID: ");
     itoa(bsp_lapic_id, buf, 10);
     serial_write_string(buf);
     serial_write_string("\n");
-
-    uint64_t total = smp_response->cpu_count;
-    if (total > MAX_CPUS) total = MAX_CPUS;
-    cpu_count = (uint32_t)total;
 
     /* HHDM offset for PMM physical-to-virtual conversion */
     extern volatile struct limine_hhdm_request hhdm_request;
@@ -291,8 +323,8 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
 
     serial_write_string("  MADT CPU Enumeration:\n");
 
-    for (uint64_t i = 0; i < total; i++) {
-        struct limine_smp_info* info = smp_response->cpus[i];
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        struct limine_smp_info* info = selected[i];
         int is_bsp = (info->lapic_id == bsp_lapic_id);
 
         cpus[i].processor_id = info->processor_id;
@@ -315,13 +347,13 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         /* === BOOT THIS AP === */
 
         /* Allocate 8KB contiguous stack (2 pages) for this AP */
-        uint64_t sphys = (uint64_t)pmm_alloc_contiguous_pages(2);
+        uint64_t sphys = (uint64_t)pmm_alloc_contiguous_pages(AP_STACK_PAGES);
         if (!sphys) {
             serial_write_string(" [AP, NO MEMORY — skipped]\n");
             continue;
         }
         /* Stack grows down: top = base + 8KB */
-        uint64_t stack_top = sphys + hhdm_off + (2 * 4096);
+        uint64_t stack_top = sphys + hhdm_off + AP_STACK_PAGES * PAGE_SIZE;
 
         /* Prepare boot data */
         ap_boot_data[i].stack_top  = stack_top;
@@ -345,7 +377,7 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         serial_write_string(buf);
         serial_write_string(" AP(s) to boot...\n");
 
-        /* Spin-wait with timeout (~100ms max) */
+        /* Bounded spin-wait; elapsed time depends on the CPU/hypervisor. */
         volatile uint32_t timeout = 10000000;
         while (__atomic_load_n(&aps_booted, __ATOMIC_SEQ_CST) < ap_count && timeout > 0) {
             asm volatile("pause");
@@ -370,17 +402,10 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
         }
     }
 
-    /* Phase 5: Per-CPU data + LAPIC on BSP (timer deferred) */
-    percpu_init_bsp();
-    lapic_init();
-    /* NOTE: BSP LAPIC timer NOT started here — deferred to smp_start_timers()
-     * which is called from kernel.c AFTER all subsystems are ready. */
-    serial_write_string("  [OK] BSP per-CPU TSS + LAPIC initialized (timer deferred)\n");
-
     /* Summary */
     uint32_t active_count = 0;
     for (uint32_t i = 0; i < cpu_count; i++) {
-        if (cpus[i].active) active_count++;
+        if (__atomic_load_n(&cpus[i].active, __ATOMIC_ACQUIRE)) active_count++;
     }
 
     serial_write_string("[OK] SMP: ");
@@ -392,7 +417,7 @@ void smp_init(struct limine_smp_response* smp_response, void* rsdp_addr) {
     serial_write_string(" active (BSP + ");
     itoa(active_count - 1, buf, 10);
     serial_write_string(buf);
-    serial_write_string(" AP(s) with LAPIC timers)\n");
+    serial_write_string(" AP(s), timers deferred)\n");
 }
 
 uint32_t smp_get_cpu_count(void) {
@@ -410,6 +435,8 @@ struct cpu_info* smp_get_cpus(void) {
 }
 
 uint32_t smp_get_current_cpu_id(void) {
+    /* Also safe before smp_init(), when LAPIC MMIO is not initialized. */
+    if (cpu_count <= 1) return 0;
     uint32_t lid = lapic_get_id();
     for (uint32_t i = 0; i < cpu_count; i++) {
         if (cpus[i].apic_id == lid) return i;
@@ -433,7 +460,7 @@ uint32_t smp_get_bsp_lapic_id(void) {
  * ready, causing Invalid Opcode (#UD) on bare metal.
  */
 void smp_start_timers(void) {
-    char buf[16];
+    char buf[21];
 
     /* Start BSP LAPIC timer */
     lapic_timer_init(1000);
@@ -442,10 +469,11 @@ void smp_start_timers(void) {
     /* Release AP gate — APs will now start their LAPIC timers + sti */
     __atomic_store_n(&ap_go, 1, __ATOMIC_SEQ_CST);
 
-    if (cpu_count > 1) {
+    uint32_t booted = __atomic_load_n(&aps_booted, __ATOMIC_SEQ_CST);
+    if (booted > 0) {
         serial_write_string("[OK] AP gate released — ");
-        itoa(cpu_count - 1, buf, 10);
+        itoa(booted, buf, 10);
         serial_write_string(buf);
-        serial_write_string(" AP(s) now scheduling\n");
+        serial_write_string(" AP(s) ready for timer interrupts\n");
     }
 }

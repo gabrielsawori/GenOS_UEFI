@@ -12,7 +12,7 @@
  * SMP Initialization Levels:
  *   ✅ Level 0: CPUID-based detection (vendor, features)
  *   ✅ Level 1: ACPI MADT via Limine SMP (accurate CPU enumeration)
- *   🔴 Level 2: AP boot via goto_address (future)
+ *   ✅ Level 2: AP boot via goto_address + per-CPU GDT/TSS and timers
  *   🔴 Level 3: Per-CPU schedulers + IPI (future)
  */
 
@@ -54,7 +54,7 @@ uint32_t smp_get_cpu_count(void);
 /* Get current CPU's APIC ID */
 uint8_t smp_get_apic_id(void);
 
-/* Get CPU info array */
+/* Get CPU info array. Index 0 is always the BSP; APs occupy subsequent slots. */
 struct cpu_info* smp_get_cpus(void);
 
 /* Get current CPU index */
