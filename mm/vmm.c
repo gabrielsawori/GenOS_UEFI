@@ -1,225 +1,290 @@
 #include "vmm.h"
 #include "pmm.h"
+#include "../cpu/preempt.h"
+#include "../cpu/percpu.h"
+#include "../cpu/tlb.h"
 #include "../limine.h"
 #include "../drivers/serial.h"
 
-// --- PERBAIKAN: Jangan buat request baru! Pinjam (extern) dari pmm.c ---
 extern volatile struct limine_hhdm_request hhdm_request;
+static uint64_t* kernel_pml4;
 
-// Pointer ke Tabel Lapis Ke-4 (Puncak dari Pohon Paging)
-static uint64_t* kernel_pml4 = NULL;
+static uint64_t* table_at(uint64_t entry) {
+    return (uint64_t*)(vmm_pte_address(entry) + hhdm_request.response->offset);
+}
+
+static int canonical(uint64_t va) {
+    return va < 0x800000000000ULL || va >= 0xFFFF800000000000ULL;
+}
+
+static unsigned index_at(uint64_t va, unsigned level) {
+    return (va >> (12 + 9 * level)) & 511;
+}
 
 void vmm_init(void) {
-    serial_write_string("[INFO] Menginisialisasi Virtual Memory Manager (VMM)...\n");
-
     uint64_t cr3;
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
-    
-    cr3 &= ~0xFFF; 
-    
-    // Gunakan hhdm_request dari pmm.c
-    kernel_pml4 = (uint64_t*)(cr3 + hhdm_request.response->offset);
-    
-    serial_write_string("[OK] Mesin Paging (VMM) berhasil terkait dengan tabel Limine!\n");
+    kernel_pml4 = table_at(cr3);
+    /* Kernel stores to user CoW mappings must fault instead of bypassing RO. */
+    uint64_t cr0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= 1ULL << 16;
+    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    serial_write_string("[OK] VMM linked to Limine page tables\n");
 }
 
-/* ========================================================================
- * INTERNAL: Operasi page table pada PML4 tertentu
- * Semua fungsi publik hanyalah wrapper yang memanggil versi _in dengan
- * kernel_pml4 sebagai parameter default.
- * ======================================================================== */
-
-void vmm_map_page_in(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
-    uint64_t offset = hhdm_request.response->offset;
-    
-    uint64_t pml4_idx = (virtual_addr >> 39) & 0x1FF;
-    uint64_t pdpt_idx = (virtual_addr >> 30) & 0x1FF;
-    uint64_t pd_idx   = (virtual_addr >> 21) & 0x1FF;
-    uint64_t pt_idx   = (virtual_addr >> 12) & 0x1FF;
-
-    // --- Lapis 1: PDPT ---
-    uint64_t* pdpt;
-    if (pml4[pml4_idx] & 1) { 
-        pdpt = (uint64_t*)((pml4[pml4_idx] & ~0xFFF) + offset);
-    } else { 
-        uint64_t p = (uint64_t)pmm_alloc_page();
-        pdpt = (uint64_t*)(p + offset);
-        for(int i=0; i<512; i++) pdpt[i] = 0; 
-        pml4[pml4_idx] = p | 0b111;    
+static int map_page(uint64_t* pml4, uint64_t va, uint64_t phys, uint64_t flags,
+                    int flush) {
+    if (!pml4 || !canonical(va) || (va & (PAGE_SIZE - 1)) ||
+        (phys & ~PTE_ADDR_MASK) || !(flags & PTE_PRESENT) ||
+        (flags & ~PTE_FLAG_MASK) || ((flags & PTE_USER) && va >= 0x800000000000ULL))
+        return 0;
+    uint64_t* table = pml4;
+    uint64_t* created[3];
+    unsigned count = 0;
+    for (unsigned level = 3; level > 0; level--) {
+        uint64_t* slot = &table[index_at(va, level)];
+        if (*slot & PTE_PRESENT) {
+            /* Do not widen ancestor permissions and expose other mappings. */
+            if ((*slot & PTE_LARGE) ||
+                ((flags & PTE_USER) && !(*slot & PTE_USER)) ||
+                ((flags & PTE_WRITE) && !(*slot & PTE_WRITE)) ||
+                (!(flags & PTE_NX) && (*slot & PTE_NX))) goto rollback;
+        } else {
+            uint64_t frame = (uint64_t)pmm_alloc_page();
+            if (!frame) goto rollback;
+            uint64_t* next = table_at(frame);
+            for (unsigned i = 0; i < 512; i++) next[i] = 0;
+            *slot = frame | PTE_PRESENT | PTE_WRITE | PTE_USER;
+            created[count++] = slot;
+        }
+        table = table_at(*slot);
     }
-
-    // --- Lapis 2: PD ---
-    uint64_t* pd;
-    if (pdpt[pdpt_idx] & 1) {
-        pd = (uint64_t*)((pdpt[pdpt_idx] & ~0xFFF) + offset);
-    } else {
-        uint64_t p = (uint64_t)pmm_alloc_page();
-        pd = (uint64_t*)(p + offset);
-        for(int i=0; i<512; i++) pd[i] = 0;
-        pdpt[pdpt_idx] = p | 0b111;
+    uint64_t* leaf = &table[index_at(va, 0)];
+    if (*leaf & PTE_PRESENT) goto rollback;
+    *leaf = phys | flags;
+    if (flush) tlb_shootdown(pml4, va);
+    return 1;
+rollback:
+    {
+        uint64_t retired[3];
+        unsigned n = 0;
+        while (count) {
+            uint64_t* slot = created[--count];
+            retired[n++] = vmm_pte_address(*slot);
+            *slot = 0;
+        }
+        if (n) tlb_shootdown(pml4, UINT64_MAX);
+        while (n) pmm_free_page((void*)retired[--n]);
     }
-
-    // --- Lapis 3: PT ---
-    uint64_t* pt;
-    if (pd[pd_idx] & 1) {
-        pt = (uint64_t*)((pd[pd_idx] & ~0xFFF) + offset);
-    } else {
-        uint64_t p = (uint64_t)pmm_alloc_page();
-        pt = (uint64_t*)(p + offset);
-        for(int i=0; i<512; i++) pt[i] = 0;
-        pd[pd_idx] = p | 0b111;
-    }
-
-    /* --- Lapis Terakhir: Tautkan dengan Fisik Asli --- */
-    pt[pt_idx] = physical_addr | flags;
-
-    /* FLUSH TLB untuk alamat virtual ini. */
-    asm volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
+    return 0;
 }
 
-void vmm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
-    vmm_map_page_in(kernel_pml4, virtual_addr, physical_addr, flags);
+int vmm_map_page_in(uint64_t* pml4, uint64_t va, uint64_t phys, uint64_t flags) {
+    PREEMPT_GUARD;
+    return map_page(pml4, va, phys, flags, 1);
 }
 
-uint64_t vmm_unmap_page_in(uint64_t* pml4, uint64_t virtual_addr) {
-    uint64_t offset = hhdm_request.response->offset;
+static int valid_range(uint64_t base, uint32_t count) {
+    uint64_t bytes = (uint64_t)count * PAGE_SIZE;
+    return count && !(base & (PAGE_SIZE - 1)) && canonical(base) &&
+           bytes - 1 <= UINT64_MAX - base && canonical(base + bytes - 1);
+}
 
-    uint64_t pml4_idx = (virtual_addr >> 39) & 0x1FF;
-    uint64_t pdpt_idx = (virtual_addr >> 30) & 0x1FF;
-    uint64_t pd_idx   = (virtual_addr >> 21) & 0x1FF;
-    uint64_t pt_idx   = (virtual_addr >> 12) & 0x1FF;
+int vmm_map_pages_in(uint64_t* pml4, uint64_t base, const uint64_t* pages,
+                     uint32_t count, uint64_t flags) {
+    PREEMPT_GUARD;
+    if (!pml4 || !pages || !valid_range(base, count)) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!map_page(pml4, base + (uint64_t)i * PAGE_SIZE, pages[i], flags, 0)) {
+            if (i) vmm_unmap_pages_in(pml4, base, i);
+            return 0;
+        }
+    }
+    tlb_shootdown(pml4, UINT64_MAX);
+    return 1;
+}
 
-    if (!(pml4[pml4_idx] & 1)) return 0;
-    uint64_t* pdpt = (uint64_t*)((pml4[pml4_idx] & ~0xFFF) + offset);
+int vmm_map_page(uint64_t va, uint64_t phys, uint64_t flags) {
+    return vmm_map_page_in(kernel_pml4, va, phys, flags);
+}
 
-    if (!(pdpt[pdpt_idx] & 1)) return 0;
-    uint64_t* pd = (uint64_t*)((pdpt[pdpt_idx] & ~0xFFF) + offset);
+uint64_t* vmm_pte_in(uint64_t* pml4, uint64_t va) {
+    if (!pml4 || !canonical(va)) return NULL;
+    uint64_t* table = pml4;
+    for (unsigned level = 3; level > 0; level--) {
+        uint64_t entry = table[index_at(va, level)];
+        if (!(entry & PTE_PRESENT) || (entry & PTE_LARGE)) return NULL;
+        table = table_at(entry);
+    }
+    uint64_t* leaf = &table[index_at(va, 0)];
+    return (*leaf & PTE_PRESENT) ? leaf : NULL;
+}
 
-    if (!(pd[pd_idx] & 1)) return 0;
-    uint64_t* pt = (uint64_t*)((pd[pd_idx] & ~0xFFF) + offset);
+uint64_t vmm_get_physical_in(uint64_t* pml4, uint64_t va, uint64_t* flags) {
+    PREEMPT_GUARD;
+    uint64_t* entry = vmm_pte_in(pml4, va);
+    if (flags) *flags = entry ? (*entry & PTE_FLAG_MASK) : 0;
+    return entry ? vmm_pte_address(*entry) : 0;
+}
 
-    if (!(pt[pt_idx] & 1)) return 0;
+uint64_t vmm_get_physical(uint64_t va, uint64_t* flags) {
+    return vmm_get_physical_in(kernel_pml4, va, flags);
+}
 
-    uint64_t phys = pt[pt_idx] & ~0xFFF;
-    pt[pt_idx] = 0;
+int vmm_user_accessible(uint64_t* pml4, uint64_t va, int write) {
+    PREEMPT_GUARD;
+    if (!pml4 || va >= 0x800000000000ULL) return 0;
+    uint64_t* table = pml4;
+    for (int level = 3; level >= 0; level--) {
+        uint64_t entry = table[index_at(va, (unsigned)level)];
+        if ((entry & (PTE_PRESENT | PTE_USER)) != (PTE_PRESENT | PTE_USER)) return 0;
+        if (level) {
+            if ((entry & PTE_LARGE) || (write && !(entry & PTE_WRITE))) return 0;
+            table = table_at(entry);
+        } else if (write && !(entry & (PTE_WRITE | PTE_COW))) return 0;
+    }
+    return 1;
+}
 
-    asm volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
+static int empty_table(uint64_t* table) {
+    for (unsigned i = 0; i < 512; i++) {
+        if (table[i] & PTE_PRESENT) return 0;
+    }
+    return 1;
+}
+
+/* A bounded retirement buffer keeps stack usage small. Even when a large
+ * range fills it, no table frame is recycled before remote walkers flush. */
+static void release_tables(uint64_t* pml4, uint64_t* retired, unsigned* count) {
+    tlb_shootdown(pml4, UINT64_MAX);
+    while (*count) pmm_free_page((void*)retired[--*count]);
+}
+
+uint32_t vmm_unmap_pages_in(uint64_t* pml4, uint64_t base, uint32_t count) {
+    PREEMPT_GUARD;
+    if (!pml4 || !valid_range(base, count)) return 0;
+    uint32_t removed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t* leaf = vmm_pte_in(pml4, base + (uint64_t)i * PAGE_SIZE);
+        if (leaf) { *leaf = 0; removed++; }
+    }
+    if (!removed) return 0;
+    uint64_t retired[16];
+    unsigned n = 0;
+    /* Inspect each affected PT once, including a partially covered PT. */
+    uint64_t va = base;
+    uint64_t last = base + ((uint64_t)count - 1) * PAGE_SIZE;
+    for (;;) {
+        uint64_t* tables[4] = {pml4};
+        uint64_t* slots[3];
+        unsigned depth;
+        for (depth = 0; depth < 3; depth++) {
+            slots[depth] = &tables[depth][index_at(va, 3 - depth)];
+            if (!(*slots[depth] & PTE_PRESENT) || (*slots[depth] & PTE_LARGE)) break;
+            tables[depth + 1] = table_at(*slots[depth]);
+        }
+        if (depth == 3) {
+            for (int i = 2; i >= 0; i--) {
+                if (i == 0 && va >= 0xFFFF800000000000ULL) break;
+                if (!empty_table(tables[i + 1])) break;
+                retired[n++] = vmm_pte_address(*slots[i]);
+                *slots[i] = 0;
+                if (n == 16) release_tables(pml4, retired, &n);
+            }
+        }
+        if ((va >> 21) == (last >> 21)) break;
+        va = (va | ((1ULL << 21) - 1)) + 1;
+    }
+    release_tables(pml4, retired, &n);
+    return removed;
+}
+
+uint64_t vmm_unmap_page_in(uint64_t* pml4, uint64_t va) {
+    PREEMPT_GUARD;
+    if (!pml4 || !canonical(va) || (va & (PAGE_SIZE - 1))) return 0;
+    uint64_t* tables[4] = {pml4};
+    uint64_t* slots[3];
+    for (unsigned i = 0; i < 3; i++) {
+        slots[i] = &tables[i][index_at(va, 3 - i)];
+        if (!(*slots[i] & PTE_PRESENT) || (*slots[i] & PTE_LARGE)) return 0;
+        tables[i + 1] = table_at(*slots[i]);
+    }
+    uint64_t* leaf = &tables[3][index_at(va, 0)];
+    if (!(*leaf & PTE_PRESENT)) return 0;
+    uint64_t phys = vmm_pte_address(*leaf);
+    *leaf = 0;
+    uint64_t retired[3];
+    unsigned n = 0;
+    for (int i = 2; i >= 0; i--) {
+        /* Upper-half roots are copied into every process; keep their PDPT. */
+        if (i == 0 && va >= 0xFFFF800000000000ULL) break;
+        if (!empty_table(tables[i + 1])) break;
+        uint64_t frame = vmm_pte_address(*slots[i]);
+        *slots[i] = 0;
+        retired[n++] = frame;
+    }
+    tlb_shootdown(pml4, n ? UINT64_MAX : va);
+    while (n) pmm_free_page((void*)retired[--n]);
     return phys;
 }
 
-uint64_t vmm_unmap_page(uint64_t virtual_addr) {
-    return vmm_unmap_page_in(kernel_pml4, virtual_addr);
+uint64_t vmm_unmap_page(uint64_t va) {
+    return vmm_unmap_page_in(kernel_pml4, va);
 }
 
-uint64_t vmm_get_physical(uint64_t virtual_addr, uint64_t* out_flags) {
-    uint64_t offset = hhdm_request.response->offset;
-
-    uint64_t pml4_idx = (virtual_addr >> 39) & 0x1FF;
-    uint64_t pdpt_idx = (virtual_addr >> 30) & 0x1FF;
-    uint64_t pd_idx   = (virtual_addr >> 21) & 0x1FF;
-    uint64_t pt_idx   = (virtual_addr >> 12) & 0x1FF;
-
-    if (!(kernel_pml4[pml4_idx] & 1)) return 0;
-    uint64_t* pdpt = (uint64_t*)((kernel_pml4[pml4_idx] & ~0xFFF) + offset);
-
-    if (!(pdpt[pdpt_idx] & 1)) return 0;
-    uint64_t* pd = (uint64_t*)((pdpt[pdpt_idx] & ~0xFFF) + offset);
-
-    if (!(pd[pd_idx] & 1)) return 0;
-    uint64_t* pt = (uint64_t*)((pd[pd_idx] & ~0xFFF) + offset);
-
-    uint64_t entry = pt[pt_idx];
-    if (!(entry & 1)) return 0;
-
-    if (out_flags) {
-        *out_flags = entry & 0xFFF;
-    }
-    return entry & ~0xFFF;
-}
-
-/* ========================================================================
- * PER-PROCESS ADDRESS SPACE MANAGEMENT
- * ======================================================================== */
-
-/*
- * vmm_create_address_space: Alokasi PML4 baru untuk proses user.
- *
- * Mengalokasikan 1 page fisik untuk PML4, meng-nol-kan seluruhnya,
- * lalu menyalin entries 256-511 (upper half) dari kernel_pml4.
- * Upper half di-SHARE (pointer yang sama), bukan di-copy deep,
- * sehingga kernel mapping selalu identik di semua address space.
- *
- * Return: pointer virtual (HHDM) ke PML4 baru, atau NULL jika gagal.
- */
 uint64_t* vmm_create_address_space(void) {
-    uint64_t offset = hhdm_request.response->offset;
-
-    uint64_t phys_pml4 = (uint64_t)pmm_alloc_page();
-    if (!phys_pml4) return NULL;
-
-    uint64_t* new_pml4 = (uint64_t*)(phys_pml4 + offset);
-
-    /* Nol-kan seluruh PML4 */
-    for (int i = 0; i < 512; i++) new_pml4[i] = 0;
-
-    /* Salin upper half (entries 256-511) dari kernel — SHARED, bukan deep copy */
-    for (int i = 256; i < 512; i++) {
-        new_pml4[i] = kernel_pml4[i];
-    }
-
-    return new_pml4;
+    PREEMPT_GUARD;
+    uint64_t phys = (uint64_t)pmm_alloc_page();
+    if (!phys) return NULL;
+    uint64_t* pml4 = table_at(phys);
+    for (unsigned i = 0; i < 512; i++) pml4[i] = i < 256 ? 0 : kernel_pml4[i];
+    return pml4;
 }
 
-/*
- * vmm_destroy_address_space: Bebaskan page table levels user (lower half).
- *
- * Walk entries 0-255 dari PML4, bebaskan setiap PT, PD, dan PDPT page
- * yang dialokasikan untuk lower half. TIDAK membebaskan physical leaf
- * pages — itu tanggung jawab reaper (via user_pages[]).
- * TIDAK membebaskan upper half karena di-share dengan kernel.
- */
-void vmm_destroy_address_space(uint64_t* pml4) {
-    if (!pml4) return;
-
-    uint64_t offset = hhdm_request.response->offset;
-
-    for (int i = 0; i < 256; i++) {
-        if (!(pml4[i] & 1)) continue;
-
-        uint64_t* pdpt = (uint64_t*)((pml4[i] & ~0xFFF) + offset);
-        for (int j = 0; j < 512; j++) {
-            if (!(pdpt[j] & 1)) continue;
-
-            uint64_t* pd = (uint64_t*)((pdpt[j] & ~0xFFF) + offset);
-            for (int k = 0; k < 512; k++) {
-                if (!(pd[k] & 1)) continue;
-
-                /* Bebas PT page */
-                uint64_t pt_phys = pd[k] & ~0xFFF;
-                pmm_free_page((void*)pt_phys);
-            }
-            /* Bebas PD page */
-            uint64_t pd_phys = pdpt[j] & ~0xFFF;
-            pmm_free_page((void*)pd_phys);
+/* Free table frames only; leaf references belong to the caller. Huge leaves
+ * are skipped, never dereferenced or freed as though they were page tables. */
+static void free_tables(uint64_t* table, unsigned level, unsigned limit) {
+    if (level) {
+        for (unsigned i = 0; i < limit; i++) {
+            uint64_t entry = table[i];
+            if (!(entry & PTE_PRESENT) || (entry & PTE_LARGE)) continue;
+            free_tables(table_at(entry), level - 1, 512);
         }
-        /* Bebas PDPT page */
-        uint64_t pdpt_phys = pml4[i] & ~0xFFF;
-        pmm_free_page((void*)pdpt_phys);
     }
-
-    /* Bebas PML4 page itu sendiri */
-    uint64_t pml4_phys = (uint64_t)pml4 - offset;
-    pmm_free_page((void*)pml4_phys);
+    pmm_free_page((void*)((uint64_t)table - hhdm_request.response->offset));
 }
 
-/*
- * vmm_switch_pml4: Ganti address space aktif dengan menulis CR3.
- *
- * @param pml4: pointer virtual (HHDM) ke PML4. Fungsi ini menghitung
- *              alamat fisik dan menulisnya ke CR3.
- */
+void vmm_destroy_address_space(uint64_t* pml4) {
+    PREEMPT_GUARD;
+    if (pml4 && pml4 != kernel_pml4) free_tables(pml4, 3, 256);
+}
+
+static int visit_table(uint64_t* table, unsigned level, unsigned limit,
+                       uint64_t base, vmm_visit_fn visit, void* context) {
+    for (unsigned i = 0; i < limit; i++) {
+        uint64_t entry = table[i];
+        if (!(entry & PTE_PRESENT)) continue;
+        uint64_t va = base | ((uint64_t)i << (12 + 9 * level));
+        if (level) {
+            if ((entry & PTE_LARGE) ||
+                !visit_table(table_at(entry), level - 1, 512, va, visit, context))
+                return 0;
+        } else if (!visit(va, entry, context)) return 0;
+    }
+    return 1;
+}
+
+int vmm_visit_user_pages(uint64_t* pml4, vmm_visit_fn visit, void* context) {
+    PREEMPT_GUARD;
+    return pml4 && visit && visit_table(pml4, 3, 256, 0, visit, context);
+}
+
 void vmm_switch_pml4(uint64_t* pml4) {
-    uint64_t offset = hhdm_request.response->offset;
-    uint64_t phys = (uint64_t)pml4 - offset;
-    asm volatile ("mov %0, %%cr3" : : "r"(phys) : "memory");
+    if (!pml4) pml4 = kernel_pml4;
+    uint64_t phys = (uint64_t)pml4 - hhdm_request.response->offset;
+    uint64_t old;
+    asm volatile("mov %%cr3, %0" : "=r"(old));
+    if (old != phys) asm volatile("mov %0, %%cr3" : : "r"(phys) : "memory");
+    percpu_current()->active_cr3 = phys;
 }

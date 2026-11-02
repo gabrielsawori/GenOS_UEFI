@@ -1,3 +1,4 @@
+#include "../cpu/preempt.h"
 #include "heap.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -11,7 +12,7 @@
 #define HEAP_GROW_SIZE     (16 * 4096) // Tumbuh 16 Petak (64 KB) setiap kali habis
 
 // Struktur data (Header) yang menempel di atas setiap irisan memori
-struct heap_block {
+struct __attribute__((aligned(16))) heap_block {
     size_t size;            // Ukuran irisan ini
     int free;               // 1 = Kosong, 0 = Terpakai
     struct heap_block* next;// Penunjuk ke irisan selanjutnya
@@ -41,7 +42,12 @@ void heap_init(void) {
             for (;;) { asm volatile ("hlt"); }
         }
         /* 0x03 = Present + Writable (tanpa User bit = hanya kernel yang bisa akses) */
-        vmm_map_page(HEAP_START_VIRTUAL + i, (uint64_t)phys_page, 3);
+        if (!vmm_map_page(HEAP_START_VIRTUAL + i, (uint64_t)phys_page, 3)) {
+            pmm_free_page(phys_page);
+            serial_write_string("[FATAL] heap_init: page table allocation failed\n");
+            asm volatile("cli");
+            for (;;) asm volatile("hlt");
+        }
     }
 
     /* Pada awalnya, Heap adalah satu blok raksasa utuh sebesar 64KB yang Kosong */
@@ -62,6 +68,7 @@ void heap_init(void) {
  * bisa tumbuh melampaui 64KB awal tanpa batas (selama RAM tersedia).
  */
 static int heap_grow(void) {
+    if (heap_end > UINT64_MAX - HEAP_GROW_SIZE) return 0;
     serial_write_string("[INFO] Heap berkembang...\n");
 
     /* Cari blok terakhir di linked-list */
@@ -71,13 +78,14 @@ static int heap_grow(void) {
     }
 
     /* Alokasikan page baru dari PMM dan petakan ke VMM */
-    for (uint64_t i = 0; i < HEAP_GROW_SIZE; i += 4096) {
+    uint64_t mapped = 0;
+    for (; mapped < HEAP_GROW_SIZE; mapped += PAGE_SIZE) {
         void* phys_page = pmm_alloc_page();
-        if (!phys_page) {
-            serial_write_string("[FATAL] heap_grow: PMM kehabisan frame!\n");
-            return 0;
+        if (!phys_page) goto rollback;
+        if (!vmm_map_page(heap_end + mapped, (uint64_t)phys_page, 3)) {
+            pmm_free_page(phys_page);
+            goto rollback;
         }
-        vmm_map_page(heap_end + i, (uint64_t)phys_page, 3);
     }
 
     /* Buat blok kosong baru di ujung heap */
@@ -98,11 +106,21 @@ static int heap_grow(void) {
     heap_end += HEAP_GROW_SIZE;
     serial_write_string("[OK] Heap berkembang 64KB.\n");
     return 1;
+rollback:
+    while (mapped) {
+        mapped -= PAGE_SIZE;
+        uint64_t phys = vmm_unmap_page(heap_end + mapped);
+        if (phys) pmm_free_page((void*)phys);
+    }
+    return 0;
 }
 
 void* kmalloc(size_t size) {
-    if (size == 0) return NULL;
+    PREEMPT_GUARD;
+    if (size == 0 || size > SIZE_MAX - 15 - sizeof(struct heap_block)) return NULL;
+    size = (size + 15) & ~(size_t)15;
 
+retry:
     struct heap_block* curr = heap_head;
     
     // Cari irisan memori dari depan ke belakang (First-Fit)
@@ -133,7 +151,7 @@ void* kmalloc(size_t size) {
     
     // Tidak ada blok yang cocok. Coba perluas heap lalu cari lagi.
     if (heap_grow()) {
-        return kmalloc(size);
+        goto retry;
     }
 
     serial_write_string("[ERROR] Heap Out of Memory!\n");
@@ -141,6 +159,7 @@ void* kmalloc(size_t size) {
 }
 
 void kfree(void* ptr) {
+    PREEMPT_GUARD;
     if (!ptr) return;
     
     // Dapatkan header dari pointer ini (mundur beberapa byte)
@@ -183,6 +202,7 @@ void kfree(void* ptr) {
  *   - blok terlalu kecil → alokasi baru, copy data lama, bebas lama
  */
 void* krealloc(void* ptr, size_t new_size) {
+    PREEMPT_GUARD;
     if (!ptr) return kmalloc(new_size);
     if (new_size == 0) { kfree(ptr); return NULL; }
 

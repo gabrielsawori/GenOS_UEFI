@@ -2,6 +2,18 @@
 
 > Kernel minimalis yang didesain untuk **cybersecurity** dan **backend development**, dibangun dari nol di atas arsitektur x86-64 Long Mode dengan bootloader Limine (UEFI/BIOS).
 
+Prioritas saat ini: **core, multicore, dan driver dahulu; DE menyusul**.
+Target awal QEMU x86-64. Paket SMP menjalankan task pada BSP/AP, dengan driver
+timer, enumerasi PCI, dan input PS/2. Jalankan `hwinfo` di shell untuk status.
+Status implementasi, batasan, tes, dan syarat menuju DE ada di
+[core-readiness.md](documentation/core-readiness.md).
+Memori user kini mendukung malloc/free/realloc berbasis halaman dan SHM hingga
+16 MiB per segmen. Kontrak, batasan, dan tes ada di
+[user-memory.md](documentation/user-memory.md).
+Context x87/SSE per task dan isolasi exception aplikasi dijelaskan di
+[task-context.md](documentation/task-context.md); jalankan `make test-context`
+untuk matriks pengujiannya.
+
 ---
 
 ## ✨ Highlights
@@ -27,7 +39,7 @@
 │   app.elf   ── Test Application                     │
 ├─────────────────────────────────────────────────────┤
 │                 SYSCALL BOUNDARY                    │
-│         49 syscalls + pointer validation            │
+│         Native syscalls + checked user buffers      │
 ├─────────────────────────────────────────────────────┤
 │                    RING 0 (Kernel)                  │
 │                                                     │
@@ -36,7 +48,7 @@
 │   Filesystem VFS · TAR ramdisk · tmpfs · cache      │
 │   Crypto    AES-256 · SHA-256 · HMAC · PBKDF2 · RNG│
 │   Security  Credentials · Keystore · SMEP · uaccess │
-│   Drivers   Framebuffer · Keyboard · Timer · Serial │
+│   Drivers   Framebuffer · PS/2 · PCI · Timer · Serial│
 │   Task      Preemptive scheduler · fork · clone     │
 │   IPC       Shared memory (POSIX-like)              │
 └─────────────────────────────────────────────────────┘

@@ -3,6 +3,8 @@ CFLAGS = -Wall -Wextra -O2 -pipe -ffreestanding -fno-stack-protector -fno-stack-
 
 LD = ld
 LDFLAGS = -nostdlib -static -z max-page-size=0x1000 -T linker.ld
+QEMU_CPUS ?= 4
+QEMU_MEMORY ?= 512M
 
 SRC_DIRS = kernel drivers cpu mm fs crypto security
 C_SRCS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)/*.c))
@@ -13,7 +15,14 @@ OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.S=.o)
 LIBC_SRCS = libc/stdio.c libc/stdlib.c libc/string.c libc/crypto.c
 LIBC_OBJS = $(LIBC_SRCS:.c=.o)
 
-.PHONY: all clean run iso ramdisk
+CFLAGS += -DGENOS_KERNEL -MMD -MP
+# Userspace may use the standard x86-64 SSE2 ABI; kernel code must remain
+# integer-only because syscall/interrupt entry borrows the current FP state.
+USER_CFLAGS = $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -DGENOS_KERNEL,$(CFLAGS)) -mcmodel=small -msse2 -mfpmath=sse
+-include $(OBJS:.o=.d) $(LIBC_OBJS:.o=.d) shell/shell.d app/app.d
+.DEFAULT_GOAL := all
+
+.PHONY: all clean run run-headless test-core test-user-memory test-context iso ramdisk
 
 all: GenOS.iso
 
@@ -23,21 +32,20 @@ all: GenOS.iso
 %.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(LIBC_OBJS) shell/shell.o app/app.o: %.o: %.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 kernel.elf: $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
 
 # --- KOMPILASI SHELL SEBAGAI ELF USER-SPACE (Ring 3) ---
 # Di-link di 0x50000000 agar tidak konflik dengan app.elf (0x40000000)
-shell.elf: $(LIBC_OBJS)
-	mkdir -p shell
-	$(CC) $(CFLAGS) -c shell/shell.c -o shell/shell.o
-	$(LD) -nostdlib -Ttext 0x50000000 shell/shell.o $(LIBC_OBJS) -o shell.elf
+shell.elf: shell/shell.o $(LIBC_OBJS)
+	$(LD) -nostdlib -Ttext 0x50000000 $^ -o $@
 
 # --- KOMPILASI APLIKASI USER SEBAGAI ELF ---
-app.elf: $(LIBC_OBJS)
-	mkdir -p app
-	$(CC) $(CFLAGS) -c app/app.c -o app/app.o
-	$(LD) -nostdlib -Ttext 0x40000000 app/app.o $(LIBC_OBJS) -o app.elf
+app.elf: app/app.o $(LIBC_OBJS)
+	$(LD) -nostdlib -Ttext 0x40000000 $^ -o $@
 
 # --- BUNGKUS SEMUA KE RAMDISK ---
 ramdisk.tar: shell.elf app.elf
@@ -56,9 +64,22 @@ GenOS.iso: kernel.elf ramdisk.tar
 	./limine/limine bios-install GenOS.iso || true
 
 run: GenOS.iso
-	qemu-system-x86_64 -m 2G -cdrom GenOS.iso -serial stdio
+	qemu-system-x86_64 -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -cdrom GenOS.iso -serial stdio
+
+run-headless: GenOS.iso
+	qemu-system-x86_64 -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -cdrom GenOS.iso -display none -monitor none -serial stdio
+
+test-core:
+	python3 tests/run_scheduler_boot_tests.py --suite core --timeout 45
+
+test-user-memory:
+	python3 tests/run_scheduler_boot_tests.py --suite umem --timeout 45
+
+test-context:
+	python3 tests/run_scheduler_boot_tests.py --suite context --timeout 45
 
 clean:
+	rm -f $(OBJS:.o=.d) $(LIBC_OBJS:.o=.d) app/app.d shell/shell.d
 	rm -f $(OBJS) $(LIBC_OBJS) kernel.elf GenOS.iso ramdisk.tar pesan.txt
 	rm -f app.elf app/app.o shell.elf shell/shell.o
 	rm -rf iso_root

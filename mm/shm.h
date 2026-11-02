@@ -14,14 +14,13 @@ struct task;
  * map the same physical pages, so writes are immediately visible.
  *
  * Limits:
- *   SHM_MAX_SEGMENTS = 8 global segments
- *   SHM_MAX_PAGES    = 4 pages per segment (16KB max)
- *   SHM_MAX_ATTACH   = 4 segments per process
+ *   32 global segments, up to 16 MiB each, 16 attachments per address space.
+ *   Physical-page arrays are allocated on demand, not embedded in BSS.
  */
 
-#define SHM_MAX_SEGMENTS  8
-#define SHM_MAX_PAGES     4
-#define SHM_MAX_ATTACH    4
+#define SHM_MAX_SEGMENTS  32
+#define SHM_MAX_PAGES     4096
+#define SHM_MAX_ATTACH    16
 
 /*
  * Global shared memory segment descriptor.
@@ -30,7 +29,7 @@ struct task;
 typedef struct {
     int      in_use;
     int      shmid;
-    uint64_t phys_pages[SHM_MAX_PAGES];  /* Physical page addresses */
+    uint64_t* phys_pages;                 /* Owned dynamic physical-page array */
     uint32_t page_count;                  /* Number of allocated pages */
     uint32_t size;                        /* Requested size in bytes */
     uint32_t refcount;                    /* Number of attached processes */
@@ -74,7 +73,12 @@ int shm_destroy(int shmid);
 
 /*
  * Cleanup all SHM attachments for a dying process.
- * Called by the reaper in schedule() before destroying the address space.
+ * Called by the reaper worker before destroying the address space.
  * Uses the task's shm_attached[] to find and detach all segments.
  */
 void shm_cleanup_process(struct task* t);
+
+/* Fork helpers: verify shared leaves, then retain attachment metadata after
+ * all mappings succeeded. They do not acquire private PMM references. */
+int shm_owns_mapping(struct task* owner, uint64_t va, uint64_t phys);
+int shm_inherit_attachments(struct task* parent, struct task* child);

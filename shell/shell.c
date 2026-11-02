@@ -200,6 +200,7 @@ static void cmd_help(void) {
     terminal_print("    help      Show this message", COLOR_TEXT);
     terminal_print("    clear     Clear terminal + history", COLOR_TEXT);
     terminal_print("    info      System information", COLOR_TEXT);
+    terminal_print("    hwinfo    CPU, memory and driver status", COLOR_TEXT);
     terminal_print("    run       Execute app.elf", COLOR_TEXT);
     terminal_print("", COLOR_TEXT);
     terminal_print("  Filesystem:", COLOR_WARN);
@@ -234,13 +235,48 @@ static void cmd_info(void) {
     terminal_print("[*] Crypto: AES-256-CBC, SHA-256, HMAC, PBKDF2", COLOR_TEXT);
 }
 
+static void cmd_hwinfo(void) {
+    struct genos_system_info info;
+    if (get_system_info(&info)) {
+        terminal_print("Cannot read system status", COLOR_ERROR);
+        return;
+    }
+    char line[160];
+    int pos = 0;
+    str_append(line, &pos, "CPUs online/detected: ");
+    u64_to_str(info.online_cpus, line, &pos);
+    str_append(line, &pos, "/");
+    u64_to_str(info.detected_cpus, line, &pos);
+    str_append(line, &pos, "  Shell CPU: ");
+    u64_to_str(info.current_cpu, line, &pos);
+    line[pos] = 0;
+    terminal_print(line, COLOR_INFO);
+    pos = 0;
+    str_append(line, &pos, "Free RAM KiB: ");
+    u64_to_str(info.free_bytes / 1024, line, &pos);
+    str_append(line, &pos, "  PCI devices: ");
+    u64_to_str(info.pci_devices, line, &pos);
+    line[pos] = 0;
+    terminal_print(line, COLOR_TEXT);
+    terminal_print(info.ps2_mouse ? "PS/2 mouse: ready" : "PS/2 mouse: unavailable", COLOR_TEXT);
+    for (unsigned i = 0; i < info.detected_cpus; i++) {
+        pos = 0;
+        str_append(line, &pos, "CPU ");
+        u64_to_str(i, line, &pos);
+        str_append(line, &pos, " scheduler selections: ");
+        u64_to_str(info.switches[i], line, &pos);
+        line[pos] = 0;
+        terminal_print(line, COLOR_DIM);
+    }
+}
+
 static void cmd_ls(void) {
     terminal_print("=== File Listing ===", COLOR_INFO);
     int dir_fd = open("/", 0);
     if (dir_fd < 0) { terminal_print("[ERROR] Cannot open ramdisk!", COLOR_ERROR); return; }
     char name_buf[100];
-    long size_val = 0;
-    while (readdir(dir_fd, name_buf, (int*)&size_val)) {
+    int size_val = 0;
+    while (readdir(dir_fd, name_buf, &size_val) > 0) {
         char line[200];
         int j = 0;
         str_append(line, &j, "  ");
@@ -621,6 +657,7 @@ void _start(void) {
                     render_viewport();
                 }
                 else if (strcmp(cmd_buffer, "info") == 0)      cmd_info();
+                else if (strcmp(cmd_buffer, "hwinfo") == 0)    cmd_hwinfo();
                 else if (strcmp(cmd_buffer, "ls") == 0)         cmd_ls();
                 else if (strcmp(cmd_buffer, "read") == 0)       cmd_read();
                 else if (strcmp(cmd_buffer, "run") == 0)        cmd_run();

@@ -1,3 +1,4 @@
+#include "../cpu/preempt.h"
 #include "pmm.h"
 #include "../limine.h"
 #include "../drivers/serial.h"
@@ -21,14 +22,15 @@ static uint64_t hhdm_offset = 0;
 
 /*
  * Page reference count array.
- * refcounts[page_index] = number of mappings referencing this physical page.
+ * refcounts[page_index] = number of owned references to this physical page.
  *   0 = free (bit clear in bitmap)
- *   1 = exclusively owned by one process
+ *   1 = exclusively owned (data, stack, table or SHM backing)
  *  >1 = shared (Copy-on-Write)
  *
- * Stored right after bitmap in the same usable memory region.
+ * UINT32_MAX marks reserved frames; it is never a releasable reference.
+ * Stored at a uint32_t-aligned offset after the bitmap.
  */
-static uint8_t* refcounts = NULL;
+static uint32_t* refcounts = NULL;
 static uint64_t refcounts_size = 0;
 
 static void bitmap_set(uint64_t bit) {
@@ -66,57 +68,51 @@ void pmm_init(void) {
         }
     }
 
-    total_pages = highest_address / PAGE_SIZE;
-    
-    bitmap_size = total_pages / 8;
-    if (bitmap_size * 8 < total_pages) bitmap_size++;
-
+    total_pages = (highest_address + PAGE_SIZE - 1) / PAGE_SIZE;
+    bitmap_size = (total_pages + 7) / 8;
+    uint64_t refs_offset = (bitmap_size + sizeof(uint32_t) - 1) & ~3ULL;
+    refcounts_size = total_pages * sizeof(uint32_t);
+    uint64_t metadata_bytes = refs_offset + refcounts_size;
+    uint64_t metadata_pages = (metadata_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t metadata_phys = 0;
     for (uint64_t i = 0; i < mmap->entry_count; i++) {
-        if (mmap->entries[i]->type == LIMINE_MEMMAP_USABLE) {
-            /* Need space for bitmap + refcounts (1 byte per page) */
-            refcounts_size = total_pages; /* 1 byte per page */
-            uint64_t needed = bitmap_size + refcounts_size;
-            if (mmap->entries[i]->length >= needed) {
-                bitmap = (uint8_t*)(mmap->entries[i]->base + hhdm_offset);
-                refcounts = bitmap + bitmap_size;
-                break;
-            }
+        struct limine_memmap_entry* e = mmap->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+        uint64_t start = (e->base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+        uint64_t end = (e->base + e->length) & ~(PAGE_SIZE - 1ULL);
+        if (start == 0) start = PAGE_SIZE; /* NULL remains allocation failure. */
+        if (end >= start && end - start >= metadata_pages * PAGE_SIZE) {
+            metadata_phys = start;
+            break;
         }
     }
-
-    if (bitmap == NULL) {
-        serial_write_string("[FATAL] PMM: Tidak dapat menemukan memori berurutan yang cukup untuk bitmap!\n");
-        asm volatile ("cli");
-        for (;;) { asm volatile ("hlt"); }
+    if (!metadata_phys) {
+        serial_write_string("[FATAL] PMM: insufficient metadata memory\n");
+        asm volatile("cli");
+        for (;;) asm volatile("hlt");
     }
-
-    for (uint64_t i = 0; i < bitmap_size; i++) {
-        bitmap[i] = 0xFF; 
-    }
-    /* Initialize all refcounts to 0 (free) */
-    for (uint64_t i = 0; i < refcounts_size; i++) {
-        refcounts[i] = 0;
-    }
-
+    bitmap = (uint8_t*)(metadata_phys + hhdm_offset);
+    refcounts = (uint32_t*)(bitmap + refs_offset);
+    for (uint64_t i = 0; i < bitmap_size; i++) bitmap[i] = 0xFF;
+    /* UINT32_MAX is reserved, never a releasable allocation. */
+    for (uint64_t i = 0; i < total_pages; i++) refcounts[i] = UINT32_MAX;
+    free_pages = 0;
     for (uint64_t i = 0; i < mmap->entry_count; i++) {
-        if (mmap->entries[i]->type == LIMINE_MEMMAP_USABLE) {
-            uint64_t base = mmap->entries[i]->base;
-            uint64_t length = mmap->entries[i]->length;
-            
-            for (uint64_t j = 0; j < length; j += PAGE_SIZE) {
-                bitmap_clear((base + j) / PAGE_SIZE); 
-                free_pages++;
-            }
+        struct limine_memmap_entry* e = mmap->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+        uint64_t first = (e->base + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t end = (e->base + e->length) / PAGE_SIZE;
+        if (first == 0) first = 1;
+        for (uint64_t page = first; page < end; page++) {
+            if (bitmap_test(page)) free_pages++;
+            bitmap_clear(page);
+            refcounts[page] = 0;
         }
     }
-
-    /* Mark bitmap + refcounts region as used */
-    uint64_t metadata_start_page = ((uint64_t)bitmap - hhdm_offset) / PAGE_SIZE;
-    uint64_t metadata_bytes = bitmap_size + refcounts_size;
-    uint64_t metadata_pages = metadata_bytes / PAGE_SIZE + 1;
     for (uint64_t i = 0; i < metadata_pages; i++) {
-        bitmap_set(metadata_start_page + i);
-        refcounts[metadata_start_page + i] = 1;
+        uint64_t page = metadata_phys / PAGE_SIZE + i;
+        bitmap_set(page);
+        refcounts[page] = UINT32_MAX;
         free_pages--;
     }
 
@@ -126,21 +122,23 @@ void pmm_init(void) {
 static uint64_t last_alloc_index = 0;
 
 void* pmm_alloc_page(void) {
+    PREEMPT_GUARD;
     for (uint64_t i = 0; i < total_pages; i++) {
         uint64_t idx = (last_alloc_index + i) % total_pages;
         if (!bitmap_test(idx)) {
-            bitmap_set(idx); 
+            bitmap_set(idx);
             refcounts[idx] = 1; /* New page starts with refcount=1 */
             free_pages--;
             last_alloc_index = idx + 1;
-            return (void*)(idx * PAGE_SIZE); 
+            return (void*)(idx * PAGE_SIZE);
         }
     }
-    return NULL; 
+    return NULL;
 }
 
 void* pmm_alloc_contiguous_pages(uint64_t count) {
-    if (count == 0) return NULL;
+    PREEMPT_GUARD;
+    if (count == 0 || count > free_pages) return NULL;
     if (count == 1) return pmm_alloc_page();
 
     uint64_t run = 0;
@@ -162,49 +160,37 @@ void* pmm_alloc_contiguous_pages(uint64_t count) {
             run = 0;
         }
     }
-    return NULL; 
+    return NULL;
+}
+
+static int allocated_frame(void* ptr) {
+    uint64_t phys = (uint64_t)ptr;
+    uint64_t page = phys / PAGE_SIZE;
+    return phys && !(phys & (PAGE_SIZE - 1)) && page < total_pages &&
+           bitmap_test(page) && refcounts[page] && refcounts[page] != UINT32_MAX;
 }
 
 void pmm_free_page(void* ptr) {
+    PREEMPT_GUARD;
+    if (!allocated_frame(ptr)) return;
     uint64_t page = (uint64_t)ptr / PAGE_SIZE;
-    if (page >= total_pages) return;
-    if (!bitmap_test(page)) return; /* Already free */
-
-    /* Decrement refcount. Only actually free if refcount reaches 0 */
-    if (refcounts[page] > 1) {
-        refcounts[page]--;
-        return; /* Still shared by other processes */
-    }
-
-    /* Refcount is 0 or 1 — actually free the page */
-    refcounts[page] = 0;
-    bitmap_clear(page); 
+    if (--refcounts[page]) return;
+    bitmap_clear(page);
     free_pages++;
 }
 
-/*
- * pmm_ref_page: Increment reference count for a physical page.
- * Called by CoW fork to share a page between parent and child.
- */
-void pmm_ref_page(void* ptr) {
+int pmm_ref_page(void* ptr) {
+    PREEMPT_GUARD;
+    if (!allocated_frame(ptr)) return 0;
     uint64_t page = (uint64_t)ptr / PAGE_SIZE;
-    if (page < total_pages && bitmap_test(page)) {
-        if (refcounts[page] < 255) { /* Prevent overflow */
-            refcounts[page]++;
-        }
-    }
+    if (refcounts[page] == UINT32_MAX - 1) return 0;
+    refcounts[page]++;
+    return 1;
 }
 
-/*
- * pmm_get_refcount: Get reference count for a physical page.
- * Returns 0 if page is free or out of range.
- */
-uint8_t pmm_get_refcount(void* ptr) {
-    uint64_t page = (uint64_t)ptr / PAGE_SIZE;
-    if (page < total_pages) {
-        return refcounts[page];
-    }
-    return 0;
+uint32_t pmm_get_refcount(void* ptr) {
+    PREEMPT_GUARD;
+    return allocated_frame(ptr) ? refcounts[(uint64_t)ptr / PAGE_SIZE] : 0;
 }
 
 uint64_t pmm_get_free_ram(void) {
