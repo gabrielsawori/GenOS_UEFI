@@ -1,6 +1,13 @@
 #include "stdlib.h"
 #include "syscall.h"
-#include "string.h"    /* memcpy for realloc */
+
+int get_cpu_id(void) { return (int)syscall(50, 0, 0, 0); }
+int read_input_event(struct genos_input_event* event) {
+    return (int)syscall(51, (uint64_t)event, 0, 0);
+}
+int get_system_info(struct genos_system_info* info) {
+    return (int)syscall(52, (uint64_t)info, 0, 0);
+}
 
 void exit(int status) {
     syscall(2, (uint64_t)status, 0, 0);
@@ -34,14 +41,8 @@ int exec(const char* filename) {
     return (int)syscall(9, (uint64_t)filename, 0, 0);
 }
 
-/*
- * wait_pid() - Cek apakah task dengan PID tertentu sudah selesai.
- *
- * Non-blocking: hanya cek state lalu return. Pemanggil bertanggung jawab
- * memanggil user_sleep() di antara polling agar tidak menyita CPU.
- *
- * Return: 0 = masih hidup, 1 = TASK_DEAD / tidak ditemukan.
- */
+/* Wait until a PID exits. Kernel blocks this task and releases the mutation
+ * lock while waiting; returns 1 for a dead or unknown PID. */
 int wait_pid(int pid) {
     return (int)syscall(11, (uint64_t)pid, 0, 0);
 }
@@ -95,46 +96,17 @@ void power_restart(void) {
     while (1);
 }
 
-/* === Dynamic Memory (user-space static heap) === */
-
-/*
- * User-space bump allocator menggunakan static buffer.
- * Kernel heap (kmalloc) mengembalikan alamat kernel yang tidak
- * bisa diakses Ring 3, jadi kita pakai buffer di .bss user ELF.
- *
- * Setiap alokasi disimpan dengan header berisi ukuran,
- * sehingga realloc bisa meng-copy data dengan benar.
- */
-#define USER_HEAP_SIZE (64 * 1024)  /* 64KB user heap */
-static char user_heap[USER_HEAP_SIZE] __attribute__((aligned(16)));
-static size_t heap_used = 0;
-
+/* The kernel owns allocation metadata and serializes operations across threads.
+ * Returned pages belong to this address space; no kernel heap pointers cross
+ * the ABI. Allocation is page-granular and includes a trailing guard page. */
 void* malloc(size_t size) {
-    if (size == 0) return (void*)0;
-    size = (size + 15) & ~15;  /* 16-byte align */
-    size_t total = size + sizeof(size_t);  /* header + data */
-    if (heap_used + total > USER_HEAP_SIZE) return (void*)0;
-    size_t* header = (size_t*)&user_heap[heap_used];
-    *header = size;
-    heap_used += total;
-    return (void*)(header + 1);
+    return (void*)syscall(54, size, 0, 0);
 }
 
 void free(void* ptr) {
-    /* Bump allocator: individual free is a no-op.
-     * Memory is reclaimed when process exits. */
-    (void)ptr;
+    (void)syscall(55, (uint64_t)ptr, 0, 0);
 }
 
 void* realloc(void* ptr, size_t new_size) {
-    if (!ptr) return malloc(new_size);
-    if (new_size == 0) { free(ptr); return (void*)0; }
-    size_t* header = (size_t*)ptr - 1;
-    size_t old_size = *header;
-    void* new_ptr = malloc(new_size);
-    if (new_ptr) {
-        size_t copy_size = old_size < new_size ? old_size : new_size;
-        memcpy(new_ptr, ptr, copy_size);
-    }
-    return new_ptr;
+    return (void*)syscall(56, (uint64_t)ptr, new_size, 0);
 }

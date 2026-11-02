@@ -2,8 +2,10 @@
 #include <stdint.h>
 #include <stddef.h>     
 #include "../cpu/isr.h"
+#include "../cpu/fpu.h"
 #include "../fs/vfs.h"
 #include "../mm/shm.h" 
+#include "../mm/user_memory.h"
 
 typedef enum {
     TASK_RUNNING,
@@ -38,31 +40,24 @@ typedef enum {
 /* Starvation prevention: boost semua task setiap N ticks */
 #define STARVATION_BOOST_INTERVAL 500
 
-/*
- * User-space heap region (brk-style).
- * 0x60000000–0x67FFFFFF (128MB) — tidak konflik dengan app.elf (0x40000000),
- * shell.elf (0x50000000), maupun stack (0x80000000+).
- */
-#define HEAP_BASE       0x60000000ULL
-#define HEAP_SIZE_MAX   0x08000000ULL   /* 128MB */
-
 struct task {
     uint32_t pid;
+    uint32_t cpu_id;
+    uint64_t ready_since;
     uint32_t tgid;            // Thread Group ID (= PID of group leader)
     task_state_t state;
     struct registers regs;
+    struct fpu_state fpu;
     uint64_t stack_base;
     uint64_t sleep_until;     // Tick target untuk bangun dari TASK_SLEEPING
     uint32_t wait_target_pid; // PID yang ditunggu (untuk TASK_WAITING)
     uint64_t* pml4;           // Address space PML4 (NULL = kernel task)
     uint64_t kernel_stack;    // Per-task kernel stack top (for TSS.RSP0)
+    uint64_t kernel_stack_phys; /* Owned contiguous allocation; 0 = borrowed. */
+    uint32_t kernel_stack_pages;
+    void (*entry_point)(void); /* Kernel task body, called by the task trampoline. */
 
-    /* === User-Space Heap (brk-style, per-process) ===
-     * heap_brk:   break saat ini (tumbuh ke atas dari HEAP_BASE).
-     *             sbrk(incr) menambah break & memetakan page baru bila perlu.
-     * heap_limit: batas atas break (= HEAP_BASE + HEAP_SIZE_MAX). */
-    uint64_t heap_brk;
-    uint64_t heap_limit;
+    struct user_allocation* allocations; /* Owned by the thread-group leader. */
 
     /* === Thread Support === */
     uint8_t  is_thread;       // 1 = thread (shares parent's PML4), 0 = process
@@ -77,7 +72,11 @@ struct task {
     uint32_t cpu_ticks;       // Total CPU ticks consumed (for stats)
     uint32_t sleep_count;     // Jumlah kali task sleep (I/O indicator)
 
-    uint64_t user_pages[256]; // Daftar page fisik milik proses ini
+    uint64_t* user_pages;
+    uint64_t* user_vaddrs; /* Matching private VA; replace ownership on CoW. */
+    uint64_t inline_pages[USER_INLINE_PAGES];
+    uint64_t inline_vaddrs[USER_INLINE_PAGES];
+    uint32_t user_page_capacity;
     uint32_t user_page_count; // Jumlah page yang dilacak
     vfs_fd_t fds[VFS_MAX_FDS]; // Per-process file descriptor table
     shm_attach_record_t shm_attached[SHM_MAX_ATTACH]; // SHM attachments
@@ -90,18 +89,28 @@ struct task {
 };
 
 void task_init(void);
-void create_task(void (*entry_point)(void));
+struct task* create_task(void (*entry_point)(void));
 void schedule(struct registers* current_regs);
+
+struct task_resource_stats {
+    uint64_t kernel_stack_pages;
+    uint64_t stack_alloc_failures;
+    uint64_t tasks_reaped;
+};
+void task_get_resource_stats(struct task_resource_stats* out);
 /*
  * create_user_task() - Muat ELF & jadwalkan eksekusi di Ring 3.
- * Mengembalikan pointer ke struct task yang baru dibuat, atau NULL bila
- * gagal. Pointer ini dapat dipakai pemanggil (mis. syscall `exec`) untuk
- * menunggu child task selesai dengan memantau `task->state == TASK_DEAD`.
+ * Mengembalikan pointer ke struct task yang baru dibuat, atau NULL bila gagal.
+ * Caller must hold PREEMPT_GUARD through reading its PID; use task_is_dead(pid)
+ * for later polling because the reaper can free a completed task.
  */
-struct task* create_user_task(uint8_t* binary_data);
+/* binary_data is a stable kernel buffer, readable for binary_size bytes. */
+struct task* create_user_task(const uint8_t* binary_data, size_t binary_size);
 
 // Fungsi untuk membunuh program yang sedang berjalan
 void exit_current_task(void);
+/* Unrecoverable user exception: stop every task sharing its address space. */
+void task_abort_current_group(void) __attribute__((noreturn));
 
 // Fungsi untuk menidurkan task saat ini sampai tick tertentu
 void sleep_current_task(uint64_t wake_tick);
@@ -143,8 +152,12 @@ vfs_fd_t* task_get_current_fds(void);
 /*
  * task_find_by_pid() - Look up a task by PID in the linked list.
  * Return: pointer to task, or NULL if not found.
+ * Hold PREEMPT_GUARD while using another task's returned pointer.
  */
 struct task* task_find_by_pid(uint32_t pid);
+
+/* Shared memory metadata lives in the group leader. Caller holds guard. */
+struct task* task_memory_owner(struct task* t);
 
 /*
  * task_get_current_pml4() - Get the current task's PML4 pointer.
@@ -158,7 +171,7 @@ uint64_t* task_get_current_pml4(void);
  * Returns child PID (>0) to parent, 0 is set for child (via regs.rax),
  * or -1 on failure.
  */
-int32_t task_fork(void);
+int32_t task_fork(const struct registers* user_frame);
 
 /*
  * task_set_nice() - Set nice value for the current task.
@@ -182,7 +195,8 @@ int task_get_sched_info(uint32_t pid, char* out_buf);
  * @param entry: Thread entry point function address (user-space)
  * @param stack_top: Top of the thread's stack (user-allocated)
  *
- * The new thread shares the parent's address space (PML4), FDs, and SHM.
+ * The new thread shares the parent's address space (PML4), allocations, and SHM.
+ * FD entries are copied; descriptor offsets remain per-thread.
  * It gets its own: PID/TID, registers, kernel stack, scheduling state.
  *
  * Returns thread TID (>0) to parent, or -1 on failure.
@@ -206,3 +220,8 @@ void task_set_uid(uint32_t uid, uint32_t gid);
  * task_get_uid() - Get UID of the current task.
  */
 uint32_t task_get_uid(void);
+
+struct task* create_task_on_cpu(void (*entry)(void), uint32_t cpu);
+int task_set_cpu(uint32_t pid, uint32_t cpu);
+void task_wait_current(void);
+void task_context_enter(void);

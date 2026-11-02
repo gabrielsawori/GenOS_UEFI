@@ -1,5 +1,6 @@
 #include "stdio.h"
 #include "syscall.h"
+#include <limits.h>
 
 void print(const char* text, int y_pos) {
     syscall(1, (uint64_t)text, (uint64_t)y_pos, 0);
@@ -92,8 +93,15 @@ int seek(int fd, int offset, int whence) {
  * Return: 1 = entry ditemukan, 0 = tidak ada entry lagi.
  */
 int readdir(int fd, char* name_buf, int* size_buf) {
-    /* size_buf is int* but kernel expects size_t* — cast through uint64_t */
-    return (int)syscall(16, (uint64_t)(int64_t)fd, (uint64_t)name_buf, (uint64_t)size_buf);
+    if (!size_buf) return -1;
+    /* The syscall ABI writes 64 bits; the libc API promises only an int. */
+    uint64_t size = 0;
+    int result = (int)syscall(16, (uint64_t)(int64_t)fd, (uint64_t)name_buf, (uint64_t)&size);
+    if (result > 0) {
+        if (size > INT_MAX) return -1;
+        *size_buf = (int)size;
+    }
+    return result;
 }
 
 /* === Write Operations (syscalls 23-25) === */

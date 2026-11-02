@@ -2,8 +2,13 @@
 #define ELF_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define ELF_MAGIC 0x464C457F
+#define ELF_PT_LOAD 1
+#define ELF_PF_X 1
+#define ELF_PF_W 2
+#define ELF_PF_R 4
 
 typedef struct {
     uint32_t magic;
@@ -34,7 +39,12 @@ typedef struct {
     uint64_t align;
 } elf_phdr_t;
 
-uint64_t elf_load(uint8_t* binary_data, uint64_t* target_pml4,
-                  uint64_t* phys_pages, uint32_t* page_count);
+/* Kernel-owned binary must remain readable and unchanged for binary_size bytes.
+ * Returns entry or 0. Failed allocations/mappings leave ownership records for
+ * the caller to discard, along with its unpublished address space.
+ */
+uint64_t elf_load(const uint8_t* binary_data, size_t binary_size, uint64_t* target_pml4,
+                  uint64_t* phys_pages, uint64_t* virtual_pages,
+                  uint32_t* page_count, uint32_t page_capacity);
 
 #endif

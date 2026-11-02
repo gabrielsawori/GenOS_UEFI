@@ -4,6 +4,8 @@
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
 #include "../drivers/timer.h"
+#include "../drivers/pci.h"
+#include "../drivers/ps2.h"
 #include "../cpu/gdt.h"
 #include "../cpu/idt.h"
 #include "../cpu/pic.h"
@@ -272,6 +274,9 @@ void _start(void) {
     /* === FASE 6: Syscall Gateway === */
     syscall_init();
 
+    pci_init();
+    ps2_init();
+
     /* === FASE 6: Launch User-Space Shell ===
      *
      * Shell berjalan di Ring 3 (User Mode) sebagai ELF terpisah.
@@ -285,7 +290,10 @@ void _start(void) {
         size_t ukuran = 0;
         char* shell_data = tar_read_file("shell.elf", &ukuran);
         if (shell_data != NULL) {
-            create_user_task((uint8_t*)shell_data);
+            if (!create_user_task((const uint8_t*)shell_data, ukuran)) {
+                serial_write_string("[FATAL] Cannot allocate or load shell task!\n");
+                hcf();
+            }
             serial_write_string("[OK] Shell launched in Ring 3!\n");
         } else {
             serial_write_string("[FATAL] shell.elf not found in ramdisk!\n");

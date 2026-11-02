@@ -47,7 +47,7 @@ int close(int fd);
 /* Ubah posisi baca file; return posisi baru / -1 */
 int seek(int fd, int offset, int whence);
 
-/* Baca entry direktori berikutnya; return 1=found, 0=done */
+/* name_buf >= 100 bytes; return 1=found, 0=done, -1=error/size exceeds INT_MAX. */
 int readdir(int fd, char* name_buf, int* size_buf);
 
 /* === Write Operations (syscalls 23-25) === */

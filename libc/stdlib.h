@@ -1,4 +1,9 @@
 #pragma once
+#include "../include/genos/system.h"
+#include "../include/genos/input.h"
+int get_cpu_id(void);
+int get_system_info(struct genos_system_info* info);
+int read_input_event(struct genos_input_event* event);
 #include <stdint.h>
 #include <stddef.h>
 
@@ -21,14 +26,7 @@ int read_file(const char* filename, char* buffer, int max_size);
  */
 int exec(const char* filename);
 
-/*
- * Cek status task berdasarkan PID (syscall 11). Non-blocking.
- * Return: 0 = task masih hidup, 1 = task sudah selesai (DEAD) / tidak ditemukan.
- *
- * Polling pattern di Ring 3:
- *     int pid = exec("app.elf");
- *     while (pid > 0 && !wait_pid(pid)) user_sleep(50);
- */
+/* Wait until a PID exits; returns 1 for a dead or unknown PID (syscall 11). */
 int wait_pid(int pid);
 
 /* === Shared Memory IPC (syscalls 17-20) === */
@@ -76,7 +74,7 @@ void power_shutdown(void);
 /* Restart mesin (keyboard controller reset). Tidak pernah kembali. */
 void power_restart(void);
 
-/* === Dynamic Memory (syscalls 47-49) === */
+/* === Dynamic Memory (syscalls 54-56, private user pages) === */
 
 /* Alokasi memori dinamis. Return: pointer atau NULL */
 void* malloc(size_t size);
