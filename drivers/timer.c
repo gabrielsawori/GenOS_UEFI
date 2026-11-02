@@ -3,9 +3,13 @@
 #include "serial.h"
 
 // Variabel global untuk menghitung berapa kali jantung OS berdetak
-static volatile uint64_t ticks = 0;
+static uint64_t ticks = 0;
 
 void timer_init(uint32_t frequency) {
+    if (!frequency || frequency > 1193180 || 1193180 / frequency > 65536) {
+        serial_write_string("[ERROR] Invalid PIT frequency\n");
+        return;
+    }
     // Clock dasar dari chip PIT adalah 1193180 Hz
     uint32_t divisor = 1193180 / frequency; 
     
@@ -21,19 +25,19 @@ void timer_init(uint32_t frequency) {
 
 // Fungsi ini akan dipanggil oleh CPU setiap kali PIT berdetak
 void timer_tick(void) {
-    ticks++;
+    __atomic_add_fetch(&ticks, 1, __ATOMIC_RELAXED);
 }
 
 // Fungsi untuk melihat sudah berapa milidetik OS menyala
 uint64_t timer_get_ticks(void) {
-    return ticks;
+    return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
 }
 
 // Fungsi ajaib untuk menunda waktu (Delay/Sleep) dalam satuan milidetik
 void sleep(uint32_t ms) {
-    uint64_t start_time = ticks;
+    uint64_t start_time = timer_get_ticks();
     // Tahan CPU di sini sampai jumlah detak mencapai target
-    while (ticks < start_time + ms) {
+    while (timer_get_ticks() - start_time < ms) {
         __asm__ volatile ("hlt"); // Hlt agar CPU hemat daya saat menunggu
     }
 }

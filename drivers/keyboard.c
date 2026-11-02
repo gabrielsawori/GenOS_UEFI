@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "serial.h"
 #include <stdbool.h>
+#include "input.h"
 
 // --- SISTEM RING BUFFER (Ember Antrean 256 Huruf) ---
 #define BUFFER_SIZE 256
@@ -16,17 +17,17 @@ static volatile int buffer_tail = 0; // Penunjuk tempat huruf diambil
 // firing during keyboard processing), causing stack corruption on bare metal.
 static void buffer_push(char c) {
     int next_head = (buffer_head + 1) % BUFFER_SIZE;
-    if (next_head != buffer_tail) { // Jika ember tidak penuh
+    if (next_head != __atomic_load_n(&buffer_tail, __ATOMIC_ACQUIRE)) {
         key_buffer[buffer_head] = c;
-        buffer_head = next_head;
+        __atomic_store_n(&buffer_head, next_head, __ATOMIC_RELEASE);
     }
 }
 
 // Fungsi yang akan dipanggil oleh Terminal untuk mengambil huruf
 char keyboard_get_char(void) {
-    if (buffer_head == buffer_tail) return 0; // Jika ember kosong, kembalikan 0
+    if (__atomic_load_n(&buffer_head, __ATOMIC_ACQUIRE) == buffer_tail) return 0;
     char c = key_buffer[buffer_tail];
-    buffer_tail = (buffer_tail + 1) % BUFFER_SIZE;
+    __atomic_store_n(&buffer_tail, (buffer_tail + 1) % BUFFER_SIZE, __ATOMIC_RELEASE);
     return c;
 }
 
@@ -64,6 +65,9 @@ static bool extended_key = false;  /* PS/2 extended scancode (0xE0 prefix) */
 
 // Fungsi yang terpicu setiap jari menekan tuts keyboard
 void keyboard_handler(uint8_t scancode) {
+    static unsigned pause_bytes;
+    if (pause_bytes) { pause_bytes--; return; }
+    if (scancode == 0xe1) { pause_bytes = 5; extended_key = false; return; }
     /*
      * PS/2 Extended Scancodes: Arrow keys, Home, End, etc.
      * send a 0xE0 prefix byte FIRST, then the actual scancode.
@@ -74,6 +78,10 @@ void keyboard_handler(uint8_t scancode) {
         return;
     }
 
+    struct genos_input_event event = {.type = GENOS_INPUT_KEY,
+        .code = (scancode & 0x7f) | (extended_key ? 0x100 : 0),
+        .value = !(scancode & 0x80)};
+    input_push(&event);
     if (extended_key) {
         extended_key = false;
         /* Ignore key-up events for extended keys */

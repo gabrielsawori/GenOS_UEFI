@@ -1,6 +1,15 @@
 #pragma once
 #include <stdint.h>
 
+static inline uint32_t inl(uint16_t port) {
+    uint32_t value;
+    asm volatile("inl %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+static inline void outl(uint16_t port, uint32_t value) {
+    asm volatile("outl %0, %1" :: "a"(value), "Nd"(port));
+}
+
 // Fungsi untuk mengirim data 1 byte ke perangkat keras
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );

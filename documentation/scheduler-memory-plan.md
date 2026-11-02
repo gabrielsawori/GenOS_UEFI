@@ -1,9 +1,18 @@
 Rencana peningkatan scheduler dan memori GenOS — 17 Oktober 2026
 
-Status: rencana berdasarkan inspeksi kode lokal. Perbaikan boot SMP sebelumnya
-sudah tersedia; peningkatan scheduler dan memori di dokumen ini belum
-diimplementasikan. Temuan di bawah berasal dari jalur kode, belum seluruhnya
-direproduksi dengan workload. Belum ada angka peningkatan performa yang terukur.
+Pembaruan 23 Oktober: [paket core/SMP](core-readiness.md) menambahkan eksekusi
+task pada AP, state per-CPU, lock mutasi kernel, IPI/TLB shootdown, dan driver
+dasar. Tahapan optimasi di dokumen ini tetap backlog; status BSP-only berikut
+menggambarkan keadaan sebelum paket tersebut.
+
+Status per 22 Oktober 2026: paket timer/stack/reaper, koreksi PMM/VMM/CoW/SHM,
+recovery akses buffer user, dan validasi ukuran/format ELF sudah diimplementasikan. Rincian ada di
+[progres paket awal](scheduler-memory-progress.md),
+[koreksi memori](memory-correctness.md),
+[uaccess](uaccess-correctness.md), dan [loader ELF](elf-correctness.md).
+Tahap 0–2 masih parsial; seluruh roadmap belum selesai. Tabel temuan di bawah
+menyimpan hasil audit awal, termasuk masalah yang sudah ditangani paket ini.
+Belum ada angka peningkatan performa yang terukur.
 
 Target awal adalah kernel stabil saat task dibuat, melakukan fork/clone, memakai
 SHM, dan keluar; kemudian latensi penjadwalan yang terukur dan eksekusi task pada

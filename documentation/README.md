@@ -1,5 +1,10 @@
 # Dokumentasi GenOS v4
 
+**Prioritas 23 Oktober 2026:** core, multicore, dan driver pada QEMU x86-64
+sebelum DE. [Status core terbaru](core-readiness.md) menjelaskan eksekusi task
+pada AP, TLB shootdown, dan driver PCI/PS/2. Tabel migrasi di bawah adalah
+catatan historis v3 → v4; mouse kini tersedia lagi melalui API event baru.
+
 Folder ini berisi dokumentasi utama untuk **GenOS v4 Security Kernel**. GenOS telah berevolusi dari OS desktop menjadi kernel yang berfokus pada **cybersecurity** dan **backend development**.
 
 ## Perubahan dari v3 → v4
@@ -22,6 +27,12 @@ Folder ini berisi dokumentasi utama untuk **GenOS v4 Security Kernel**. GenOS te
 - `bugfix-guidelines.md` — Alur bugfix, debugging, dan validasi
 - `development-plan.md` — Rencana kerja dan prioritas
 - [scheduler-memory-plan.md](scheduler-memory-plan.md) — Audit, prioritas perbaikan, dan tahapan peningkatan scheduler/memori
+- [scheduler-memory-progress.md](scheduler-memory-progress.md) — Implementasi awal, tes regresi, dan batasan yang masih terbuka
+- [memory-correctness.md](memory-correctness.md) — Kontrak mapping, kepemilikan CoW/SHM, rollback, dan tes memori
+- [uaccess-correctness.md](uaccess-correctness.md) — Copy buffer user, recovery fault/OOM, adaptor syscall, dan tes Ring 3
+- [elf-correctness.md](elf-correctness.md) — Validasi ukuran/format ELF, batas segmen dan entry point, serta tes rollback loader
+- [user-memory.md](user-memory.md) — Heap user dinamis, free/realloc, tracking halaman, VA guard/reuse, dan SHM besar
+- [task-context.md](task-context.md) — Context x87/SSE per task, isolasi exception aplikasi, pengujian multicore dan batas QEMU TCG
 - `ai-training.md` — Panduan untuk pelatihan AI dengan kode GenOS
 
 ## Security Checklist (v4)
