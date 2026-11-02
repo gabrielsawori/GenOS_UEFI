@@ -57,7 +57,8 @@ void idt_init(void) {
         if (i == 8) {
             idt_set_descriptor_ist(i, (void*)isr_stub_table[i], 0x8E, 1);
         } else {
-            idt_set_descriptor(i, (void*)isr_stub_table[i], 0x8E);
+            /* INT3 is a userspace breakpoint, not a privileged IDT access. */
+            idt_set_descriptor(i, (void*)isr_stub_table[i], i == 3 ? 0xEE : 0x8E);
         }
     }
 
@@ -69,6 +70,10 @@ void idt_init(void) {
     // 3. LAPIC Timer (Vector 48) — for SMP per-CPU scheduling
     extern void lapic_timer_stub(void);
     idt_set_descriptor(48, (void*)lapic_timer_stub, 0x8E);
+    extern void irqtlb(void), irqreschedule(void), irqspurious(void);
+    idt_set_descriptor(49, (void*)irqtlb, 0x8E);
+    idt_set_descriptor(50, (void*)irqreschedule, 0x8E);
+    idt_set_descriptor(255, (void*)irqspurious, 0x8E);
 
     idt_load((uint64_t)&idtr);
     serial_write_string("[OK] IDT Berhasil Dimuat dan ISR/IRQ Didaftarkan!\n");

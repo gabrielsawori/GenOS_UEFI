@@ -7,6 +7,7 @@
 #include "../drivers/serial.h"
 #include "../kernel/utils.h"
 #include "../mm/pmm.h"
+#include "../mm/vmm.h"
 
 /*
  * SMP — Full Multi-Core Support via Limine goto_address
@@ -126,6 +127,9 @@ void __attribute__((noreturn)) smp_ap_main(struct ap_boot_info* boot) {
 
     /* 7. NOW safe: start LAPIC timer + enable interrupts */
     lapic_timer_init(1000);
+    if (!percpu_current()->idle_task) for (;;) asm volatile("cli; hlt");
+    vmm_switch_pml4(NULL);
+    __atomic_store_n(&percpu_current()->scheduler_online, 1, __ATOMIC_RELEASE);
     asm volatile("sti");
 
     while (1) {
@@ -466,6 +470,8 @@ void smp_start_timers(void) {
     lapic_timer_init(1000);
     serial_write_string("[OK] BSP LAPIC timer started (1000 Hz)\n");
 
+    vmm_switch_pml4(NULL);
+    __atomic_store_n(&percpu_get(0)->scheduler_online, 1, __ATOMIC_RELEASE);
     /* Release AP gate — APs will now start their LAPIC timers + sti */
     __atomic_store_n(&ap_go, 1, __ATOMIC_SEQ_CST);
 

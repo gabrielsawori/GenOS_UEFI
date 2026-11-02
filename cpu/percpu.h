@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "gdt.h"
 #include "smp.h"
+struct task;
 
 /*
  * Per-CPU Data — SMP support infrastructure.
@@ -28,6 +29,15 @@ struct percpu_data {
 
     /* Alignment padding to cache line boundary */
     uint8_t  _pad[12];
+    struct task* current;
+    struct task* retiring;
+    struct task* idle_task;
+    uint32_t preempt_count;
+    uint32_t scheduler_online;
+    uint64_t active_cr3;
+    uint64_t tlb_request;
+    uint64_t tlb_ack;
+    uint64_t switches;
 } __attribute__((aligned(64))); /* Cache-line aligned to prevent false sharing */
 
 /*
@@ -35,6 +45,7 @@ struct percpu_data {
  * Called once during boot after gdt_init().
  */
 void percpu_init_bsp(void);
+struct percpu_data* percpu_current(void);
 
 /*
  * percpu_init_ap() - Initialize per-CPU data for an Application Processor.

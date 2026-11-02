@@ -1,66 +1,71 @@
 .global syscall_entry
 .extern syscall_handler
-.extern kernel_stack_top
-
-.section .bss
-user_rsp_tmp: .quad 0
 
 .section .text
 syscall_entry:
-    /*
-     * SYSCALL ENTRY POINT (Ring 3 -> Ring 0)
-     *
-     * Saat instruksi 'syscall' dieksekusi oleh aplikasi:
-     *   - RCX  = RIP user (return address)
-     *   - R11  = RFLAGS user
-     *   - RAX  = nomor syscall
-     *   - RDI  = arg1, RSI = arg2, RDX = arg3
+    /* IF is masked by FMASK. Offsets asserted in percpu.c. */
+    swapgs
+    mov %rsp, %gs:8
+    mov %gs:16, %rsp
+
+    /* Build the same 176-byte struct registers as interrupt entry. This is
+     * also fork's user return frame; never borrow an old timer snapshot.
      */
-
-    /* 1. Simpan User RSP dan pindah ke Kernel Stack */
-    mov %rsp, user_rsp_tmp(%rip)
-    mov kernel_stack_top(%rip), %rsp
-
-    /* 2. Simpan register krusial */
-    push %rcx               /* RCX = RIP user */
-    push %r11               /* R11 = RFLAGS user */
-
-    mov user_rsp_tmp(%rip), %r10
-    push %r10               /* Simpan RSP user ke stack kernel */
-
-    /* Amankan register callee-saved */
+    push $0x1b
+    pushq %gs:8
+    push %r11
+    push $0x23
+    push %rcx
+    push $0
+    push $0
+    push %rax
+    push %rcx
+    push %rdx
     push %rbx
     push %rbp
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
     push %r12
     push %r13
     push %r14
     push %r15
 
-    /* 3. Terjemahkan argumen syscall -> konvensi C */
-    mov %rdx, %rcx          /* rcx = arg3 (C param ke-4) */
-    mov %rsi, %rdx          /* rdx = arg2 (C param ke-3) */
-    mov %rdi, %rsi          /* rsi = arg1 (C param ke-2) */
-    mov %rax, %rdi          /* rdi = syscall_num (C param ke-1) */
-
-    /* 4. Panggil handler */
+    /* C(num, arg1, arg2, arg3, frame). RSP is aligned before CALL. */
+    mov %rsp, %r8
+    mov %rdx, %rcx
+    mov %rsi, %rdx
+    mov %rdi, %rsi
+    mov %rax, %rdi
     cld
     call syscall_handler
-
-    /* 5. Kembalikan semuanya */
-    mov %rax, %rdi          /* Simpan return value */
+    cli
+    mov %rax, 112(%rsp)
 
     pop %r15
     pop %r14
     pop %r13
     pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
     pop %rbp
     pop %rbx
+    pop %rdx
+    pop %rcx
+    pop %rax
+    add $16, %rsp
 
-    pop %rax                /* RAX = user RSP */
-    pop %r11                /* RFLAGS user */
-    pop %rcx                /* RIP user */
-    mov %rax, %rsp          /* Kembali ke User Stack */
-
-    mov %rdi, %rax          /* Return value ke RAX */
-
+    mov 0(%rsp), %rcx
+    mov 16(%rsp), %r11
+    mov 24(%rsp), %rsp
+    swapgs
     sysretq
+
+.section .note.GNU-stack,"",@progbits

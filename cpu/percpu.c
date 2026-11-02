@@ -3,6 +3,15 @@
 #include "../drivers/serial.h"
 #include "../kernel/utils.h"
 #include <stddef.h>
+#include "msr.h"
+
+_Static_assert(offsetof(struct percpu_data, user_rsp_tmp) == 8, "syscall GS RSP");
+_Static_assert(offsetof(struct percpu_data, kernel_stack_top) == 16, "syscall GS stack");
+
+static void install_gs(struct percpu_data* p) {
+    wrmsr(0xc0000101, (uint64_t)p);
+    wrmsr(0xc0000102, 0);
+}
 
 /*
  * Per-CPU Data Management
@@ -58,6 +67,7 @@ void percpu_init_bsp(void) {
     percpu[0].cpu_id = 0;
     percpu[0].lapic_id = smp_get_bsp_lapic_id();
     percpu[0].kernel_stack_top = 0;
+    install_gs(&percpu[0]);
 
     serial_write_string("  [PERCPU] BSP (CPU #0) registered\n");
 }
@@ -108,11 +118,17 @@ void percpu_init_ap(uint32_t cpu_id, uint32_t lapic_id, uint64_t stack_top) {
 
     /* 5. Load TSS selector (offset 0x28 = GDT slot 5) */
     asm volatile("ltr %w0" : : "r" ((uint16_t)0x28));
+    install_gs(p);
 }
 
 struct percpu_data* percpu_get(uint32_t cpu_id) {
     if (cpu_id >= MAX_CPUS) return &percpu[0];
     return &percpu[cpu_id];
+}
+
+struct percpu_data* percpu_current(void) {
+    /* Safe during early boot and exception entry, including swapgs windows. */
+    return percpu_get(smp_get_current_cpu_id());
 }
 
 /*
@@ -123,6 +139,7 @@ void percpu_set_kernel_stack(uint32_t cpu_id, uint64_t stack_top) {
     if (cpu_id >= MAX_CPUS) return;
     percpu[cpu_id].tss.rsp0 = stack_top;
     percpu[cpu_id].kernel_stack_top = stack_top;
+    if (cpu_id == 0) set_kernel_stack(stack_top);
 }
 
 void percpu_set_ist1(uint32_t cpu_id, uint64_t ist_stack) {

@@ -87,7 +87,15 @@ lapic_timer_stub:
     jmp isr_common
 
 /* Menyimpan semua register */
+IRQ_STUB 49, tlb
+IRQ_STUB 50, reschedule
+IRQ_STUB 255, spurious
+
 isr_common:
+    testb $3, 24(%rsp)
+    jz 1f
+    swapgs
+1:
     push %rax
     push %rcx
     push %rdx
@@ -125,7 +133,10 @@ isr_common:
     mov %ax, %es
 
     mov %rsp, %rdi
+    mov %rsp, %r12
+    and $-16, %rsp
     call isr_handler
+    mov %r12, %rsp
 
     pop %r15
     pop %r14
@@ -221,6 +232,10 @@ isr_common:
 
 .Lcs_done:
     pop %rax
+    testb $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
     iretq
 
 /* Tabel Array Error CPU */

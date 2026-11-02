@@ -1,4 +1,7 @@
 #include "syscall.h"
+#include "fpu.h"
+#include "preempt.h"
+#include "percpu.h"
 #include "msr.h"
 #include "gdt.h"
 #include "../drivers/serial.h"
@@ -14,13 +17,13 @@
 #include "../fs/vfs.h"
 #include "../fs/cache.h"
 #include "../mm/shm.h"
-#include "../crypto/sha256.h"
-#include "../crypto/aes.h"
-#include "../crypto/hmac.h"
-#include "../crypto/random.h"
 #include "../security/cred.h"
-#include "../security/keystore.h"
 #include "uaccess.h"
+#include "syscall_user.h"
+#include "../drivers/input.h"
+#include "../drivers/ps2.h"
+#include "../drivers/pci.h"
+#include "../include/genos/system.h"
 
 #define MSR_EFER 0xC0000080
 #define MSR_STAR 0xC0000081
@@ -30,24 +33,6 @@
 extern void syscall_entry(void);
 extern struct limine_framebuffer *fb;
 extern volatile struct limine_hhdm_request hhdm_request;
-
-uint64_t kernel_stack_top = 0;
-
-/*
- * in_syscall flag: DEPRECATED for scheduling purposes.
- *
- * Previously this flag blocked ALL context switches during syscalls.
- * Now that each task has its own kernel stack (per-task stack scheme),
- * the scheduler can safely preempt during syscalls:
- *   - Timer interrupt pushes onto the same per-task kernel stack
- *   - Scheduler saves/restores the interrupt frame correctly
- *   - iretq returns to inside the syscall handler on the per-task stack
- *   - Syscall continues and sysretq returns to user mode
- *
- * This is exactly how Linux handles preemptible syscalls.
- * The flag is kept only for debugging/tracing purposes.
- */
-volatile int in_syscall = 0;
 
 /*
  * syscall_init_cpu() - Konfigurasi MSR syscall pada CPU *yang sedang berjalan*.
@@ -65,6 +50,7 @@ volatile int in_syscall = 0;
  * setiap AP di ap_entry()) sebelum interrupt/timer diaktifkan.
  */
 void syscall_init_cpu(void) {
+    fpu_init_cpu();
     /* EFER.SCE (bit 0) — enable SYSCALL/SYSRET instruction pair */
     uint64_t efer = rdmsr(MSR_EFER);
     wrmsr(MSR_EFER, efer | 1);
@@ -79,27 +65,25 @@ void syscall_init_cpu(void) {
     uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
     wrmsr(MSR_STAR, star);
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
-    wrmsr(MSR_FMASK, 0x200);
+    wrmsr(MSR_FMASK, 0x700); /* IF, DF, TF */
+    uint32_t a, b, c, d;
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                 : "a"(0x80000001), "c"(0));
+    if (d & (1U << 20)) wrmsr(MSR_EFER, rdmsr(MSR_EFER) | (1ULL << 11));
+    uint64_t cr0, cr4;
+    asm volatile("mov %%cr0, %0; mov %%cr4, %1" : "=r"(cr0), "=r"(cr4));
+    cr0 |= 1ULL << 16; /* Supervisor write protection on every CPU. */
+    cr4 &= ~(1ULL << 16); /* No user FSGSBASE until a TLS/GS ABI exists. */
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+    if (b & (1U << 7)) cr4 |= 1ULL << 20;
+    asm volatile("mov %0, %%cr0; mov %1, %%cr4" :: "r"(cr0), "r"(cr4) : "memory");
 }
 
 void syscall_init(void) {
     serial_write_string("[INFO] Membangun Pintu Gerbang System Call...\n");
 
-    /*
-     * BUG FIX: Allocate syscall kernel stack via PMM (4 pages = 16KB)
-     * instead of kmalloc(4096). This ensures:
-     *   1. Larger stack for complex syscalls (fork, exec, map_framebuffer)
-     *   2. Physical page alignment (no heap header misalignment)
-     *   3. Consistent with the 16 KB per-task kernel stack scheme
-     *
-     * Was 2 pages (8 KB) — too thin when a timer IRQ preempts a deep
-     * syscall call chain on bare metal (PIT @ 1000 Hz), causing RSP to
-     * overshoot the stack and corrupt the iretq frame.
-     *
-     * Note: This stack is used by syscall_entry (via kernel_stack_top)
-     * and also set as TSS.RSP0. Per-task kernel stacks in schedule()
-     * will override TSS.RSP0 during context switches.
-     */
+    /* Bootstrap stack; scheduling installs each task's stack in per-CPU
+     * GS state and TSS.RSP0 before entering Ring 3. */
     extern volatile struct limine_hhdm_request hhdm_request;
     uint64_t hhdm_off = hhdm_request.response->offset;
     uint64_t phys = (uint64_t)pmm_alloc_contiguous_pages(4);
@@ -109,8 +93,7 @@ void syscall_init(void) {
         for (;;) asm volatile ("hlt");
     }
     /* Stack grows down: top = base + 16KB */
-    kernel_stack_top = phys + hhdm_off + (4 * 4096);
-    set_kernel_stack(kernel_stack_top);
+    percpu_set_kernel_stack(0, phys + hhdm_off + (4 * 4096));
 
     /* Aktifkan syscall MSRs pada BSP. AP mengaktifkannya sendiri di ap_entry(). */
     syscall_init_cpu();
@@ -154,8 +137,14 @@ void syscall_init(void) {
  * │ 11 │ wait_pid    │ uint32 pid           │ -                │ -            │ 0=alive 1=dead│
  * └────┴─────────────┴──────────────────────┴──────────────────┴──────────────┴──────────────┘
  */
-uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
-    in_syscall = 1; /* Debug tracing only — no longer blocks scheduler */
+uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
+                         uint64_t arg3, const struct registers* user_frame) {
+    task_context_enter();
+    preempt_disable();
+    if (percpu_current()->current && percpu_current()->current->state == TASK_DEAD) {
+        preempt_enable();
+        exit_current_task();
+    }
     /*
      * Paksa task ke TASK_RUNNING sebelum memproses syscall.
      * Ini memastikan scheduler memperlakukan task sebagai aktif jika
@@ -167,25 +156,64 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
 
     uint64_t result = 0;
     switch (syscall_num) {
+    case 54:
+        result = user_alloc(percpu_current()->current, arg1);
+        break;
+    case 55:
+        result = user_free(percpu_current()->current, arg1);
+        break;
+    case 56:
+        result = user_realloc(percpu_current()->current, arg1, arg2);
+        break;
+    case 50:
+        result = smp_get_current_cpu_id();
+        break;
+    case 51: {
+        struct genos_input_event event;
+        if (user_write_prepare((void*)arg1, sizeof(event))) { result = -1; break; }
+        result = input_peek(&event);
+        if (result) {
+            if (copy_to_user((void*)arg1, &event, sizeof(event))) result = -1;
+            else input_consume();
+        }
+        break;
+    }
+    case 52: {
+        struct genos_system_info info = {.version = 1,
+            .detected_cpus = smp_get_cpu_count(), .current_cpu = smp_get_current_cpu_id(),
+            .pci_devices = pci_count(), .ps2_mouse = ps2_mouse_present(),
+            .ticks = timer_get_ticks(), .free_bytes = pmm_get_free_ram(),
+            .input_dropped = input_dropped()};
+        for (uint32_t i = 0; i < smp_get_cpu_count(); i++) {
+            info.online_cpus += !!__atomic_load_n(&percpu_get(i)->scheduler_online, __ATOMIC_ACQUIRE);
+            info.switches[i] = percpu_get(i)->switches;
+        }
+        result = copy_to_user((void*)arg1, &info, sizeof(info));
+        break;
+    }
+    case 53: {
+        struct pci_device device;
+        result = -1;
+        if (arg1 <= UINT32_MAX && !pci_get((uint32_t)arg1, &device))
+            result = copy_to_user((void*)arg2, &device, sizeof(device));
+        break;
+    }
 
     /* ================================================================
      * SYSCALL 1: print(char* text, uint64_t y_pos)
      * Cetak teks ke framebuffer + serial (kompatibilitas lama)
      * ================================================================ */
     case 1: {
-        char* pesan = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char pesan[USER_STRING_MAX];
+        if (copy_user_string(pesan, (const char*)arg1, sizeof(pesan)) < 0) {
             result = (uint64_t)-1; break;
         }
-        uint64_t y_pos = arg2;
-        if (y_pos == 0) y_pos = 100;
+        uint64_t y_pos = arg2 ? arg2 : 100;
         serial_write_string("[APP] ");
         serial_write_string(pesan);
         serial_write_string("\n");
         fb_print("[APP RING-3] -> ", 50, y_pos, 0xFFFF00, 0x002244, 2);
         fb_print(pesan, 250, y_pos, 0xFFFFFF, 0x002244, 2);
-        result = 0;
         break;
     }
 
@@ -195,7 +223,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * ================================================================ */
     case 2:
         serial_write_string("[EXIT] Task called exit()\n");
-        in_syscall = 0;
+        preempt_enable();
         exit_current_task();
         result = 0; break; /* tak pernah tercapai */
 
@@ -210,23 +238,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         break;
     }
 
-    /* ================================================================
-     * SYSCALL 4: sleep(uint32_t milliseconds)
-     *
-     * BUG FIX: Versi lama menggunakan busy-wait (pause loop) dengan
-     * in_syscall = 1 selama N milidetik. Ini MEMBLOKIR scheduler dari
-     * context-switch karena scheduler selalu skip saat in_syscall aktif.
-     *
-     * Akibatnya: saat shell memanggil user_sleep(50) dalam polling loop
-     * `while (!wait_pid(pid)) user_sleep(50)`, app task TIDAK PERNAH
-     * mendapat giliran CPU — shell memonopoli CPU selama 50ms per iterasi,
-     * lalu hanya memberi jendela ~50ns sebelum syscall berikutnya.
-     *
-     * PERBAIKAN: Gunakan sleep_current_task() untuk menandai task sebagai
-     * TASK_SLEEPING. Setelah sysretq, timer IRQ berikutnya akan memanggil
-     * schedule(), yang melihat task SLEEPING dan langsung switch ke task
-     * lain (mis. app). Task dibangunkan otomatis saat timer tick >= target.
-     * ================================================================ */
+    /* Blocking sleep: dispatcher waits after releasing the mutation lock. */
     case 4: {
         if (arg1 > 0) {
             sleep_current_task(timer_get_ticks() + arg1);
@@ -251,16 +263,12 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Koordinat di-pack: arg2 = (x << 32) | (y & 0xFFFFFFFF)
      * ================================================================ */
     case 6: {
-        char* text = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char text[USER_STRING_MAX];
+        if (copy_user_string(text, (const char*)arg1, sizeof(text)) < 0) {
             result = (uint64_t)-1; break;
         }
-        uint32_t x = (uint32_t)(arg2 >> 32);
-        uint32_t y = (uint32_t)(arg2 & 0xFFFFFFFF);
-        uint32_t color = (uint32_t)arg3;
-        fb_print(text, x, y, color, 0x002244, 2);
-        result = 0;
+        fb_print(text, (uint32_t)(arg2 >> 32), (uint32_t)arg2,
+                 (uint32_t)arg3, 0x002244, 2);
         break;
     }
 
@@ -284,45 +292,21 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: jumlah byte yang dibaca, atau 0 jika file tidak ditemukan.
      * ================================================================ */
     case 8: {
-        char* filename = (char*)arg1;
-        char* user_buf = (char*)arg2;
-        uint64_t max_size = arg3;
-        if (!verify_user_ptr((void*)arg1) || !is_user_range(arg2, arg3)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-
+        char filename[100];
+        if (copy_user_string(filename, (const char*)arg1, sizeof(filename)) < 0 ||
+            !is_user_range(arg2, arg3)) { result = (uint64_t)-1; break; }
         size_t file_size = 0;
         char* file_data = tar_read_file(filename, &file_size);
-        if (file_data == NULL) return 0;
-
-        /* Salin ke buffer user, batasi ukuran */
-        uint64_t copy_size = file_size < max_size ? file_size : max_size;
-        for (uint64_t i = 0; i < copy_size; i++) {
-            user_buf[i] = file_data[i];
-        }
-        result = copy_size;
+        if (!file_data) break;
+        size_t count = file_size < arg3 ? file_size : arg3;
+        result = copy_to_user((void*)arg2, file_data, count) ? (uint64_t)-1 : count;
         break;
     }
 
-    /* ================================================================
-     * SYSCALL 9: exec(char* filename)
-     * Muat dan jalankan file ELF dari ramdisk sebagai user task baru.
-     *
-     * BUG FIX #17: Mengembalikan PID child (>0) agar shell bisa menunggu
-     * child selesai dengan syscall `wait_pid` (#11). Versi blocking
-     * langsung di kernel TIDAK aman karena `kernel_stack_top` di-share
-     * antar syscall — child yang melakukan syscall akan menimpa frame
-     * kernel shell yang sedang block. Karena itu polling dilakukan di
-     * Ring 3 dengan user_sleep, sehingga kernel stack hanya terpakai
-     * sebentar saat tiap iterasi syscall.
-     *
-     * Return: PID child (>0) bila berhasil, atau (uint64_t)-1 bila gagal.
-     * ================================================================ */
+    /* Spawn an ELF process; constructor publishes only a complete task. */
     case 9: {
-        char* filename = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char filename[100];
+        if (copy_user_string(filename, (const char*)arg1, sizeof(filename)) < 0) {
             result = (uint64_t)-1; break;
         }
         size_t ukuran = 0;
@@ -335,7 +319,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             break;
         }
 
-        struct task* child = create_user_task((uint8_t*)elf_data);
+        PREEMPT_GUARD;
+        struct task* child = create_user_task((const uint8_t*)elf_data, ukuran);
         if (child == NULL) { result = (uint64_t)-1; break; }
 
         serial_write_string("[EXEC] Launched PID ");
@@ -399,9 +384,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: FD number (>=0) atau -1 bila gagal.
      * ================================================================ */
     case 12: {
-        char* filename = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char filename[100];
+        if (copy_user_string(filename, (const char*)arg1, sizeof(filename)) < 0) {
             result = (uint64_t)-1; break;
         }
         int flags = (int)(int64_t)arg2;
@@ -417,16 +401,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: jumlah byte yang dibaca, 0 = EOF, -1 = error.
      * ================================================================ */
     case 13: {
-        int fd = (int)(int64_t)arg1;
-        char* buf = (char*)arg2;
-        size_t count = (size_t)arg3;
-        if (!is_user_range(arg2, arg3)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        uint32_t pid = get_current_pid();
-        int bytes = vfs_read(pid, fd, buf, count);
-        result = (uint64_t)(int64_t)bytes;
+        result = (uint64_t)(int64_t)sys_user_read((int)arg1, (void*)arg2, arg3);
         break;
     }
 
@@ -465,16 +440,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 1 = entry ditemukan, 0 = selesai (tidak ada entry lagi).
      * ================================================================ */
     case 16: {
-        int fd = (int)(int64_t)arg1;
-        char* name_buf = (char*)arg2;
-        size_t* size_buf = (size_t*)arg3;
-        if (!verify_user_ptr((void*)arg2) || !verify_user_ptr((void*)arg3)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        uint32_t pid = get_current_pid();
-        int ret = vfs_readdir(pid, fd, name_buf, size_buf);
-        result = (uint64_t)ret;
+        result = (uint64_t)(int64_t)sys_user_readdir((int)arg1, (char*)arg2, (size_t*)arg3);
         break;
     }
 
@@ -484,6 +450,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: shmid (>=0) atau -1 bila gagal.
      * ================================================================ */
     case 17: {
+        if (arg1 > UINT32_MAX) { result = (uint64_t)-1; break; }
         uint32_t size = (uint32_t)arg1;
         uint32_t pid = get_current_pid();
         int shmid = shm_create(pid, size);
@@ -538,19 +505,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 = sukses, -1 = error.
      * ================================================================ */
     case 21: {
-        cache_stats_t* out = (cache_stats_t*)arg1;
-        if (!is_user_range(arg1, sizeof(cache_stats_t))) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!out) { result = (uint64_t)-1; break; }
-        cache_stats_t s = cache_get_stats();
-        out->hits        = s.hits;
-        out->misses      = s.misses;
-        out->evictions   = s.evictions;
-        out->used_blocks = s.used_blocks;
-        out->total_blocks = s.total_blocks;
-        result = 0;
+        cache_stats_t snapshot = cache_get_stats();
+        result = (uint64_t)(int64_t)copy_to_user((void*)arg1, &snapshot, sizeof(snapshot));
         break;
     }
 
@@ -561,7 +517,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: PID child (>0) ke parent, 0 ke child, -1 bila gagal.
      * ================================================================ */
     case 22: {
-        int32_t child_pid = task_fork();
+        int32_t child_pid = task_fork(user_frame);
         result = (uint64_t)(int64_t)child_pid;
         break;
     }
@@ -572,16 +528,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: bytes written or -1 on error.
      * ================================================================ */
     case 23: {
-        int fd = (int)(int64_t)arg1;
-        void* buf = (void*)arg2;
-        size_t count = (size_t)arg3;
-        if (!is_user_range(arg2, arg3)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        uint32_t pid = get_current_pid();
-        int bytes = vfs_write(pid, fd, buf, count);
-        result = (uint64_t)(int64_t)bytes;
+        result = (uint64_t)(int64_t)sys_user_write((int)arg1, (const void*)arg2, arg3);
         break;
     }
 
@@ -591,9 +538,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 on success, -1 on error.
      * ================================================================ */
     case 24: {
-        char* filename = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char filename[100];
+        if (copy_user_string(filename, (const char*)arg1, sizeof(filename)) < 0) {
             result = (uint64_t)-1; break;
         }
         uint32_t pid = get_current_pid();
@@ -608,9 +554,8 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 on success, -1 on error.
      * ================================================================ */
     case 25: {
-        char* filename = (char*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
+        char filename[100];
+        if (copy_user_string(filename, (const char*)arg1, sizeof(filename)) < 0) {
             result = (uint64_t)-1; break;
         }
         uint32_t pid = get_current_pid();
@@ -642,13 +587,10 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 on success, -1 if not found.
      * ================================================================ */
     case 27: {
-        uint32_t target_pid = (uint32_t)arg1;
-        char* buf = (char*)arg2;
-        if (!is_user_range(arg2, 128)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        result = (uint64_t)(int64_t)task_get_sched_info(target_pid, buf);
+        char info[128] = {0};
+        int status = task_get_sched_info((uint32_t)arg1, info);
+        if (!status) status = copy_to_user((void*)arg2, info, sizeof(info));
+        result = (uint64_t)(int64_t)status;
         break;
     }
 
@@ -691,15 +633,9 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 = success, -1 = error.
      * ================================================================ */
     case 31: {
-        uint32_t* out = (uint32_t*)arg1;
-        if (!is_user_range(arg1, sizeof(uint32_t)*2)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!out || !fb) { result = (uint64_t)-1; break; }
-        out[0] = (uint32_t)fb->width;
-        out[1] = (uint32_t)fb->height;
-        result = 0;
+        if (!fb) { result = (uint64_t)-1; break; }
+        uint32_t dimensions[2] = {(uint32_t)fb->width, (uint32_t)fb->height};
+        result = (uint64_t)(int64_t)copy_to_user((void*)arg1, dimensions, sizeof(dimensions));
         break;
     }
 
@@ -757,15 +693,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 = success, -1 = error.
      * ================================================================ */
     case 37: {
-        void* buf = (void*)arg1;
-        size_t len = (size_t)arg2;
-        if (!is_user_range(arg1, arg2)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!buf || len == 0 || len > 4096) { result = (uint64_t)-1; break; }
-        random_bytes(buf, len);
-        result = 0;
+        result = (uint64_t)(int64_t)sys_user_random((void*)arg1, arg2);
         break;
     }
 
@@ -775,16 +703,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 = success, -1 = error.
      * ================================================================ */
     case 38: {
-        const void* data = (const void*)arg1;
-        size_t len = (size_t)arg2;
-        uint8_t* digest = (uint8_t*)arg3;
-        if (!is_user_range(arg1, arg2) || !is_user_range(arg3, 32)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!data || !digest) { result = (uint64_t)-1; break; }
-        sha256_hash(data, len, digest);
-        result = 0;
+        result = (uint64_t)(int64_t)sys_user_sha256((const void*)arg1, arg2, (void*)arg3);
         break;
     }
 
@@ -794,24 +713,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: ciphertext length, or -1 on error.
      * ================================================================ */
     case 39: {
-        struct {
-            const uint8_t* key;
-            const uint8_t* iv;
-            const void*    input;
-            size_t         in_len;
-            void*          output;
-            size_t         out_max;
-        } *p = (void*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!p || !p->key || !p->iv || !p->input || !p->output) {
-            result = (uint64_t)-1; break;
-        }
-        int r = aes256_cbc_encrypt(p->key, p->iv, p->input, p->in_len,
-                                   p->output, p->out_max);
-        result = (uint64_t)(int64_t)r;
+        result = (uint64_t)(int64_t)sys_user_aes((const void*)arg1, 0);
         break;
     }
 
@@ -821,24 +723,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: plaintext length, or -1 on error.
      * ================================================================ */
     case 40: {
-        struct {
-            const uint8_t* key;
-            const uint8_t* iv;
-            const void*    input;
-            size_t         in_len;
-            void*          output;
-            size_t         out_max;
-        } *p = (void*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!p || !p->key || !p->iv || !p->input || !p->output) {
-            result = (uint64_t)-1; break;
-        }
-        int r = aes256_cbc_decrypt(p->key, p->iv, p->input, p->in_len,
-                                   p->output, p->out_max);
-        result = (uint64_t)(int64_t)r;
+        result = (uint64_t)(int64_t)sys_user_aes((const void*)arg1, 1);
         break;
     }
 
@@ -848,19 +733,16 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: UID >= 0 on success, -1 on failure.
      * ================================================================ */
     case 41: {
-        const char* username = (const char*)arg1;
-        const char* password = (const char*)arg2;
-        if (verify_user_string((char*)arg1, 4096) == -1 || verify_user_string((char*)arg2, 4096) == -1) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
+        char username[USERNAME_MAX], password[USER_STRING_MAX];
+        if (copy_user_string(username, (const char*)arg1, sizeof(username)) < 0 ||
+            copy_user_string(password, (const char*)arg2, sizeof(password)) < 0) {
+            result = (uint64_t)-1;
+        } else {
+            int uid = cred_authenticate(username, password);
+            if (uid >= 0) task_set_uid((uint32_t)uid, 0);
+            result = (uint64_t)(int64_t)uid;
         }
-        if (!username || !password) { result = (uint64_t)-1; break; }
-        int uid = cred_authenticate(username, password);
-        if (uid >= 0) {
-            /* Set UID on current task */
-            task_set_uid((uint32_t)uid, 0);
-        }
-        result = (uint64_t)(int64_t)uid;
+        for (size_t i = 0; i < sizeof(password); i++) ((volatile char*)password)[i] = 0;
         break;
     }
 
@@ -870,22 +752,17 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Writes username to buf, returns UID.
      * ================================================================ */
     case 42: {
-        char* buf = (char*)arg1;
-        size_t len = (size_t)arg2;
-        if (!is_user_range(arg1, arg2)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
         uint32_t uid = task_get_uid();
-        if (buf && len > 0) {
+        result = uid;
+        if (arg1 && arg2) {
             const char* name = cred_get_username(uid);
             if (!name) name = "unknown";
-            size_t i;
-            for (i = 0; name[i] && i < len - 1; i++)
-                buf[i] = name[i];
-            buf[i] = '\0';
+            char buffer[USERNAME_MAX] = {0};
+            size_t capacity = arg2 < sizeof(buffer) ? arg2 : sizeof(buffer);
+            size_t i = 0;
+            while (i + 1 < capacity && name[i]) { buffer[i] = name[i]; i++; }
+            if (copy_to_user((void*)arg1, buffer, i + 1)) result = (uint64_t)-1;
         }
-        result = (uint64_t)uid;
         break;
     }
 
@@ -904,43 +781,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * Return: 0 = success, -1 = error. For COUNT, returns count.
      * ================================================================ */
     case 44: {
-        struct {
-            int         op;
-            const char* name;
-            void*       value;
-            size_t      val_len;
-            int*        out_len;
-        } *p = (void*)arg1;
-        if (!verify_user_ptr((void*)arg1)) {
-            serial_write_string("[SEC] Blocked: invalid user pointer in syscall\n");
-            result = (uint64_t)-1; break;
-        }
-        if (!p) { result = (uint64_t)-1; break; }
-
-        switch (p->op) {
-        case 0: /* SET */
-            result = (uint64_t)(int64_t)keystore_set(p->name, p->value, p->val_len);
-            break;
-        case 1: /* GET */
-            result = (uint64_t)(int64_t)keystore_get(p->name, p->value, p->val_len, p->out_len);
-            break;
-        case 2: /* DELETE */
-            result = (uint64_t)(int64_t)keystore_delete(p->name);
-            break;
-        case 3: /* COUNT */
-            result = (uint64_t)keystore_count();
-            break;
-        case 4: /* INIT */
-            if (p->name) {
-                keystore_init(p->name);
-                result = 0;
-            } else {
-                result = (uint64_t)-1;
-            }
-            break;
-        default:
-            result = (uint64_t)-1;
-        }
+        result = (uint64_t)(int64_t)sys_user_keystore((const void*)arg1);
         break;
     }
 
@@ -1015,9 +856,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
     }
 
     /* ================================================================
-     * SYSCALL 47: malloc(size_t size)
-     * Allocate memory from kernel heap for userspace.
-     * Return: pointer to allocated memory, or 0 (NULL) on failure.
+     * SYSCALLS 47-49: removed kernel-heap ABI. Never expose kernel pointers.
      * ================================================================ */
     case 47:
     case 48:
@@ -1027,7 +866,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
          * Mengekspos kernel heap ke Ring 3 memungkinkan:
          *   - Arbitrary kernel heap corruption via kfree(kernel_ptr)
          *   - Kernel address leak via kmalloc() return value
-         * User-space sudah memiliki bump allocator internal di libc/stdlib.c.
+         * User allocations use the separate, validated ABI 54-56.
          */
         serial_write_string("[SEC] Blocked: kernel heap syscall from Ring 3\n");
         result = (uint64_t)-1;
@@ -1048,6 +887,7 @@ uint64_t syscall_handler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
      * sysretq secara atomik me-restore RFLAGS (termasuk IF=1) dari R11.
      */
     asm volatile ("cli");
-    in_syscall = 0;
+    preempt_enable();
+    task_wait_current();
     return result;
 }

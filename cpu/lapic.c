@@ -2,6 +2,7 @@
 #include "../limine.h"
 #include "../drivers/serial.h"
 #include "../kernel/utils.h"
+#include "../drivers/io.h"
 
 /*
  * Local APIC Driver
@@ -32,6 +33,7 @@
 #define TIMER_MASKED    (1 << 16)  /* Masked */
 
 static uint64_t lapic_base_virt = 0;
+static uint32_t timer_counts_per_second;
 
 extern volatile struct limine_hhdm_request hhdm_request;
 
@@ -62,9 +64,9 @@ void lapic_init(void) {
 
     /* Set task priority to 0 (accept all interrupts) */
     lapic_write(LAPIC_TPR, 0);
-    
+
     /* BUG FIX (Bare Metal): Route legacy 8259 PIC interrupts to the BSP.
-     * When LAPIC is enabled, it takes over interrupt routing. If LINT0 
+     * When LAPIC is enabled, it takes over interrupt routing. If LINT0
      * is not configured as ExtINT, PIC interrupts (like the mouse on IRQ12)
      * will be dropped. Keyboard (IRQ1) might sometimes work if BIOS left it
      * routed, but IRQ12 typically fails. */
@@ -77,39 +79,52 @@ void lapic_init(void) {
 /*
  * lapic_timer_init() — Start periodic LAPIC timer.
  *
- * Uses a rough calibration: on QEMU, bus freq ~1GHz, div 16 = ~62.5MHz.
- * Count = freq / hz. For 1000Hz: ~62500.
- * Real hardware would need PIT-based calibration.
+ * BSP calibrates with PIT channel 2 before releasing APs. All QEMU CPUs
+ * use that rate; PIT channel 0 remains the monotonic time source.
  */
 void lapic_timer_init(uint32_t hz) {
+    if (!hz || hz > 1000000) return;
     /* Divide by 16 */
     lapic_write(LAPIC_TIMER_DCR, 0x03);
 
-    /*
-     * Calibrate: measure LAPIC ticks per ~1ms using a busy-wait.
-     * Set a large initial count, wait ~1ms via port 0x80 delay, read remainder.
-     */
-    lapic_write(LAPIC_LVT_TIMER, TIMER_MASKED); /* Mask during calibration */
-    lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);    /* Max count */
-
-    /* Wait ~1ms using PIT channel 2 one-shot (1193 ticks = ~1ms) */
-    /* Simple busy-wait: ~1ms at typical CPU speeds */
-    for (volatile int i = 0; i < 100000; i++) {
-        asm volatile("pause");
+    /* BSP calibrates once against PIT channel 2 (~10 ms). AP gate publishes
+     * the result; APs never reprogram the shared PIT. QEMU xAPIC target. */
+    if (!timer_counts_per_second) {
+        uint8_t speaker = inb(0x61);
+        outb(0x61, speaker & ~3U);
+        outb(0x43, 0xb0); /* channel 2, low/high bytes, one-shot */
+        outb(0x42, 11932 & 255);
+        outb(0x42, 11932 >> 8);
+        lapic_write(LAPIC_LVT_TIMER, TIMER_MASKED);
+        lapic_write(LAPIC_TIMER_ICR, UINT32_MAX);
+        outb(0x61, (speaker & ~2U) | 1);
+        uint32_t limit = 100000000;
+        while (!(inb(0x61) & 0x20) && --limit) asm volatile("pause");
+        uint64_t elapsed = UINT32_MAX - lapic_read(LAPIC_TIMER_CCR);
+        outb(0x61, speaker);
+        uint64_t rate = elapsed * 1193182ULL / 11932;
+        if (!limit || !rate || rate > UINT32_MAX) {
+            serial_write_string("[FATAL] LAPIC timer calibration failed\n");
+            asm volatile("cli");
+            for (;;) asm volatile("hlt");
+        }
+        timer_counts_per_second = (uint32_t)rate;
     }
-
-    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
-    uint32_t ticks_per_ms = elapsed; /* Approximate ticks in ~1ms */
-    
-    /* Sanity: if calibration seems off, use default */
-    if (ticks_per_ms < 1000) ticks_per_ms = 62500;
-    
-    uint32_t count = (ticks_per_ms * 1000) / hz; /* Scale to desired Hz */
-    if (count < 100) count = 62500; /* Safety floor */
+    uint32_t count = timer_counts_per_second / hz;
+    if (!count) count = 1;
 
     /* Set periodic timer with our vector */
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | TIMER_PERIODIC);
     lapic_write(LAPIC_TIMER_ICR, count);
+}
+
+void lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
+    uint64_t flags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    while (lapic_read(LAPIC_ICR_LO) & (1U << 12)) asm volatile("pause");
+    lapic_write(LAPIC_ICR_HI, apic_id << 24);
+    lapic_write(LAPIC_ICR_LO, vector);
+    if (flags & 512) asm volatile("sti" ::: "memory");
 }
 
 void lapic_eoi(void) {

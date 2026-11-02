@@ -2,6 +2,9 @@
 #include <stdint.h>
 
 #define LAPIC_TIMER_VECTOR 48  /* Dedicated vector for LAPIC timer */
+#define LAPIC_TLB_VECTOR 49
+#define LAPIC_RESCHEDULE_VECTOR 50
+void lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 
 void lapic_init(void);              /* Init LAPIC on current CPU */
 void lapic_timer_init(uint32_t hz); /* Start periodic timer */
