@@ -99,3 +99,46 @@ uint32_t fb_read_pixel(size_t x, size_t y) {
 
 size_t fb_get_width(void)  { return fb ? fb->width  : 0; }
 size_t fb_get_height(void) { return fb ? fb->height : 0; }
+
+/* ══════════════════════════════════════════════════════════════════════
+ * TrueType Font Wrappers
+ *
+ * Jika font TrueType sudah diinisialisasi → gunakan anti-aliased
+ * rendering. Jika belum → fallback ke bitmap font 8x8.
+ * ══════════════════════════════════════════════════════════════════════ */
+#include "tirdlib/font_modern/LiberationSans-Regular/font_renderer.h"
+#include "../cpu/fpu.h"
+
+/* The optional renderer is not linked into the core target yet. Keep bitmap
+ * fallback usable while the font backend's build/initialization is pending. */
+#pragma weak ttf_is_initialized
+#pragma weak ttf_draw_char
+#pragma weak ttf_print
+
+void fb_draw_char_ttf(char c, size_t x, size_t y, uint32_t fg, uint32_t bg, int scale) {
+    if (ttf_is_initialized && ttf_draw_char) {
+        struct fpu_state saved;
+        fpu_kernel_begin(&saved);
+        /* Gunakan TTF: pixel_height ≈ 8 × scale (cocokkan ukuran bitmap) */
+        if (ttf_is_initialized()) ttf_draw_char(c, (int)x, (int)y, fg);
+        else fb_draw_char(c, x, y, fg, bg, scale);
+        fpu_kernel_end(&saved);
+    } else {
+        /* Fallback ke bitmap 8x8 */
+        fb_draw_char(c, x, y, fg, bg, scale);
+    }
+}
+
+void fb_print_ttf(const char *str, size_t x, size_t y, uint32_t fg, uint32_t bg, int scale) {
+    if (ttf_is_initialized && ttf_print) {
+        struct fpu_state saved;
+        fpu_kernel_begin(&saved);
+        /* Gunakan TTF renderer */
+        if (ttf_is_initialized()) ttf_print(str, (int)x, (int)y, fg);
+        else fb_print(str, x, y, fg, bg, scale);
+        fpu_kernel_end(&saved);
+    } else {
+        /* Fallback ke bitmap 8x8 */
+        fb_print(str, x, y, fg, bg, scale);
+    }
+}

@@ -58,7 +58,8 @@ masing-masing. ELF yang bertabrakan dengan stack atau guard ditolak. Stack
 thread tetap diberikan oleh pemanggil clone; memakai malloc memberi guard di
 ujung alokasi, tetapi kernel belum menyediakan API stack thread khusus.
 
-Thread memakai metadata alokasi dan SHM milik leader. Operasi allocator antar
+Thread memakai metadata alokasi dan SHM dalam objek address space bersama,
+terpisah dari lifetime task leader. Operasi allocator antar
 thread diserialisasi oleh kernel, tanpa lock userspace yang dapat tertinggal
 terkunci setelah fork. Sinkronisasi akses data aplikasi tetap tanggung jawab
 aplikasi; membebaskan buffer yang masih dipakai thread lain tetap tidak valid.
@@ -66,9 +67,10 @@ aplikasi; membebaskan buffer yang masih dipakai thread lain tetap tidak valid.
 Fork menyalin metadata alokasi, mempertahankan referensi halaman private dengan
 CoW, dan mempertahankan attachment SHM sebagai mapping shared. Free/resize pada
 child tidak melepas halaman milik parent. Semua pekerjaan yang dapat gagal
-selesai sebelum proteksi CoW parent diubah. Reaper melepas backing page, array
-tracking, serta metadata alokasi setelah semua thread berhenti memakai address
-space tersebut. Pencarian ownership masih linear; belum ada indeks VA untuk
+selesai sebelum proteksi CoW parent diubah. Backing page, array tracking dan
+metadata alokasi dilepas pada reference address space terakhir, setelah seluruh
+task dan pin eksternal dilepas. Lihat [kontrak lifetime](address-space-lifetime.md).
+Pencarian ownership masih linear; belum ada indeks VA untuk
 mengoptimalkan fork/CoW berukuran sangat besar.
 
 Array tracking dan heap kernel mempertahankan kapasitas yang sudah diperoleh

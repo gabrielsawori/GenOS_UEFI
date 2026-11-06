@@ -1,4 +1,4 @@
-# Context FP dan exception aplikasi — 2 November 2026
+# Context FP dan exception aplikasi — 4 November 2026
 
 Tahap ini melanjutkan fondasi SMP dan memori user pada QEMU x86-64. Task
 sekarang membawa context x87/MMX/SSE sendiri. Exception aplikasi yang tidak
@@ -18,6 +18,9 @@ memulihkan context baru setiap kali memilih task berbeda. Ini juga berlaku
 saat task tidur di dalam syscall. Tidak ada lazy ownership atau handler #NM
 untuk menunda restore. Kernel harus tetap dibangun tanpa floating point/SIMD;
 penggunaan register FP di kernel hanya boleh melalui helper context eksplisit.
+`fpu_kernel_begin/end` menahan guard preemption/mutasi, menyimpan state task,
+memasang environment FP bersih, lalu memulihkan state semula. Scope ini boleh
+bersarang, tetapi tidak boleh sleep atau menunggu task lain.
 
 ELF baru mendapat x87 control word `0x037f`, MXCSR `0x1f80`, stack x87 kosong,
 dan payload register nol. Mengandalkan FNINIT saja tidak cukup untuk
@@ -30,6 +33,18 @@ memulai environment baru.
 Makefile memisahkan `USER_CFLAGS` dari flag kernel. Aplikasi dan libc kini
 dapat menggunakan SSE2 dan ABI floating point x86-64; kernel C tetap integer.
 Target ISA tetap x86-64 dasar, bukan `-march=native`.
+`libc/start.S` menerima entry ELF dengan RSP kelipatan 16, kemudian melakukan
+CALL ke `main()` sehingga alignment stack sesuai ABI C. Shell/aplikasi tidak
+lagi mendefinisikan entry ELF sebagai fungsi C langsung; SSE sebelumnya
+menyingkap #GP pada MOVAPS akibat selisih alignment delapan byte tersebut.
+Entry clone masih berupa entry assembly dengan RSP kelipatan 16; pemanggilan
+fungsi C di dalamnya memerlukan CALL seperti fixture thread.
+
+Wrapper font yang baru ada di workspace memakai scope FP ini ketika backend
+tersedia. Build core belum menautkan atau menginisialisasi rasterizer TrueType;
+wrapper memakai fallback bitmap. Path header disesuaikan dengan direktori font
+yang ada. File renderer/font dan rancangan desktop tetap disimpan untuk tahap
+integrasi tersendiri; perubahan ini tidak menyatakan renderer tersebut lulus tes.
 
 Referensi format dan konfigurasi CPU:
 [Intel SDM volume 2A](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf)
@@ -65,6 +80,7 @@ tersendiri, run queue per CPU, dan lock per subsistem masih pekerjaan berikutnya
 
 ```sh
 make test-context
+make test-boot
 python3 tests/run_scheduler_boot_tests.py --suite context --log-dir .test-results/serial --timeout 45
 python3 tests/run_scheduler_boot_tests.py --suite context --fatal-probe kernel-ud --case quad --timeout 8
 python3 tests/run_scheduler_boot_tests.py --suite context --fatal-probe user-nmi --case quad --timeout 8
@@ -78,6 +94,9 @@ XMM0–15, control word, dan MXCSR. Worker kernel ikut menukar pola pada semua
 CPU. Tes lain memeriksa aritmetika `double` yang dikompilasi memakai flag user,
 snapshot fork/clone, ELF baru dengan register bersih, dan proses induk yang
 terus berjalan ketika anak-anaknya fault.
+Backend font pengganti khusus fixture mengubah register FP melalui wrapper
+framebuffer asli, termasuk scope FP bersarang; user harus tetap melihat pola
+register miliknya dan guard tidak boleh tertinggal.
 
 Probe native meliputi divide error integer, UD2, CLI terlarang, alamat unmapped,
 INT3, single-step, divide error x87, stack noncanonical, INT IRQ terlarang, dan
@@ -103,3 +122,33 @@ Runner tidak lagi memakai `-no-shutdown` bersama `isa-debug-exit`: QEMU harus
 keluar sendiri dengan status debug-exit sukses. Timeout selalu menggagalkan
 suite normal. Negative control justru harus bertahan di handler fatal hingga
 batas observasi, tanpa kembali ke fixture atau mematikan grup user.
+Setiap suite scheduler/memori/core/context mengompilasi object produksi ke
+direktori temporernya sendiri, agar build paralel tidak menimpa object yang
+sedang dibaca linker suite lain. Log serial lama dibersihkan sebelum boot.
+
+`test-boot` memakai ISO produksi dan ELF shell C yang sebenarnya selama 15 detik
+pada 4 vCPU/512 MiB. Pemeriksaan menolak exit dini, panic, maupun `[USER TRAP]`;
+marker "shell diluncurkan" saja tidak cukup bila shell langsung fault sesudahnya.
+Ini smoke test, bukan soak test atau pengujian seluruh interaksi shell.
+
+## Hasil validasi 4 November 2026
+
+| Suite | Hasil |
+|---|---|
+| Context FP, exception user, kernel FP bersarang | 6/6 konfigurasi |
+| Scheduler, memory, uaccess, user memory | Masing-masing 6/6 konfigurasi |
+| Core, TLB, allocator, input keyboard/mouse melalui QMP | 6/6 konfigurasi |
+| Boot SMP, termasuk 17 vCPU/batas 16, fallback dan kegagalan stack | 6/6 kasus |
+| Negative control kernel UD, CPL3 NMI/MCE dan reserved-bit PF | 4/4 kasus |
+
+Total **46 kasus boot QEMU lulus**. Seluruh suite normal dengan debug-exit
+berakhir sendiri; empat negative control bertahan di jalur fatal seperti
+diharapkan. Suite boot SMP mengamati boot/timer/scheduler selama 15 detik per
+kasus. Build penuh `make -B -j4 all` berhasil tanpa warning/error compiler.
+Validator ELF dengan UBSan menerima shell/aplikasi produksi dan lulus guard
+page, 44 kasus penolakan serta 20.000 mutasi. Smoke test ISO produksi 4 vCPU /
+512 MiB selama 15 detik lulus setelah entry assembly diperbaiki.
+
+Ringkasan tersimpan di `.test-results/*-matrix-final.log`, `core-matrix.log`,
+`context-smp-matrix.log`, `context-fatal-*.log`, dan
+`context-production-smoke.log`; serial suite utama ada di `.test-results/serial/`.

@@ -2,15 +2,20 @@
 #include "io.h"
 #include "serial.h"
 #include "../cpu/preempt.h"
+#include "../cpu/irq_lock.h"
 #include "../kernel/utils.h"
 
 static struct pci_device devices[PCI_MAX_DEVICES];
 static uint32_t count;
+static spinlock_t config_lock = SPINLOCK_INIT;
 /* PCI configuration mechanism #1 on the QEMU PC. Serialize address/data pair. */
-static uint32_t config(uint32_t bus, uint32_t slot, uint32_t fn, uint32_t reg) {
-    PREEMPT_GUARD;
+static uint32_t config_unlocked(uint32_t bus, uint32_t slot, uint32_t fn, uint32_t reg) {
     outl(0xcf8, 0x80000000U | (bus << 16) | (slot << 11) | (fn << 8) | (reg & 252));
     return inl(0xcfc);
+}
+static uint32_t config(uint32_t bus, uint32_t slot, uint32_t fn, uint32_t reg) {
+    IRQ_LOCK_GUARD(&config_lock);
+    return config_unlocked(bus, slot, fn, reg);
 }
 
 void pci_init(void) {
@@ -50,4 +55,10 @@ int pci_get(uint32_t index, struct pci_device* out) {
     if (!out || index >= count) return -1;
     *out = devices[index];
     return 0;
+}
+
+void pci_update_command(const struct pci_device* d, uint16_t set, uint16_t clear) {
+    IRQ_LOCK_GUARD(&config_lock);
+    uint16_t command = config_unlocked(d->bus, d->slot, d->function, 4);
+    outw(0xcfc, (command | set) & ~clear);
 }

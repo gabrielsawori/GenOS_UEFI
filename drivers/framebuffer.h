@@ -25,3 +25,21 @@ uint32_t fb_read_pixel(size_t x, size_t y);
 /* Get framebuffer dimensions */
 size_t fb_get_width(void);
 size_t fb_get_height(void);
+
+/* ── TrueType Font API ────────────────────────────────────────────────
+ * Wrapper untuk font renderer TrueType (stb_truetype).
+ * Fungsi-fungsi ini menggunakan anti-aliased rendering.
+ * Jika TTF belum diinisialisasi, otomatis fallback ke bitmap 8x8.
+ * ──────────────────────────────────────────────────────────────────── */
+
+/*
+ * fb_draw_char_ttf — Render 1 karakter TrueType ke layar.
+ * Jika TTF tidak aktif, gunakan bitmap 8x8 sebagai fallback.
+ */
+void fb_draw_char_ttf(char c, size_t x, size_t y, uint32_t fg, uint32_t bg, int scale);
+
+/*
+ * fb_print_ttf — Render string dengan TrueType font.
+ * Jika TTF tidak aktif, gunakan fb_print() bitmap sebagai fallback.
+ */
+void fb_print_ttf(const char *str, size_t x, size_t y, uint32_t fg, uint32_t bg, int scale);

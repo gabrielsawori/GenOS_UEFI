@@ -33,6 +33,14 @@ Folder ini berisi dokumentasi utama untuk **GenOS v4 Security Kernel**. GenOS te
 - [elf-correctness.md](elf-correctness.md) — Validasi ukuran/format ELF, batas segmen dan entry point, serta tes rollback loader
 - [user-memory.md](user-memory.md) — Heap user dinamis, free/realloc, tracking halaman, VA guard/reuse, dan SHM besar
 - [task-context.md](task-context.md) — Context x87/SSE per task, isolasi exception aplikasi, pengujian multicore dan batas QEMU TCG
+- [address-space-lifetime.md](address-space-lifetime.md) — Reference address space, retirement leader, pin dan urutan lock PMM
+- [virtio-drivers.md](virtio-drivers.md) — API disk/Ethernet kernel, lifetime DMA, timeout dan tes QEMU
+- [wait-and-async-io.md](wait-and-async-io.md) — Event, deadline, token request, pembatalan dan cleanup pemilik mati
+- [interrupt-completion.md](interrupt-completion.md) — Shared INTx, lock IRQ/PIC, watchdog dan perubahan konfigurasi disk/NIC
+- [device-locking.md](device-locking.md) — Lock disk/NIC per perangkat, preemption lokal, urutan lock dan reset serentak
+- [heap-locking.md](heap-locking.md) — Lock metadata heap, fast-path antar-CPU, pertumbuhan transaksional dan tes OOM
+- [vmm-locking.md](vmm-locking.md) — Lock page table, snapshot PTE, conditional replacement dan shootdown tanpa guard mutasi
+- [Kebutuhan API desktop](../GenOS_Desktop/Concept/kernel-api-status.md) — Penghubung compositor, font dan decoder Ring 3
 - `ai-training.md` — Panduan untuk pelatihan AI dengan kode GenOS
 
 ## Security Checklist (v4)

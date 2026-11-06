@@ -29,7 +29,9 @@ yang ada. Logika CoW yang baru memiliki API tersendiri di `mm/cow.c`.
 VA/PA harus selaras 4 KiB, VA harus canonical, flags harus valid, dan mapping
 user tidak boleh berada di upper half. Mapping yang sudah ada tidak ditimpa.
 Huge leaf ditolak pada operasi 4 KiB, bukan dibaca sebagai pointer page table.
-Caller yang memerlukan penggantian PTE CoW memakai lookup dengan guard aktif.
+Caller CoW memakai snapshot `vmm_read_pte_in()` dan conditional replacement
+`vmm_replace_page_in()` di bawah guard ownership user. Pointer PTE tidak keluar
+dari [lock VMM](vmm-locking.md); snapshot sendiri tidak memin backing frame.
 
 Alamat PTE dipisahkan memakai `PTE_ADDR_MASK`; NX tidak ikut menjadi alamat
 fisik. Query mengembalikan base fisik halaman dan flags, termasuk NX. Operasi
@@ -54,9 +56,10 @@ tidak sepenuhnya berada dalam memmap usable tidak menjadi hasil alokasi.
 Metadata/refcount disejajarkan dan dibulatkan tepat; refcount kini 32 bit,
 memakai empat byte per frame dibanding satu byte sebelumnya.
 
-Setiap entri `task.user_pages[]` dipasangkan dengan `user_vaddrs[]`. Metadata
-proses yang dibagi thread berada di leader yang lifetime-nya dipertahankan
-oleh reaper. Pada CoW write, entri untuk VA itu diganti dengan PA baru dan
+Setiap entri `address_space.user_pages[]` dipasangkan dengan `user_vaddrs[]`.
+Metadata proses yang dibagi thread berada dalam [objek address space dengan
+reference](address-space-lifetime.md), terpisah dari struktur task leader.
+Pada CoW write, entri untuk VA itu diganti dengan PA baru dan
 referensi lama dilepas sekali. Jumlah record tidak bertambah. Last owner cukup
 mengembalikan WRITE tanpa copy. NX dan izin read-only tetap dipertahankan.
 
@@ -65,13 +68,14 @@ baru diproteksi setelah seluruh operasi yang dapat gagal selesai. Fork gagal
 tidak meninggalkan parent setengah berubah. Hanya halaman private writable
 atau yang sudah CoW diberi CoW; kode/data read-only tetap read-only. Mapping
 yang tidak tercatat sebagai private atau SHM ditolak sampai kebijakan
-pewarisannya tersedia. Batas tracking masih 256 halaman private.
+pewarisannya tersedia. Tracking kini dinamis hingga 65.536 halaman private;
+lihat [memori user](user-memory.md).
 
 SHM memakai satu referensi PMM per backing page, dimiliki segmen. Jumlah
 attachment dihitung terpisah. Fork menyalin mapping shared tanpa CoW dan
-mempertahankan metadata attachment anak. Thread memakai attachment leader;
+mempertahankan metadata attachment anak. Thread memakai attachment address space bersama;
 keluar satu thread tidak melepas mapping address space bersama. Segmen yang
-dibuat tanpa pernah attached ikut dibersihkan ketika owner keluar.
+dibuat tanpa pernah attached ikut dibersihkan pada reference address space terakhir.
 
 VMM memastikan CR0.WP aktif agar kernel tidak melewati proteksi read-only saat
 menulis buffer user. Resolver menerima write fault CoW dari user atau kernel,
