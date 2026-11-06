@@ -1,4 +1,5 @@
 #include "fpu.h"
+#include "preempt.h"
 #include "../drivers/serial.h"
 #include <stddef.h>
 
@@ -17,6 +18,17 @@ void fpu_save(struct fpu_state* state) {
 
 void fpu_restore(const struct fpu_state* state) {
     asm volatile("fxrstor64 %0" :: "m"(*state) : "memory");
+}
+
+void fpu_kernel_begin(struct fpu_state* saved) {
+    preempt_disable();
+    fpu_save(saved);
+    fpu_restore(&initial);
+}
+
+void fpu_kernel_end(const struct fpu_state* saved) {
+    fpu_restore(saved);
+    preempt_enable();
 }
 
 void fpu_init_cpu(void) {

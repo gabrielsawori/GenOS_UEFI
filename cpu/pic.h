@@ -13,3 +13,10 @@ void pic_remap(void);
  * Dipakai untuk mengaktifkan IRQ12 (mouse) dan IRQ2 (cascade master→slave).
  */
 void pic_unmask_irq(uint8_t irq);
+/* QEMU PC ELCR: PCI INTx is level-triggered. Reserved ISA/PS2 lines rejected. */
+int pic_enable_pci_irq(uint8_t irq);
+/* Begin rejects spurious IRQ7/15. End acknowledges a real IRQ after devices. */
+int pic_begin_irq(uint8_t irq);
+void pic_end_irq(uint8_t irq);
+struct pic_irq_stats { uint64_t spurious7, spurious15; };
+void pic_get_irq_stats(struct pic_irq_stats* out);

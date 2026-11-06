@@ -19,6 +19,7 @@ static void irq_restore(uint64_t flags) {
 void preempt_disable(void) {
     uint64_t flags = irq_save();
     struct percpu_data* p = percpu_current();
+    if (p->local_preempt_count) __builtin_trap();
     uint32_t previous = p->preempt_count++;
     irq_restore(flags);
     if (!previous) {
@@ -32,7 +33,7 @@ void preempt_disable(void) {
 int preempt_try_disable(void) {
     uint64_t flags = irq_save();
     struct percpu_data* p = percpu_current();
-    int ok = !p->preempt_count && spin_trylock(&mutation_lock);
+    int ok = !p->preempt_count && !p->local_preempt_count && spin_trylock(&mutation_lock);
     if (ok) p->preempt_count = 1;
     irq_restore(flags);
     return ok;
@@ -47,11 +48,29 @@ void preempt_enable(void) {
 }
 
 uint32_t preempt_depth(void) { return percpu_current()->preempt_count; }
+void preempt_local_disable(void) {
+    uint64_t flags = irq_save();
+    struct percpu_data* p = percpu_current();
+    if (p->local_preempt_count == UINT32_MAX) __builtin_trap();
+    p->local_preempt_count++;
+    irq_restore(flags);
+}
+void preempt_local_enable(void) {
+    uint64_t flags = irq_save();
+    struct percpu_data* p = percpu_current();
+    if (!p->local_preempt_count) __builtin_trap();
+    p->local_preempt_count--;
+    irq_restore(flags);
+}
+uint32_t preempt_local_depth(void) { return percpu_current()->local_preempt_count; }
 #else
 /* Host allocator fixtures do not execute privileged instructions. */
-static uint32_t depth;
-void preempt_disable(void) { depth++; }
+static _Thread_local uint32_t depth, local_depth;
+void preempt_disable(void) { if (local_depth) __builtin_trap(); depth++; }
 void preempt_enable(void) { if (!depth) __builtin_trap(); depth--; }
 uint32_t preempt_depth(void) { return depth; }
-int preempt_try_disable(void) { if (depth) return 0; depth = 1; return 1; }
+int preempt_try_disable(void) { if (depth || local_depth) return 0; depth = 1; return 1; }
+void preempt_local_disable(void) { if (local_depth == UINT32_MAX) __builtin_trap(); local_depth++; }
+void preempt_local_enable(void) { if (!local_depth) __builtin_trap(); local_depth--; }
+uint32_t preempt_local_depth(void) { return local_depth; }
 #endif

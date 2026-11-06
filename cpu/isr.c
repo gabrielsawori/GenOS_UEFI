@@ -1,5 +1,7 @@
 #include "isr.h"
 #include "tlb.h"
+#include "pic.h"
+#include "../drivers/virtio_irq.h"
 #include "../drivers/ps2.h"
 #include "lapic.h"
 #include "smp.h"
@@ -344,6 +346,8 @@ void isr_handler(struct registers *regs) {
     }
     else if (regs->vector >= 32 && regs->vector <= 47) {
         /* ===== HARDWARE IRQ ===== */
+        uint8_t irq = regs->vector - 32;
+        if (!pic_begin_irq(irq)) return;
 
         /* PIT on BSP is the sole wall-clock and scheduler tick source. */
         if (regs->vector == 32) {
@@ -354,11 +358,10 @@ void isr_handler(struct registers *regs) {
         else if (regs->vector == 33 || regs->vector == 44) {
             ps2_irq();
         }
-        /* IRQ 12 (INT 44): Reserved (mouse driver removed) */
+        else virtio_irq_dispatch(irq);
 
         /* Kirim EOI (End of Interrupt) ke PIC */
-        if (regs->vector >= 40) { outb(0xA0, 0x20); } /* Slave PIC */
-        outb(0x20, 0x20); /* Master PIC */
+        pic_end_irq(irq);
     }
     /* AP scheduler ticks are local; only BSP PIT advances global time. */
     else if (regs->vector == 48) {

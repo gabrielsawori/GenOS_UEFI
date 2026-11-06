@@ -16,3 +16,9 @@ void fpu_init_cpu(void);
 void fpu_state_init(struct fpu_state* state);
 void fpu_save(struct fpu_state* state);
 void fpu_restore(const struct fpu_state* state);
+
+/* Call from integer-only kernel code. The pair holds the mutation/preemption
+ * guard, isolates user control/mask bits, and restores the interrupted task.
+ * Never block or wait for another task inside this scope. */
+void fpu_kernel_begin(struct fpu_state* saved);
+void fpu_kernel_end(const struct fpu_state* saved);

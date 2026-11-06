@@ -31,8 +31,8 @@ int user_write_prepare(void* ptr, size_t len) {
     if (!len) return 0;
     uint64_t end = (uint64_t)ptr + len;
     for (uint64_t va = (uint64_t)ptr & ~(PAGE_SIZE - 1ULL); va < end; va += PAGE_SIZE) {
-        uint64_t* pte = vmm_pte_in(task_get_current_pml4(), va);
-        if (!(*pte & PTE_WRITE) && !cow_resolve(va, 3)) return -1;
+        uint64_t entry = vmm_read_pte_in(task_get_current_pml4(), va);
+        if (!entry || (!(entry & PTE_WRITE) && !cow_resolve(va, 3))) return -1;
     }
     return 0;
 }

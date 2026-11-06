@@ -1,11 +1,9 @@
 #include "tlb.h"
 #include "percpu.h"
 #include "lapic.h"
-#include "preempt.h"
-#include "../limine.h"
+#include "../mm/vmm.h"
 
-extern volatile struct limine_hhdm_request hhdm_request;
-/* Serialized by the kernel mutation lock. IRQ handler never acquires it. */
+/* Serialized by the VMM lock. IRQ handler never acquires it. */
 static uint64_t sequence;
 static uint64_t address;
 
@@ -35,8 +33,8 @@ void tlb_poll(void) {
 }
 
 void tlb_shootdown(uint64_t* pml4, uint64_t va) {
-    if (!preempt_depth()) __builtin_trap();
-    uint64_t physical = (uint64_t)pml4 - hhdm_request.response->offset;
+    if (!vmm_lock_held()) __builtin_trap();
+    (void)pml4;
     uint32_t self = smp_get_current_cpu_id();
     uint32_t targets = 0;
     uint64_t seq = ++sequence;
@@ -44,7 +42,9 @@ void tlb_shootdown(uint64_t* pml4, uint64_t va) {
     for (uint32_t i = 0; i < smp_get_cpu_count(); i++) {
         struct percpu_data* p = percpu_get(i);
         if (i == self || !__atomic_load_n(&p->scheduler_online, __ATOMIC_ACQUIRE)) continue;
-        if (va < 0x800000000000ULL && p->active_cr3 != physical) continue;
+        /* Scheduler/CR3 changes no longer share our lock. Broadcast rather
+         * than sampling active_cr3 and missing a CPU entering this root.
+         * Context switches reload CR3; PCID is not enabled. */
         targets |= 1U << i;
         __atomic_store_n(&p->tlb_request, seq, __ATOMIC_RELEASE);
         lapic_send_ipi(p->lapic_id, LAPIC_TLB_VECTOR);

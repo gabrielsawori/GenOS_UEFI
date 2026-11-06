@@ -9,6 +9,12 @@ void preempt_enable(void);
 uint32_t preempt_depth(void);
 int preempt_try_disable(void);
 
+/* Pin the running task without taking the global lock. IRQs stay enabled.
+ * A local critical section must not acquire the mutation guard or sleep. */
+void preempt_local_disable(void);
+void preempt_local_enable(void);
+uint32_t preempt_local_depth(void);
+
 static inline void preempt_guard_leave(int* guard) {
     (void)guard;
     preempt_enable();

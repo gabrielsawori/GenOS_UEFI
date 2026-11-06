@@ -17,7 +17,7 @@
 #include "../libc/stdio.h"
 #include "../libc/stdlib.h"
 
-void _start(void) {
+void main(void) {
     /* Tahap 1: Pesan selamat datang */
     print("=== GENOS INTERACTIVE APP (Ring 3) ===", 300);
     print("Syscall aktif: print, read_key, sleep, exit", 324);

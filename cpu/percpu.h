@@ -38,6 +38,7 @@ struct percpu_data {
     uint64_t tlb_request;
     uint64_t tlb_ack;
     uint64_t switches;
+    uint32_t local_preempt_count; /* Subsystem locks; no global mutation lock. */
 } __attribute__((aligned(64))); /* Cache-line aligned to prevent false sharing */
 
 /*

@@ -1,4 +1,5 @@
 #include "pic.h"
+#include "irq_lock.h"
 #include "../drivers/io.h"
 #include "../drivers/serial.h"
 
@@ -10,6 +11,8 @@
 #define ICW1_INIT    0x10
 #define ICW1_ICW4    0x01
 #define ICW4_8086    0x01
+static spinlock_t pic_lock = SPINLOCK_INIT;
+static struct pic_irq_stats stats;
 
 void pic_remap(void) {
     serial_write_string("[INFO] Melakukan Remapping PIC...\n");
@@ -56,6 +59,8 @@ void pic_remap(void) {
 }
 
 void pic_unmask_irq(uint8_t irq) {
+    if (irq >= 16) return;
+    IRQ_LOCK_GUARD(&pic_lock);
     uint16_t port;
     uint8_t  bit;
     if (irq < 8) {
@@ -67,4 +72,42 @@ void pic_unmask_irq(uint8_t irq) {
     }
     /* Clear bit untuk mengizinkan IRQ ini lewat (bit=1 = masked, bit=0 = enabled) */
     outb(port, inb(port) & ~(1 << bit));
+}
+
+int pic_enable_pci_irq(uint8_t irq) {
+    /* ELCR writable bits are DEF8; leave PS/2 IRQ12 edge-triggered. */
+    if (irq >= 16 || !(0xcef8U & (1U << irq))) return 0;
+    IRQ_LOCK_GUARD(&pic_lock);
+    uint16_t elcr = 0x4d0 + irq / 8;
+    uint8_t mask = 1U << (irq & 7);
+    outb(elcr, inb(elcr) | mask);
+    if (!(inb(elcr) & mask)) return 0;
+    if (irq >= 8) outb(PIC1_DATA, inb(PIC1_DATA) & ~(1U << 2));
+    uint16_t port = irq >= 8 ? PIC2_DATA : PIC1_DATA;
+    outb(port, inb(port) & ~mask);
+    return 1;
+}
+
+int pic_begin_irq(uint8_t irq) {
+    if (irq >= 16) return 0;
+    if (irq != 7 && irq != 15) return 1;
+    IRQ_LOCK_GUARD(&pic_lock);
+    uint16_t command = irq == 7 ? PIC1_COMMAND : PIC2_COMMAND;
+    outb(command, 0x0b); /* OCW3: read in-service register. */
+    if (inb(command) & 0x80) return 1;
+    if (irq == 7) stats.spurious7++;
+    else {
+        stats.spurious15++;
+        outb(PIC1_COMMAND, 0x20); /* Cascade was real; slave IRQ15 was not. */
+    }
+    return 0;
+}
+void pic_end_irq(uint8_t irq) {
+    IRQ_LOCK_GUARD(&pic_lock);
+    if (irq >= 8) outb(PIC2_COMMAND, 0x20);
+    outb(PIC1_COMMAND, 0x20);
+}
+void pic_get_irq_stats(struct pic_irq_stats* out) {
+    IRQ_LOCK_GUARD(&pic_lock);
+    if (out) *out = stats;
 }
